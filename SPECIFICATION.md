@@ -1,6 +1,6 @@
 # nextoomio – functional specification
 
-Document version: **1.13**  
+Document version: **1.14**  
 First prototype version: **nextoomio v0.0.1**  
 Planned delivery: **v0.0.1–v0.0.5 according to [ROADMAP.md](ROADMAP.md)**  
 Date: **2026-11-13**  
@@ -263,6 +263,8 @@ Operate the prototype on a local network without direct internet exposure. Choos
 
 ### 10.1 Manual updates for v0.0.1–v0.0.5
 
+Development images used on the test bench from Phase 0 may additionally accept a manually started image upload from the developer's workstation over key-authenticated SSH, and may require a confirmation from that workstation before a trial slot is committed. This path uses the same A/B mechanism, validation, and rollback rules as below. It must not exist in release images and is not an online update.
+
 - **UPD-01:** Start updates through manual system-image upload in the local WebUI. Device internet access is not required.
 - **UPD-02:** Do not discover, download, or automatically install online updates. A manually uploaded image is the only update input.
 - **UPD-03:** Do not implement image signing or cryptographic signature verification in v0.0.1–v0.0.5. An image signature is not an acceptance prerequisite.
@@ -297,6 +299,7 @@ The full functionality, dependencies, release gates, and requirement-ID coverage
 
 | Version | New functionality |
 | --- | --- |
+| Phase 0 (v0.0.0, internal) | No user functionality. A/B base development image for the reference hardware that is installed and replaced remotely, with automatic return from a bad image, so later releases can be tested without physical access to the device. Not a public release. |
 | v0.0.1 | Standalone Yocto player targeting Raspberry Pi 4 + HiFiBerry Amp+: local files, radio, API, English-only translation-ready WebUI, safe initial setup, manual A/B updates, and configuration backup/restore. Reference hardware is closed under section 2.1. |
 | v0.0.2 | NAS, Wi-Fi configuration, and native multiroom with central volume, satellite references, group control, and failure recovery. |
 | v0.0.3 | AirPlay 2, Spotify Connect, Bluetooth reception, and Music Assistant with complete input arbitration and group isolation. |

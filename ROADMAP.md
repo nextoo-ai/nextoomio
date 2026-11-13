@@ -1,10 +1,10 @@
 # nextoomio – roadmap v0.0.1 to v0.0.5
 
-Document version: **1.7**  
+Document version: **1.9**  
 Date: **2026-11-13**  
 Status: **Plan only; no item is marked implemented or verified by this document.**  
-Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.13.  
-Architecture design: [ARCHITECTURE.md](ARCHITECTURE.md), version 0.7.  
+Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.14.  
+Architecture design: [ARCHITECTURE.md](ARCHITECTURE.md), version 0.9.  
 Agent and language rules: [AGENTS.md](AGENTS.md).
 
 ## 1. Goal and planning rules
@@ -17,7 +17,8 @@ Deliver the complete agreed scope by v0.0.5: standalone playback, all required i
 - Do not assign release dates before implementation and hardware results are available. The sequence and release gates define the working plan.
 - Deliver interface security with the interface. Do not expose API, image upload, or group control without protection and defer it to v0.0.5.
 - Local control, setup, and native multiroom work without a project cloud. Losing internet must not disable available local/NAS playback, control, or the native group.
-- All five releases update exclusively through manual image upload. Online updates and image signing/signature verification are outside this roadmap.
+- All five releases update exclusively through manual image upload. Online updates and image signing/signature verification are outside this roadmap. The Phase 0 development image is also updated only by a manually started upload, from the developer's workstation over SSH; that path exists only in development images.
+- Phase 0 (section 2.1) precedes v0.0.1. It delivers no user feature and is not a public release; it exists so that v0.0.1 and later work can be installed and tested on the bench device without physical access.
 - Project artifacts are English; direct communication with the user is Slovak. WebUI initially supports only English (`en`), with translation catalogs and stable keys from v0.0.1. Every subsequent screen follows the same convention; no additional shipped language is required by v0.0.5.
 - Measurement targets are in specification section 13.2. Report missed targets as missed; do not label unverified integrations or cards supported.
 - At v0.0.5, an agreed function must not remain merely a design, stub, hidden option, or backlog item. Record technical obstacles as undelivered requirements and revise the plan openly rather than silently reducing scope.
@@ -26,11 +27,40 @@ Deliver the complete agreed scope by v0.0.5: standalone playback, all required i
 
 | Version | User outcome | Main dependencies |
 | --- | --- | --- |
-| **v0.0.1** | Play local music or radio on the selected Raspberry Pi 4 + HiFiBerry Amp+ setup, control it through an English WebUI/API, and manually update the image. | Closed reference hardware, Yocto, verified audio output, common pipeline, and session manager. |
+| **Phase 0** (v0.0.0, internal) | None for end users. Developers install any new image on the bench Raspberry Pi 4 + HiFiBerry Amp+ remotely, and a bad image returns to the previous one by itself. | Closed reference hardware, Yocto, A/B boot selection (spike S1 on Pi 4), update engine, watchdog. |
+| **v0.0.1** | Play local music or radio on the selected Raspberry Pi 4 + HiFiBerry Amp+ setup, control it through an English WebUI/API, and manually update the image. | Phase 0 bench and update engine, verified audio output, common pipeline, and session manager. |
 | **v0.0.2** | Play NAS music and create a synchronized native group with a reference volume per satellite. | Working v0.0.1 foundation, audio distribution, clock synchronization, and group control. |
 | **v0.0.3** | Send audio through AirPlay 2, Spotify Connect, Bluetooth, or Music Assistant with correct input/group takeover. | Common input adapters, arbitration, existing multiroom, and verified external protocols. |
 | **v0.0.4** | Control the device through MQTT, run follow-up actions, and use it as an HA voice satellite. | Stable commands/states, events, and an audio branch before the local voice layer. |
 | **v0.0.5** | Use verified Matter control and the complete agreed feature set on supported RPi/HiFiBerry combinations. | Completed v0.0.1–v0.0.4 functionality and Matter, compatibility, and regression verification. |
+
+### 2.1 Phase 0 – A/B base image and remote test bench (v0.0.0)
+
+Phase 0 builds the part of v0.0.1 that everything else is installed with, and builds it first. Its result is a development image on the bench device that can replace itself. It is the same A/B layout and update engine that v0.0.1 later puts behind the authenticated WebUI upload, not a temporary mechanism.
+
+#### Scope
+
+- Yocto development image for Raspberry Pi 4 + HiFiBerry Amp+ with the final partition layout: selector, two boot slots, two read-only root slots, and a data partition grown on first boot. Pinned layer revisions; the image and its `.swu` update file are built by CI.
+- The SD card is written by hand once. Every later image is installed over the network.
+- Update engine with the architecture's transaction rules: write the inactive slot, one-shot trial boot, local health check, commit, at most two attempts, durable attempt accounting, and watchdog coverage from the bootloader onwards. This completes spike S1 for Raspberry Pi 4.
+- Remote access in the development image only: SSH with key authentication, the public key supplied at build time and never stored in the repository. Release images contain no SSH server.
+- Remote-confirmed commit in the development image: a trial slot becomes the default only after the local health check passes and the deploying workstation confirms over the network within the trial budget. An image that boots but cannot be reached is therefore rolled back, not committed.
+- One deploy command on the workstation: upload, install, trial boot, confirm, and report the running slot and image version.
+- Audio smoke path: sound-card overlay loaded, ALSA card present, and a test tone played. Remote evidence is taken from the sound card itself: the playback stream is running and its hardware position advances for the whole tone. Audible output is confirmed once by listening when someone is at the device, for example at the first flash.
+- Bench hardware: bench device on wired Ethernet, passive speaker, and a remotely switched power outlet for power-loss tests and last-resort resets. No microphone is required. A microphone is needed only for the Voice feature (VOICE-01, v0.0.4); if one happens to be attached, the bench may also record the tone as additional evidence.
+
+#### Exit gates
+
+- Ten consecutive remote update cycles, alternating slots, without touching the device; the reported slot and version match each time.
+- Deliberately broken images return to the previous slot without intervention after at most two attempts: one that hangs before systemd starts, one that reaches systemd but fails the health check, and one that boots without working network or SSH.
+- Power removed through the switched outlet during inactive-slot writing, during the trial boot, and during commit leaves a bootable, reachable device and a consistent update state.
+- A test tone plays on the Amp+ with the playback stream running and advancing for its whole length, checked remotely, and audible output has been confirmed by listening at least once on the bench device. No gate depends on a microphone.
+- Data written to the data partition survives updates and rollbacks; the root filesystem is read-only.
+- The record lists hardware revisions, pinned versions, measured boot and update times, and every case that still needs physical access.
+
+#### Limits
+
+Physical access is still needed for the first flash, a failed SD card or power supply, and a state in which neither slot can boot or the selector is unreadable. Phase 0 reduces these cases; it cannot remove them. The Raspberry Pi 3 and 5 parts of spike S1 remain required before the partition layout is declared final for the first public v0.0.1 image.
 
 ## 3. v0.0.1 – standalone player and system foundation
 
@@ -175,7 +205,7 @@ Deliver the complete agreed scope by v0.0.5: standalone playback, all required i
 
 ## 8. Requirement coverage matrix
 
-“First delivery” means the first usable implementation for then-available sources/hardware. “Full functional delivery” is the deadline for the complete requirement, including dependencies such as MA exceptions or Voice. Reverify every delivered requirement at v0.0.5. No row records completed work.
+“First delivery” means the first usable implementation for then-available sources/hardware. “Full functional delivery” is the deadline for the complete requirement, including dependencies such as MA exceptions or Voice. Reverify every delivered requirement at v0.0.5. No row records completed work. Phase 0 builds the engine behind SYS-03, SYS-04, SYS-05, and UPD-03 to UPD-06 on a development image, but those requirements count as first delivered in v0.0.1, when the authenticated WebUI upload and the release image exist.
 
 | ID | First delivery | Full functional delivery | Coverage |
 | --- | --- | --- | --- |

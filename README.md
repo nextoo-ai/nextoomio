@@ -2,7 +2,7 @@
 
 **nextoomio** is an open-source, cloud-free audio player and multiroom operating system for **Raspberry Pi 3+** and **HiFiBerry** sound cards, built on **Yocto Linux**.
 
-> **Project status:** Specification (`v1.13`), cumulative delivery roadmap (`v1.7`), and system architecture (`v0.7`) are established. Repository scaffolding, core state-machine contracts, WebUI i18n catalog foundation, Yocto layer structure, and CI/CD pipelines are initialized for **v0.0.1** development. Hardware measurements and full Yocto target builds are not yet verified on physical hardware.
+> **Project status:** Specification (`v1.14`), cumulative delivery roadmap (`v1.9`), and system architecture (`v0.9`) are established. Repository scaffolding, core state-machine contracts, WebUI i18n catalog foundation, Yocto layer structure, and CI/CD pipelines are initialized for **v0.0.1** development. Hardware measurements and full Yocto target builds are not yet verified on physical hardware.
 
 ---
 
@@ -47,7 +47,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete system design.
 
 | Path | Description | License |
 | --- | --- | --- |
-| [SPECIFICATION.md](SPECIFICATION.md) | Authoritative functional specification (`v1.13`, 78 requirement IDs) | Apache-2.0 |
+| [SPECIFICATION.md](SPECIFICATION.md) | Authoritative functional specification (`v1.14`, 78 requirement IDs) | Apache-2.0 |
 | [ROADMAP.md](ROADMAP.md) | Cumulative delivery plan and release gates (`v0.0.1–v0.0.5`) | Apache-2.0 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Technical architecture, component register, and traceability | Apache-2.0 |
 | [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md) | Architecture review dispositions (`AR-01–AR-08`) | Apache-2.0 |
@@ -60,6 +60,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete system design.
 | [`docs/`](docs/) | OpenAPI specification, hardware compatibility matrix, and spike reports | Apache-2.0 |
 | [`scripts/`](scripts/) | Automated traceability, i18n catalog, and layer verification tools | Apache-2.0 |
 | [`SK/`](SK/) | Deprecated, frozen historical Slovak archive (do not modify) | Historical |
+| [docs/backlog/](docs/backlog/README.md) | Conventions for features, stories, and defects, which are tracked as [GitHub issues](https://github.com/nextoo-ai/nextoomio/issues) | Apache-2.0 |
 
 ---
 

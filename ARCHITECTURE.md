@@ -1,10 +1,10 @@
 # nextoomio – architecture design v0.0.1 to v0.0.5
 
-Document version: **0.7**  
+Document version: **0.9**  
 Date: **2026-11-13**  
 Status: **Design proposal. Nothing in this document is implemented, built, or measured. Component versions are candidates as of the date above and must be pinned and re-checked when each release starts.**  
-Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.13.  
-Delivery plan: [ROADMAP.md](ROADMAP.md), version 1.7.  
+Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.14.  
+Delivery plan: [ROADMAP.md](ROADMAP.md), version 1.9.  
 Agent and language rules: [AGENTS.md](AGENTS.md).
 
 ## 1. Purpose and reading guide
@@ -23,6 +23,10 @@ Version 0.6 incorporates AR-01–AR-08 from [ARCHITECTURE_REVIEW.md](ARCHITECTUR
 
 Version 0.7 records the non-commercial project intent and the license-selection rule in AGENTS.md. It selects the named Apache-2.0 MA client/model sources, makes a more permissive native transport the preferred replacement when technical equivalence is demonstrated, and retains justified copyleft components without adding commercial-product certification work. Section 11.1 records the current comparisons.
 
+Version 0.8 adds Phase 0 (section 4.1): the A/B base development image and remote test bench that precede v0.0.1, and decision AD-22.
+
+Version 0.9 removes the microphone from the Phase 0 bench (a microphone is needed only for Voice) and closes OD-02: Rust for the core, with the Matter process free to use the C++ reference SDK.
+
 Section 10 is the complete component and license register, section 11 the license-compliance design, section 12 risks and open decisions, and section 13 the requirement-to-architecture traceability for every requirement ID.
 
 ## 2. Architecture decisions
@@ -30,7 +34,7 @@ Section 10 is the complete component and license register, section 11 the licens
 | # | Decision | Choice | Main alternatives and why they were not chosen |
 | --- | --- | --- | --- |
 | AD-01 | Build system and base | Yocto Project 6.0 LTS "Wrynose" (supported until April 2030), systemd, one 64-bit image family for Raspberry Pi 3/4/5. | 5.0 "Scarthgap" ends April 2028 and ships Rust 1.75; non-LTS releases are supported for about six months only. |
-| AD-02 | Language of original code | Rust for original policy/control daemons; TypeScript for the WebUI. A small C++ `nx-ma` wrapper uses the selected upstream `sendspin-cpp` library without rewriting it. | C++ would work equally well for the core. Rust is preferred because the Spotify, Matter, Sendspin, and Snapcast ecosystems all have Rust libraries and the core is a network-facing daemon. This is a preference, not a constraint; see OD-02. |
+| AD-02 | Language of original code | Rust for original policy/control daemons; TypeScript for the WebUI. A small C++ `nx-ma` wrapper uses the selected upstream `sendspin-cpp` library without rewriting it. | C++ would work equally well for the core. Rust is preferred because the Spotify, Matter, Sendspin, and Snapcast ecosystems all have Rust libraries and the core is a network-facing daemon. Confirmed by the user (OD-02). It does not constrain separate processes such as `nx-matter`. |
 | AD-03 | Audio graph | PipeWire with WirePlumber. Every input is a separate PipeWire client; `nextoomio-core` is the only policy authority and creates every link. | Plain ALSA with dmix needs a custom mixer, resampler, Bluetooth path, and echo canceller. PulseAudio is superseded. JACK has no Bluetooth or policy layer. |
 | AD-04 | Playback arbitration | One session manager inside `nextoomio-core`; inputs are *adapters* that request, never seize (SEL-07). Audio gating is enforced by graph links owned by the core, not by adapter cooperation. | Letting each receiver open the sound card (the usual DIY-streamer design) cannot guarantee SEL-06 or stale-session rejection. |
 | AD-05 | Files, NAS, radio engine | MPD, controlled exclusively by the core over a Unix socket. | A GStreamer-based player written for the project is more code for the same result. Symphonia (pure Rust) lacks HE-AAC, which is common in radio streams. |
@@ -50,6 +54,7 @@ Section 10 is the complete component and license register, section 11 the licens
 | AD-19 | Group control channel | Each satellite opens one persistent, authenticated WebSocket to its configured master. The master sends a versioned group-state snapshot on connect and changes afterwards. TLS 1.3 uses an explicitly provisioned master public-key pin; group-key proofs are bound to the TLS connection. A separate authenticated WSS tunnel carries native audio (section 6.3). Neither channel uses wall-clock time for group authentication. | Master-initiated requests need the master to track satellite addresses, give no presence signal, lose messages while a satellite is unreachable, and need a second trust direction. Timestamped HMAC fails between devices without a real-time clock or internet. |
 | AD-20 | Privileged operations | One small root helper, `nx-sysd`, exposes a fixed set of operations to the core over a Unix socket: NAS mounts, firewall port changes, the hardware-configuration write, update installation, reboot, and data-partition reset. The core itself has no capabilities. | Granting the capabilities to the core would make the network-facing daemon privileged. Separate ad-hoc helpers per feature would leave the privilege boundary undefined. |
 | AD-21 | Time | No local function depends on correct wall-clock time: ordering uses monotonic counters, group authentication uses pinned keys and connection-bound challenges, and Snapcast keeps its own time base. `systemd-timesyncd` sets the clock when a time server is reachable and stores the last known time on the data partition. | Raspberry Pi 3 and 4 have no battery-backed clock, and local control and native multiroom must work without internet. Only outbound TLS verification (MQTT, HTTPS radio and actions) needs a plausible clock; a failure there is reported as `clock_not_set`, not as a certificate error. |
+| AD-22 | Commit rule on development images | A trial slot is committed only after the local health check passes and the deploying workstation confirms over SSH within the trial budget (`remote-confirm` mode). Release images use the local health check alone, as UPD-06 requires. | Committing on local health alone can make a bench image the default although it is unreachable, which then needs physical access. Making network reachability part of the release health check would contradict UPD-06, which forbids rollback because of network conditions. |
 
 ## 3. Target system architecture
 
@@ -238,6 +243,25 @@ A **hardware profile** is a declarative file per sound card, identified by the c
 - A release adds adapters, routes, API resources, and catalog keys. It does not change the session manager's ordering rules, the routing-table structure, the partition layout, or the configuration-versioning scheme. Those are fixed in v0.0.1 because changing them later would break "manual upgrades through earlier releases".
 - Every third-party component is pinned to an exact version in the layer, with its license recorded in the recipe and in section 10. A component may be listed as integrated only after its release gate has passed on real hardware.
 - The early S1–S6 checks required by the v0.0.1 roadmap are followed by integration checks at each dependent release. Each spike records pinned versions, reproducible setup, measurements, failure cases, and a fallback that preserves mandatory scope. A failed check blocks its dependent release; a written design or a weaker fallback is not feature delivery.
+
+### 4.1 Phase 0 – A/B base image and remote test bench
+
+Phase 0 (roadmap section 2.1) builds sections 3.5 and 3.6 before any playback feature, so every later image reaches the bench device through the mechanism it will ship with.
+
+```
+ workstation ── deploy ──► SSH (development image only) ──► update engine ──► inactive boot/root slot
+      ▲                                                          │ one-shot trial boot
+      └────────── confirm within the trial budget ◄── health ◄───┘   no confirmation: previous slot
+ bench: Raspberry Pi 4 + HiFiBerry Amp+ ─► speaker; switched power outlet
+```
+
+- **What exists.** The partition layout of section 3.6, the read-only root and data partition of section 3.5, the update transaction engine in `nx-sysd` with its durable journal, the watchdog chain, and a health service. `nextoomio-core`, PipeWire policy, MPD, the API, and the WebUI are not required. The engine is driven by a command-line interface over SSH; v0.0.1 adds the authenticated upload API in front of the same engine and changes nothing behind it.
+- **Health check in Phase 0.** System target reached, data partition mounted, configured ALSA card present and openable, SSH daemon listening. v0.0.1 extends the list with the API, WebUI assets, PipeWire, and `nx-audio` (section 3.6, step 5).
+- **Remote-confirmed commit (AD-22).** The deploy command waits for the device to return, checks the slot and image version over SSH, and sends the confirmation. Without it the trial ends at its deadline and the previous slot boots. The mode is a build-time property of the development image and cannot be enabled in a release image.
+- **Remote access.** OpenSSH with key authentication only; the authorized key comes from the builder's local configuration. The firewall opens the SSH port only in the development image.
+- **Remote audio evidence.** A test tone is played through ALSA while the check reads the sound card's playback status: the stream must be running and its hardware position must advance for the whole tone. This proves the digital path up to the amplifier, not that the speaker is audible; audible output is confirmed once by listening when someone is at the device. No microphone is part of the bench, the health check, or any device function other than Voice. Quality and synchronization still need electrical measurement at their own gates.
+- **Spike S1.** Phase 0 completes S1 for Raspberry Pi 4: selector behaviour, watchdog coverage before systemd, trial deadline, attempt accounting, and power loss at each durable boundary, using the switched outlet. The Raspberry Pi 3 and 5 parts of S1 and OD-04 stay open until run on those boards.
+- **Still physical.** First flash, storage or power-supply failure, and a state where neither slot boots or the selector is unreadable.
 
 ## 5. v0.0.1 – standalone player and system foundation
 
@@ -603,7 +627,7 @@ Any accepted replacement updates the component register, diagrams, adapter/trans
 | ID | Item | Type | Detail and proposed handling |
 | --- | --- | --- | --- |
 | OD-01 | Identity of the v0.0.1 reference card | **Closed 2026-11-13** | Reference hardware is Raspberry Pi 4 + HiFiBerry Amp+, confirmed by the user from the purchase invoice; the Amp+ powers the Raspberry Pi. Profile `hifiberry-amp` ("HiFiBerry Amp", Volumio naming). The roadmap's v0.0.1 gate still records the PCB revision and requires playback on the device, as for any hardware result. |
-| OD-02 | Rust vs. C++ for the core | Decision to confirm | Rust is proposed (AD-02). Nothing in the architecture depends on the language except the choice of `rs-matter` and Rust client libraries. |
+| OD-02 | Rust vs. C++ for the core | **Closed 2026-11-13** | Confirmed by the user: Rust for `nextoomio-core`, `nx-audio`, and `nx-sysd` (AD-02). The choice does not bind Matter: `nx-matter` is a separate process behind the core API and moves to the C++ reference SDK (connectedhomeip) if `rs-matter` fails spike S6 (AD-12). |
 | OD-03 | Snapcast vs. Sendspin for native multiroom | Prefer lower restrictions when comparable; verify in S2/S4 | Sendspin is the preferred replacement once section 11.1 parity checks pass; Snapcast remains the current baseline. Pin exact server/client versions and audit dependencies. Preserve the ownership model, but revise and reverify protocol-specific transport/authentication/generation handling before switching. A final version number alone is not proof of parity. |
 | OD-04 | Firmware `tryboot` vs. U-Boot, and final slot sizes | Lock in v0.0.1 | Spike S1 must run on a Pi 3 and a Pi 5 as well as the Pi 4, because the partition layout cannot change after the first release without breaking the upgrade path. |
 | OD-05 | Native audio authentication and session binding | **Design decided; S2 verification pending** | Both channels use pinned TLS and connection-bound group-key proofs; loopback Snapcast is carried through generation-bound audio tunnels (section 6.3). No IP-only/plaintext fallback. S2 must prove isolation, authentication, and timing before v0.0.2. |
