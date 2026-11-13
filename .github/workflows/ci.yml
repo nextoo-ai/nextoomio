@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-and-yocto-layer:
+    name: Traceability, Docs & Yocto Layer Check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify 78 requirement IDs and Markdown links
+        run: python3 scripts/check_traceability.py
+
+      - name: Validate meta-nextoomio layer and kas definitions
+        run: python3 scripts/check_yocto_layer.py
+
+  rust-core:
+    name: Rust Core & License Gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            core
+            matter
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path core/Cargo.toml --all -- --check
+
+      - name: Run Clippy lints
+        run: cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run unit tests (session manager, volume, mute, update state machine)
+        run: cargo test --manifest-path core/Cargo.toml --all-targets
+
+      - name: Check nx-matter workspace
+        run: cargo check --manifest-path matter/Cargo.toml --all-targets
+
+      - name: Audit Rust dependency licenses (ARCHITECTURE.md section 11.9)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+          manifest-path: core/Cargo.toml
+
+  webui:
+    name: WebUI & i18n Catalog Gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify English and pseudo-dev translation catalogs (I18N-01..I18N-04)
+        run: node scripts/check_i18n.mjs
+
+      - name: Install WebUI dependencies
+        working-directory: webui
+        run: npm install
+
+      - name: Type-check and build WebUI bundle
+        working-directory: webui
+        run: npm run build

@@ -1,0 +1,43 @@
+# OS & Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Scratch / unmaintained local outputs
+Claude outputs/
+
+# Rust build artifacts
+/core/target/
+/matter/target/
+**/*.rs.bk
+
+# WebUI build & dependencies
+/webui/node_modules/
+/webui/dist/
+/webui/.vite/
+/webui/coverage/
+*.tsbuildinfo
+
+# Yocto / kas build & cache directories
+/build/
+/yocto-build/
+/.kas/
+/downloads/
+/sstate-cache/
+/tmp/
+*.wic
+*.wic.bz2
+*.wic.bmap
+*.swu
+
+# Python cache & virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+venv/

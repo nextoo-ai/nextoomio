@@ -1,0 +1,9 @@
+[package]
+name = "nx-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated PipeWire gain-stage process (local.music stage 1 volume/mute and stage 2 voice ducking)"
+
+[dependencies]
+nx-protocol.workspace = true

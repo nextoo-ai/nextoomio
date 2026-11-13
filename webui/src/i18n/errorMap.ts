@@ -1,0 +1,23 @@
+// Maps stable machine-readable API error codes (I18N-04) to translation catalog keys.
+export const API_ERROR_KEYS: Record<string, string> = {
+  setup_required: 'errors.setup_required',
+  setup_already_completed: 'errors.setup_already_completed',
+  unauthenticated: 'errors.unauthenticated',
+  csrf_invalid: 'errors.csrf_invalid',
+  command_unsupported: 'errors.command_unsupported',
+  waiting_for_client: 'errors.waiting_for_client',
+  source_unreachable: 'errors.source_unreachable',
+  format_unsupported: 'errors.format_unsupported',
+  playlist_invalid: 'errors.playlist_invalid',
+  nas_unreachable: 'errors.nas_unreachable',
+  clock_not_set: 'errors.clock_not_set',
+  data_unavailable: 'errors.data_unavailable',
+  self_master_rejected: 'errors.self_master_rejected',
+  topology_cycle_rejected: 'errors.topology_cycle_rejected',
+  group_level_disabled: 'errors.group_level_disabled',
+  update_oversized: 'errors.update_oversized',
+  update_invalid_format: 'errors.update_invalid_format',
+  update_incompatible_hardware: 'errors.update_incompatible_hardware',
+  update_incompatible_schema: 'errors.update_incompatible_schema',
+  update_busy: 'errors.update_busy',
+};

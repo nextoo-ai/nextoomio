@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.bb text eol=lf
+*.bbappend text eol=lf
+*.inc text eol=lf
+*.conf text eol=lf
+*.wks.in text eol=lf
+*.png binary
+*.jpg binary
+*.swu binary

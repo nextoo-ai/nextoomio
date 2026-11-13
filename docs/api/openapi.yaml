@@ -1,0 +1,115 @@
+openapi: 3.1.0
+info:
+  title: nextoomio Local Control API
+  version: 0.0.1-dev
+  description: >
+    Local REST API contract for nextoomio (`CTL-01`, `I18N-04`, `ARCHITECTURE.md` section 3.4).
+    All identifiers, enum values, and error codes are stable machine-readable tokens independent of UI language.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+servers:
+  - url: https://{device_host}/api/v1
+    variables:
+      device_host:
+        default: nextoomio.local
+paths:
+  /setup/status:
+    get:
+      summary: Query initial administrator setup status
+      operationId: getSetupStatus
+      responses:
+        '200':
+          description: Current setup completion state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [completed]
+                properties:
+                  completed:
+                    type: boolean
+  /state:
+    get:
+      summary: Retrieve current device, session, and audio state snapshot
+      operationId: getDeviceState
+      responses:
+        '200':
+          description: Device state snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceState'
+        '401':
+          $ref: '#/components/responses/ApiErrorResponse'
+  /volume:
+    post:
+      summary: Set logical volume with explicit local or group scope (TRN-05)
+      operationId: setVolume
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, volume_percent]
+              properties:
+                scope:
+                  $ref: '#/components/schemas/CommandScope'
+                volume_percent:
+                  type: integer
+                  minimum: 0
+                  maximum: 100
+      responses:
+        '200':
+          description: Volume updated
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
+components:
+  schemas:
+    CommandScope:
+      type: string
+      enum: [local, group]
+    DeviceState:
+      type: object
+      required:
+        - device_id
+        - version
+        - local_volume_percent
+        - local_mute
+        - effective_mute
+      properties:
+        device_id:
+          type: string
+        version:
+          type: string
+        session_id:
+          type: [string, 'null']
+        owner_domain:
+          type: [string, 'null']
+          enum: [standalone, native_multiroom, music_assistant, null]
+        local_volume_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        local_mute:
+          type: boolean
+        effective_mute:
+          type: boolean
+    ApiError:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code mapped to catalog keys in the WebUI (I18N-04)
+        details:
+          type: object
+          additionalProperties: true
+  responses:
+    ApiErrorResponse:
+      description: Machine-readable API error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'

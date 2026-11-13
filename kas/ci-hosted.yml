@@ -1,0 +1,15 @@
+# GitHub Actions CI overlay for kas builds
+# Enables rm_work and bounded parallelism so builds fit within cleaned GitHub-hosted runner disk & RAM limits.
+header:
+  version: 14
+  includes:
+    - kas/rpi4-64.yml
+
+local_conf_header:
+  nextoomio-ci: |
+    INHERIT += "rm_work"
+    BB_NUMBER_THREADS ?= "4"
+    PARALLEL_MAKE ?= "-j 4"
+    BB_PRESSURE_MAX_CPU = "15000"
+    BB_PRESSURE_MAX_IO = "15000"
+    BB_PRESSURE_MAX_MEMORY = "15000"

@@ -1,0 +1,70 @@
+{
+  "app": {
+    "title": "[⟦nextoomio⟧]",
+    "subtitle": "[⟦Open-source Raspberry Pi & HiFiBerry audio system⟧]",
+    "versionLabel": "[⟦System version {version}⟧]"
+  },
+  "nav": {
+    "player": "[⟦Now Playing⟧]",
+    "sources": "[⟦Music Sources⟧]",
+    "multiroom": "[⟦Multiroom⟧]",
+    "audio": "[⟦Audio & Hardware⟧]",
+    "system": "[⟦System & Updates⟧]",
+    "diagnostics": "[⟦Diagnostics⟧]"
+  },
+  "setup": {
+    "heading": "[⟦Initial Device Setup⟧]",
+    "deviceNameLabel": "[⟦Device name⟧]",
+    "adminPasswordLabel": "[⟦Administrator password⟧]",
+    "soundCardLabel": "[⟦HiFiBerry sound card profile⟧]",
+    "initialVolumeLabel": "[⟦Initial local volume ({percent}%)⟧]",
+    "submitButton": "[⟦Complete setup⟧]"
+  },
+  "player": {
+    "ownerIdle": "[⟦Idle — no active playback owner⟧]",
+    "ownerStandalone": "[⟦Active input: {input}⟧]",
+    "ownerNative": "[⟦Native multiroom from {master}⟧]",
+    "ownerMusicAssistant": "[⟦Controlled by Music Assistant⟧]",
+    "play": "[⟦Play⟧]",
+    "pause": "[⟦Pause⟧]",
+    "stop": "[⟦Stop⟧]",
+    "localVolume": "[⟦Local volume ({percent}%)⟧]",
+    "localMute": "[⟦Local mute⟧]",
+    "groupVolume": "[⟦Group volume ({percent}%)⟧]",
+    "groupMute": "[⟦Group mute⟧]"
+  },
+  "multiroom": {
+    "centralVolumeToggle": "[⟦Enable central group volume control⟧]",
+    "satelliteReference": "[⟦Reference volume for {satellite}: {percent}%⟧]",
+    "memberCount": "[⟦No satellites connected⟧] | [⟦{count} satellite connected⟧] | [⟦{count} satellites connected⟧]"
+  },
+  "updates": {
+    "heading": "[⟦Manual System Image Update (.swu)⟧]",
+    "uploadButton": "[⟦Upload .swu image⟧]",
+    "installButton": "[⟦Install to inactive slot & reboot⟧]",
+    "backupButton": "[⟦Export encrypted backup⟧]",
+    "restoreButton": "[⟦Restore backup⟧]"
+  },
+  "errors": {
+    "setup_required": "[⟦Initial administrator setup must be completed before using the device.⟧]",
+    "setup_already_completed": "[⟦Initial setup has already been completed.⟧]",
+    "unauthenticated": "[⟦Authentication is required to perform this action.⟧]",
+    "csrf_invalid": "[⟦Browser session security token is invalid or expired.⟧]",
+    "command_unsupported": "[⟦This transport command is not supported by the current audio source.⟧]",
+    "waiting_for_client": "[⟦Waiting for the external playback client to start streaming.⟧]",
+    "source_unreachable": "[⟦The selected audio stream or file could not be reached.⟧]",
+    "format_unsupported": "[⟦The selected audio format or codec profile is not supported.⟧]",
+    "playlist_invalid": "[⟦The radio playlist file is invalid or contains no playable streams.⟧]",
+    "nas_unreachable": "[⟦The configured NAS share could not be reached.⟧]",
+    "clock_not_set": "[⟦System clock is not synchronized; TLS certificate validation cannot proceed.⟧]",
+    "data_unavailable": "[⟦Persistent data partition is unavailable. Recovery mode is active.⟧]",
+    "self_master_rejected": "[⟦A device cannot configure itself as its own native multiroom master.⟧]",
+    "topology_cycle_rejected": "[⟦Multiroom topology cycle or nested distribution level was rejected.⟧]",
+    "group_level_disabled": "[⟦Group volume changes are disabled while central volume control is off.⟧]",
+    "update_oversized": "[⟦The update bundle exceeds the reserved staging capacity.⟧]",
+    "update_invalid_format": "[⟦The uploaded update bundle is corrupted or has an invalid format.⟧]",
+    "update_incompatible_hardware": "[⟦The update bundle is not compatible with this Raspberry Pi model.⟧]",
+    "update_incompatible_schema": "[⟦The update bundle uses an incompatible configuration schema.⟧]",
+    "update_busy": "[⟦Another update transaction is already in progress.⟧]"
+  }
+}

@@ -1,0 +1,46 @@
+# kas base configuration for nextoomio Yocto builds (ARCHITECTURE.md section 2, AD-01)
+# Note: Branch and commit SHAs must be pinned and verified during Spike S1 (R-07).
+header:
+  version: 14
+
+distro: nextoomio
+target: nextoomio-image
+
+repos:
+  nextoomio:
+    layers:
+      meta-nextoomio:
+
+  poky:
+    url: https://git.yoctoproject.org/poky
+    branch: wrynose
+    layers:
+      meta:
+      meta-poky:
+
+  meta-openembedded:
+    url: https://git.openembedded.org/meta-openembedded
+    branch: wrynose
+    layers:
+      meta-oe:
+      meta-multimedia:
+      meta-networking:
+      meta-python:
+
+  meta-raspberrypi:
+    url: https://git.yoctoproject.org/meta-raspberrypi
+    branch: wrynose
+
+  meta-swupdate:
+    url: https://github.com/sbabic/meta-swupdate.git
+    branch: wrynose
+
+local_conf_header:
+  nextoomio-base: |
+    CONF_VERSION = "2"
+    PACKAGE_CLASSES = "package_ipk"
+    USER_CLASSES ?= "buildstats"
+    # Generate SPDX SBOM and per-package license manifests (ARCHITECTURE.md section 11.2)
+    INHERIT += "create-spdx"
+    COPY_LIC_MANIFEST = "1"
+    COPY_LIC_DIRS = "1"

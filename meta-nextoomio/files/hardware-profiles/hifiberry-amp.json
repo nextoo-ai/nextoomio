@@ -1,0 +1,21 @@
+{
+  "profile_id": "hifiberry-amp",
+  "display_name": "HiFiBerry Amp",
+  "hardware_family": "HiFiBerry Amp+",
+  "dtoverlay": "hifiberry-amp",
+  "dtoverlay_params": [],
+  "alsa_mixer_control": "Master",
+  "fixed_hardware_mixer_percent": 100,
+  "default_logical_volume_percent": 30,
+  "sample_rate_hz": 48000,
+  "sample_formats": ["S24_LE", "S32_LE"],
+  "static_output_latency_ms": 0.0,
+  "has_hat_eeprom": false,
+  "powers_pi_from_card": true,
+  "compatible_boards": [
+    "raspberrypi3-64",
+    "raspberrypi4-64"
+  ],
+  "verification_status": "reference_target_unverified_on_hardware",
+  "notes": "Closed v0.0.1 reference card (SPECIFICATION.md section 2.1, OD-01). Powers Raspberry Pi from the amplifier power supply. Record exact RPi4 RAM and Amp+ PCB revision upon hardware verification."
+}

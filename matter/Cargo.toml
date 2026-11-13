@@ -1,0 +1,9 @@
+[package]
+name = "nx-matter"
+version = "0.0.1-dev"
+edition = "2021"
+license = "Apache-2.0"
+description = "Matter controlled-device service (planned for v0.0.5, CTL-03 / AD-12 / AR-07)"
+
+[dependencies]
+nx-protocol = { path = "../core/crates/nx-protocol" }

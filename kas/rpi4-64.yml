@@ -1,0 +1,14 @@
+# Reference hardware target for v0.0.1: Raspberry Pi 4 (64-bit) + HiFiBerry Amp+ (SYS-01, SYS-02, OD-01)
+header:
+  version: 14
+  includes:
+    - kas/base.yml
+
+machine: raspberrypi4-64
+
+local_conf_header:
+  nextoomio-rpi4-reference: |
+    # Default reference audio overlay (hifiberry-amp for HiFiBerry Amp+)
+    RPI_EXTRA_CONFIG:append = "\ndtoverlay=hifiberry-amp\n"
+    DISABLE_VC4GRAPHICS = "1"
+    DISABLE_OVERSCAN = "1"

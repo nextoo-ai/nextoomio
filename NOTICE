@@ -1,0 +1,14 @@
+nextoomio
+Copyright 2026 nextoo-ai and contributors
+
+Original source code and documentation in this repository (`core/`, `matter/`,
+`webui/`, `docs/`, `scripts/`) are licensed under the Apache License,
+Version 2.0 (see LICENSE).
+
+OpenEmbedded/Yocto layer metadata in `meta-nextoomio/` is licensed under the
+MIT License (see `meta-nextoomio/COPYING.MIT`), following OpenEmbedded
+conventions. Patches carry the license of the upstream component they modify.
+
+Assembled Yocto system images are aggregate works containing third-party open-source
+software and redistributable hardware firmware under their respective licenses,
+as documented in `ARCHITECTURE.md` ( sections 10 and 11).

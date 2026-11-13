@@ -1,0 +1,111 @@
+name: Yocto Image Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Build mode: parse-only (fast recipe/layer check) or full-image (BitBake image build)'
+        required: true
+        default: 'parse-only'
+        type: choice
+        options:
+          - parse-only
+          - full-image
+      runner:
+        description: 'Target GitHub Actions runner'
+        required: true
+        default: 'ubuntu-24.04'
+        type: choice
+        options:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - self-hosted
+      yocto_branch:
+        description: 'OpenEmbedded/Yocto layer branch (scarthgap LTS or wrynose)'
+        required: true
+        default: 'scarthgap'
+        type: choice
+        options:
+          - scarthgap
+          - wrynose
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  yocto:
+    name: Yocto (${{ inputs.mode }} on ${{ inputs.runner }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Maximize runner disk space (GitHub-hosted runners only)
+        if: inputs.runner != 'self-hosted'
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost \
+                      /usr/local/graalvm || true
+          docker image prune --all --force || true
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare build and cache directories
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/yocto-cache/downloads"
+          mkdir -p "${GITHUB_WORKSPACE}/yocto-cache/sstate-cache"
+
+      - name: Restore Yocto downloads & sstate cache (up to 10 GB GitHub Cache limit)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/yocto-cache/downloads
+            ${{ github.workspace }}/yocto-cache/sstate-cache
+          key: yocto-${{ inputs.runner }}-${{ inputs.yocto_branch }}-${{ hashFiles('kas/**', 'meta-nextoomio/**') }}
+          restore-keys: |
+            yocto-${{ inputs.runner }}-${{ inputs.yocto_branch }}-
+
+      - name: Select Yocto branch in kas/base.yml
+        run: |
+          sed -i "s/branch: wrynose/branch: ${{ inputs.yocto_branch }}/g" kas/base.yml
+
+      - name: Run BitBake layer & recipe parse verification (parse-only)
+        if: inputs.mode == 'parse-only'
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work:rw" \
+            -w /work \
+            -e KAS_WORK_DIR=/work/build \
+            -e DL_DIR=/work/yocto-cache/downloads \
+            -e SSTATE_DIR=/work/yocto-cache/sstate-cache \
+            ghcr.io/siemens/kas/kas:4.5 \
+            kas shell kas/ci-hosted.yml -c "bitbake-layers show-layers && bitbake -p nextoomio-image"
+
+      - name: Build full nextoomio Yocto image (full-image)
+        if: inputs.mode == 'full-image'
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work:rw" \
+            -w /work \
+            -e KAS_WORK_DIR=/work/build \
+            -e DL_DIR=/work/yocto-cache/downloads \
+            -e SSTATE_DIR=/work/yocto-cache/sstate-cache \
+            ghcr.io/siemens/kas/kas:4.5 \
+            kas build kas/ci-hosted.yml
+
+      - name: Upload Yocto image, SPDX SBOM, and license manifest
+        if: inputs.mode == 'full-image'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextoomio-rpi4-64-${{ github.sha }}
+          path: |
+            build/build/tmp*/deploy/images/raspberrypi4-64/*.wic.bz2
+            build/build/tmp*/deploy/images/raspberrypi4-64/*.wic.bmap
+            build/build/tmp*/deploy/images/raspberrypi4-64/*.spdx.tar.zst
+            build/build/tmp*/deploy/licenses/**/license.manifest
+          retention-days: 14
