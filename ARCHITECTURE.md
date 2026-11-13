@@ -1,10 +1,10 @@
 # nextoomio – architecture design v0.0.1 to v0.0.5
 
-Document version: **0.9**  
+Document version: **0.10**  
 Date: **2026-11-13**  
 Status: **Design proposal. Nothing in this document is implemented, built, or measured. Component versions are candidates as of the date above and must be pinned and re-checked when each release starts.**  
-Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.14.  
-Delivery plan: [ROADMAP.md](ROADMAP.md), version 1.9.  
+Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.15.  
+Delivery plan: [ROADMAP.md](ROADMAP.md), version 1.10.  
 Agent and language rules: [AGENTS.md](AGENTS.md).
 
 ## 1. Purpose and reading guide
@@ -26,6 +26,8 @@ Version 0.7 records the non-commercial project intent and the license-selection 
 Version 0.8 adds Phase 0 (section 4.1): the A/B base development image and remote test bench that precede v0.0.1, and decision AD-22.
 
 Version 0.9 removes the microphone from the Phase 0 bench (a microphone is needed only for Voice) and closes OD-02: Rust for the core, with the Matter process free to use the C++ reference SDK.
+
+Version 0.10 replaces the separate development and release access models with one image whose SSH access is enabled by a key file on the first FAT partition (AD-23), and makes remote-confirmed commit a per-transaction request (AD-22).
 
 Section 10 is the complete component and license register, section 11 the license-compliance design, section 12 risks and open decisions, and section 13 the requirement-to-architecture traceability for every requirement ID.
 
@@ -54,7 +56,8 @@ Section 10 is the complete component and license register, section 11 the licens
 | AD-19 | Group control channel | Each satellite opens one persistent, authenticated WebSocket to its configured master. The master sends a versioned group-state snapshot on connect and changes afterwards. TLS 1.3 uses an explicitly provisioned master public-key pin; group-key proofs are bound to the TLS connection. A separate authenticated WSS tunnel carries native audio (section 6.3). Neither channel uses wall-clock time for group authentication. | Master-initiated requests need the master to track satellite addresses, give no presence signal, lose messages while a satellite is unreachable, and need a second trust direction. Timestamped HMAC fails between devices without a real-time clock or internet. |
 | AD-20 | Privileged operations | One small root helper, `nx-sysd`, exposes a fixed set of operations to the core over a Unix socket: NAS mounts, firewall port changes, the hardware-configuration write, update installation, reboot, and data-partition reset. The core itself has no capabilities. | Granting the capabilities to the core would make the network-facing daemon privileged. Separate ad-hoc helpers per feature would leave the privilege boundary undefined. |
 | AD-21 | Time | No local function depends on correct wall-clock time: ordering uses monotonic counters, group authentication uses pinned keys and connection-bound challenges, and Snapcast keeps its own time base. `systemd-timesyncd` sets the clock when a time server is reachable and stores the last known time on the data partition. | Raspberry Pi 3 and 4 have no battery-backed clock, and local control and native multiroom must work without internet. Only outbound TLS verification (MQTT, HTTPS radio and actions) needs a plausible clock; a failure there is reported as `clock_not_set`, not as a certificate error. |
-| AD-22 | Commit rule on development images | A trial slot is committed only after the local health check passes and the deploying workstation confirms over SSH within the trial budget (`remote-confirm` mode). Release images use the local health check alone, as UPD-06 requires. | Committing on local health alone can make a bench image the default although it is unreachable, which then needs physical access. Making network reachability part of the release health check would contradict UPD-06, which forbids rollback because of network conditions. |
+| AD-22 | Remote-confirmed commit | The deploy tool may request `remote-confirm` for one update transaction: the trial slot is then committed only after the local health check passes and the deploying workstation confirms over SSH within the trial budget. Without that request, the local health check alone commits, as UPD-06 requires. The mode can be requested only while SSH access is enabled (AD-23). | Committing on local health alone can make an image the default although the developer cannot reach it, which then needs physical access. Making network reachability part of every health check would contradict UPD-06, which forbids rollback because of network conditions. A build-time switch would need two image variants. |
+| AD-23 | SSH access | One image. The SSH server is installed but stays stopped, and its port closed, unless a key file (`authorized_keys`, also accepted as `authorized_keys.txt`) is present on the first FAT partition at boot. That file is the only source of authorized keys and is read at every boot; removing it disables SSH at the next boot. Key authentication only, no passwords. | Keys built into the image would put a personal key into CI artifacts or force a rebuild per developer. Enabling SSH from the WebUI would let anyone who obtains the administrator password escalate to a root shell remotely; requiring the file on the card ties shell access to physical possession. Separate development and release images (the earlier design) doubled the build and made release images untestable on the bench. |
 
 ## 3. Target system architecture
 
@@ -190,7 +193,7 @@ Partition layout (MBR, logical partitions for 5–7):
 
 | # | Label | Type | Size (initial proposal) | Content |
 | --- | --- | --- | --- | --- |
-| 1 | `select` | FAT | 64 MiB | `autoboot.txt` and, on Raspberry Pi 3, the first-stage firmware files. |
+| 1 | `select` | FAT | 64 MiB | `autoboot.txt`, the optional SSH key file (AD-23), and, on Raspberry Pi 3, the first-stage firmware files. Mounted read-only at runtime. |
 | 2 | `boot_a` | FAT | 256 MiB | Firmware files, `config.txt`, kernel, device trees, overlays for slot A. |
 | 3 | `boot_b` | FAT | 256 MiB | Same for slot B. |
 | 5 | `root_a` | ext4, read-only | 3 GiB | System slot A. |
@@ -220,7 +223,9 @@ Update flow (single updater lock; `nx-sysd` owns all slot and selector writes):
 - systemd sandboxing for every service: dedicated user, `ProtectSystem=strict`, `NoNewPrivileges`, minimal capabilities, private `/tmp`, and write access only to the service's own directory under `/data`.
 - nftables default-deny inbound policy. A port is opened only while the feature that needs it is enabled.
 - Privileged operations exist only in `nx-sysd` (AD-20). It accepts a fixed set of typed requests from the core's user, validates every argument itself, and offers no generic command execution.
-- No SSH server, package manager, or debug tooling in release images. A separate development image variant enables them.
+- **SSH is opt-in through the card (AD-23).** At boot, `nx-sysd` reads the key file from the first FAT partition, which is mounted read-only. It accepts at most 16 keys and 16 KiB; each line must be one public key of type Ed25519, ECDSA, or RSA with at least 3072 bits; key options are not accepted; Windows line endings are tolerated. A valid file starts the SSH server with exactly those keys for the root account and opens the port; an absent or invalid file leaves the server stopped and the port closed, and an invalid file is reported in diagnostics with the reason. Password and keyboard-interactive login, and agent, X11, and TCP forwarding are disabled. Host keys are generated on first boot and kept on the data partition. Whether SSH is enabled, and the fingerprints of the authorized keys, are shown in diagnostics and the WebUI.
+- **Physical access is full access.** Storage is not encrypted and images are not signed (UPD-03), so whoever holds the card controls the device. The key file does not weaken this; it uses the same trust boundary. The design protects against attackers on the network, not against someone holding the card.
+- No package manager or debug tooling in the image. An optional development image adds diagnostic tools only; it does not differ in access control.
 - Secrets are loaded through one redacting type in the core. Its `Debug`/`Display` output is always a placeholder, so secrets cannot reach logs, events, MQTT state, or diagnostic exports by accident.
 - All user-supplied strings that reach other programs (URLs, share paths, hostnames, device names) are validated in the core and passed as arguments or protocol fields, never through a shell.
 
@@ -249,16 +254,16 @@ A **hardware profile** is a declarative file per sound card, identified by the c
 Phase 0 (roadmap section 2.1) builds sections 3.5 and 3.6 before any playback feature, so every later image reaches the bench device through the mechanism it will ship with.
 
 ```
- workstation ── deploy ──► SSH (development image only) ──► update engine ──► inactive boot/root slot
+ workstation ── deploy ──► SSH (enabled by the key file, AD-23) ──► update engine ──► inactive boot/root slot
       ▲                                                          │ one-shot trial boot
       └────────── confirm within the trial budget ◄── health ◄───┘   no confirmation: previous slot
  bench: Raspberry Pi 4 + HiFiBerry Amp+ ─► speaker; switched power outlet
 ```
 
 - **What exists.** The partition layout of section 3.6, the read-only root and data partition of section 3.5, the update transaction engine in `nx-sysd` with its durable journal, the watchdog chain, and a health service. `nextoomio-core`, PipeWire policy, MPD, the API, and the WebUI are not required. The engine is driven by a command-line interface over SSH; v0.0.1 adds the authenticated upload API in front of the same engine and changes nothing behind it.
-- **Health check in Phase 0.** System target reached, data partition mounted, configured ALSA card present and openable, SSH daemon listening. v0.0.1 extends the list with the API, WebUI assets, PipeWire, and `nx-audio` (section 3.6, step 5).
-- **Remote-confirmed commit (AD-22).** The deploy command waits for the device to return, checks the slot and image version over SSH, and sends the confirmation. Without it the trial ends at its deadline and the previous slot boots. The mode is a build-time property of the development image and cannot be enabled in a release image.
-- **Remote access.** OpenSSH with key authentication only; the authorized key comes from the builder's local configuration. The firewall opens the SSH port only in the development image.
+- **Health check in Phase 0.** System target reached, data partition mounted, configured ALSA card present and openable, and the SSH server listening when a valid key file is present. v0.0.1 extends the list with the API, WebUI assets, PipeWire, and `nx-audio` (section 3.6, step 5).
+- **Remote-confirmed commit (AD-22).** The deploy command requests the mode for its transaction, waits for the device to return, checks the slot and image version over SSH, and sends the confirmation. Without it the trial ends at its deadline and the previous slot boots. The key file is on the shared first partition, so both slots see the same keys.
+- **Remote access (AD-23).** The developer copies the public key file to the first FAT partition when the card is flashed. CI therefore builds one image that contains nobody's key. The first partition is edited on ordinary computers, so spike S1 also checks that the device still boots after the partition was mounted and written on Windows and macOS.
 - **Remote audio evidence.** A test tone is played through ALSA while the check reads the sound card's playback status: the stream must be running and its hardware position must advance for the whole tone. This proves the digital path up to the amplifier, not that the speaker is audible; audible output is confirmed once by listening when someone is at the device. No microphone is part of the bench, the health check, or any device function other than Voice. Quality and synchronization still need electrical measurement at their own gates.
 - **Spike S1.** Phase 0 completes S1 for Raspberry Pi 4: selector behaviour, watchdog coverage before systemd, trial deadline, attempt accounting, and power loss at each durable boundary, using the switched outlet. The Raspberry Pi 3 and 5 parts of S1 and OD-04 stay open until run on those boards.
 - **Still physical.** First flash, storage or power-supply failure, and a state where neither slot boots or the selector is unreadable.

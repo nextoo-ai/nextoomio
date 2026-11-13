@@ -1,10 +1,10 @@
 # nextoomio – roadmap v0.0.1 to v0.0.5
 
-Document version: **1.9**  
+Document version: **1.10**  
 Date: **2026-11-13**  
 Status: **Plan only; no item is marked implemented or verified by this document.**  
-Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.14.  
-Architecture design: [ARCHITECTURE.md](ARCHITECTURE.md), version 0.9.  
+Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.15.  
+Architecture design: [ARCHITECTURE.md](ARCHITECTURE.md), version 0.10.  
 Agent and language rules: [AGENTS.md](AGENTS.md).
 
 ## 1. Goal and planning rules
@@ -17,7 +17,7 @@ Deliver the complete agreed scope by v0.0.5: standalone playback, all required i
 - Do not assign release dates before implementation and hardware results are available. The sequence and release gates define the working plan.
 - Deliver interface security with the interface. Do not expose API, image upload, or group control without protection and defer it to v0.0.5.
 - Local control, setup, and native multiroom work without a project cloud. Losing internet must not disable available local/NAS playback, control, or the native group.
-- All five releases update exclusively through manual image upload. Online updates and image signing/signature verification are outside this roadmap. The Phase 0 development image is also updated only by a manually started upload, from the developer's workstation over SSH; that path exists only in development images.
+- All five releases update exclusively through manual image upload. Online updates and image signing/signature verification are outside this roadmap. On the bench, images are also installed only by a manually started upload, from the developer's workstation over SSH; that path exists only while SSH access is enabled by a key file on the card.
 - Phase 0 (section 2.1) precedes v0.0.1. It delivers no user feature and is not a public release; it exists so that v0.0.1 and later work can be installed and tested on the bench device without physical access.
 - Project artifacts are English; direct communication with the user is Slovak. WebUI initially supports only English (`en`), with translation catalogs and stable keys from v0.0.1. Every subsequent screen follows the same convention; no additional shipped language is required by v0.0.5.
 - Measurement targets are in specification section 13.2. Report missed targets as missed; do not label unverified integrations or cards supported.
@@ -36,15 +36,15 @@ Deliver the complete agreed scope by v0.0.5: standalone playback, all required i
 
 ### 2.1 Phase 0 – A/B base image and remote test bench (v0.0.0)
 
-Phase 0 builds the part of v0.0.1 that everything else is installed with, and builds it first. Its result is a development image on the bench device that can replace itself. It is the same A/B layout and update engine that v0.0.1 later puts behind the authenticated WebUI upload, not a temporary mechanism.
+Phase 0 builds the part of v0.0.1 that everything else is installed with, and builds it first. Its result is an image on the bench device that can replace itself. It is the same A/B layout and update engine that v0.0.1 later puts behind the authenticated WebUI upload, not a temporary mechanism.
 
 #### Scope
 
-- Yocto development image for Raspberry Pi 4 + HiFiBerry Amp+ with the final partition layout: selector, two boot slots, two read-only root slots, and a data partition grown on first boot. Pinned layer revisions; the image and its `.swu` update file are built by CI.
-- The SD card is written by hand once. Every later image is installed over the network.
+- Yocto image for Raspberry Pi 4 + HiFiBerry Amp+ with the final partition layout: selector, two boot slots, two read-only root slots, and a data partition grown on first boot. Pinned layer revisions; the image and its `.swu` update file are built by CI.
+- The SD card is written by hand once, and the key file is copied to it at the same time. Every later image is installed over the network.
 - Update engine with the architecture's transaction rules: write the inactive slot, one-shot trial boot, local health check, commit, at most two attempts, durable attempt accounting, and watchdog coverage from the bootloader onwards. This completes spike S1 for Raspberry Pi 4.
-- Remote access in the development image only: SSH with key authentication, the public key supplied at build time and never stored in the repository. Release images contain no SSH server.
-- Remote-confirmed commit in the development image: a trial slot becomes the default only after the local health check passes and the deploying workstation confirms over the network within the trial budget. An image that boots but cannot be reached is therefore rolled back, not committed.
+- Remote access through a key file: the SSH server stays off unless the developer has placed a public-key file on the first FAT partition of the card. Key authentication only. The same image is used on the bench and for release; it contains nobody's key.
+- Remote-confirmed commit on request: when the deploy command asks for it, a trial slot becomes the default only after the local health check passes and the deploying workstation confirms over the network within the trial budget. An image that boots but cannot be reached is therefore rolled back, not committed.
 - One deploy command on the workstation: upload, install, trial boot, confirm, and report the running slot and image version.
 - Audio smoke path: sound-card overlay loaded, ALSA card present, and a test tone played. Remote evidence is taken from the sound card itself: the playback stream is running and its hardware position advances for the whole tone. Audible output is confirmed once by listening when someone is at the device, for example at the first flash.
 - Bench hardware: bench device on wired Ethernet, passive speaker, and a remotely switched power outlet for power-loss tests and last-resort resets. No microphone is required. A microphone is needed only for the Voice feature (VOICE-01, v0.0.4); if one happens to be attached, the bench may also record the tone as additional evidence.
@@ -205,7 +205,7 @@ Physical access is still needed for the first flash, a failed SD card or power s
 
 ## 8. Requirement coverage matrix
 
-“First delivery” means the first usable implementation for then-available sources/hardware. “Full functional delivery” is the deadline for the complete requirement, including dependencies such as MA exceptions or Voice. Reverify every delivered requirement at v0.0.5. No row records completed work. Phase 0 builds the engine behind SYS-03, SYS-04, SYS-05, and UPD-03 to UPD-06 on a development image, but those requirements count as first delivered in v0.0.1, when the authenticated WebUI upload and the release image exist.
+“First delivery” means the first usable implementation for then-available sources/hardware. “Full functional delivery” is the deadline for the complete requirement, including dependencies such as MA exceptions or Voice. Reverify every delivered requirement at v0.0.5. No row records completed work. Phase 0 builds the engine behind SYS-03, SYS-04, SYS-05, and UPD-03 to UPD-06 on the bench image, but those requirements count as first delivered in v0.0.1, when the authenticated WebUI upload and the release image exist.
 
 | ID | First delivery | Full functional delivery | Coverage |
 | --- | --- | --- | --- |
