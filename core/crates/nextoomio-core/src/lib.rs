@@ -78,10 +78,8 @@ impl SessionManager {
             self.last_selected_standalone = Some(input);
         }
         if matches!(owner, OwnershipDomain::NativeMultiroom { .. }) && self.central_volume_enabled {
-            self.local_volume = VolumePercent::from_group_and_reference(
-                self.group_volume,
-                self.reference_volume,
-            );
+            self.local_volume =
+                VolumePercent::from_group_and_reference(self.group_volume, self.reference_volume);
         }
         self.active_session = Some(ActiveSession {
             id: id.clone(),
@@ -150,10 +148,8 @@ impl SessionManager {
             Some(OwnershipDomain::NativeMultiroom { .. })
         );
         if central_enabled && is_native_satellite {
-            self.local_volume = VolumePercent::from_group_and_reference(
-                self.group_volume,
-                self.reference_volume,
-            );
+            self.local_volume =
+                VolumePercent::from_group_and_reference(self.group_volume, self.reference_volume);
         }
     }
 
