@@ -57,6 +57,9 @@ jobs:
 
       - name: Prepare build and cache directories
         run: |
+          if [ "${{ inputs.runner }}" != "self-hosted" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
           mkdir -p "${GITHUB_WORKSPACE}/build"
           mkdir -p "${GITHUB_WORKSPACE}/yocto-cache/downloads"
           mkdir -p "${GITHUB_WORKSPACE}/yocto-cache/sstate-cache"
@@ -79,6 +82,8 @@ jobs:
         if: inputs.mode == 'parse-only'
         run: |
           docker run --rm \
+            --user=root \
+            --security-opt apparmor=unconfined \
             -v "${GITHUB_WORKSPACE}:/work:rw" \
             -w /work \
             -e USER_ID="$(id -u)" \
@@ -93,6 +98,8 @@ jobs:
         if: inputs.mode == 'full-image'
         run: |
           docker run --rm \
+            --user=root \
+            --security-opt apparmor=unconfined \
             -v "${GITHUB_WORKSPACE}:/work:rw" \
             -w /work \
             -e USER_ID="$(id -u)" \
