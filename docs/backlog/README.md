@@ -10,14 +10,15 @@ Features, stories, and defects are tracked as [GitHub issues](https://github.com
 | --- | --- |
 | Phase 0 features and stories | [Milestone "Phase 0 (v0.0.0)"](https://github.com/nextoo-ai/nextoomio/milestone/1), labels `type:feature`, `type:story`, `type:enabler`, `type:spike` |
 | Defects | [Label `type:defect`](https://github.com/nextoo-ai/nextoomio/issues?q=is%3Aissue+label%3Atype%3Adefect), with `severity:*` and `area:*` labels |
-| Later phases | Milestones `v0.0.1` to `v0.0.5`; their stories are written when the phase before them has produced the results they depend on |
+| v0.0.1 features and stories | [Milestone "v0.0.1"](https://github.com/nextoo-ai/nextoomio/milestone/2). The update stories (`P1-F9`) are revised if spike `P0-F4.1` selects a different boot mechanism |
+| Later phases | Milestones `v0.0.2` to `v0.0.5`; their stories are written when the v0.0.1 spikes (`P1-F11`) have produced the results they depend on |
 | Verification evidence | `docs/evidence/<phase>/<story-id>.md` in the repository, linked from the issue |
 
 ## Identifiers
 
 Identifiers are part of the issue title and never reused.
 
-- **Feature:** `P<phase>-F<n>`, for example `P0-F4`. A feature is a deliverable capability of a phase and the parent issue of its stories.
+- **Feature:** `P<phase>-F<n>`, for example `P0-F4`; `P0` is Phase 0 and `P1` to `P5` are v0.0.1 to v0.0.5. A feature is a deliverable capability of a phase and the parent issue of its stories.
 - **Story:** `P<phase>-F<n>.<m>`, for example `P0-F4.5`. A withdrawn story keeps its identifier and is closed as not planned.
 - **Defect:** `D-<nnn>`.
 - Requirement IDs (`SYS-03`, `UPD-06`, …), architecture decisions (`AD-22`), open decisions (`OD-04`), and spikes (`S1`) keep the meaning they have in the maintained documents.
