@@ -8,6 +8,7 @@ target: nextoomio-image
 
 repos:
   nextoomio:
+    path: ..
     layers:
       meta-nextoomio:
 

@@ -39,8 +39,8 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
     steps:
-      - name: Maximize runner disk space (GitHub-hosted runners only)
-        if: inputs.runner != 'self-hosted'
+      - name: Maximize runner disk space (GitHub-hosted full-image builds only)
+        if: inputs.runner != 'self-hosted' && inputs.mode == 'full-image'
         run: |
           df -h
           sudo rm -rf /usr/share/dotnet \
@@ -57,6 +57,7 @@ jobs:
 
       - name: Prepare build and cache directories
         run: |
+          mkdir -p "${GITHUB_WORKSPACE}/build"
           mkdir -p "${GITHUB_WORKSPACE}/yocto-cache/downloads"
           mkdir -p "${GITHUB_WORKSPACE}/yocto-cache/sstate-cache"
 
@@ -80,11 +81,13 @@ jobs:
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/work:rw" \
             -w /work \
+            -e USER_ID="$(id -u)" \
+            -e GROUP_ID="$(id -g)" \
             -e KAS_WORK_DIR=/work/build \
             -e DL_DIR=/work/yocto-cache/downloads \
             -e SSTATE_DIR=/work/yocto-cache/sstate-cache \
             ghcr.io/siemens/kas/kas:4.5 \
-            kas shell kas/ci-hosted.yml -c "bitbake-layers show-layers && bitbake -p nextoomio-image"
+            kas shell /work/kas/ci-hosted.yml -c "bitbake-layers show-layers && bitbake -p nextoomio-image"
 
       - name: Build full nextoomio Yocto image (full-image)
         if: inputs.mode == 'full-image'
@@ -92,11 +95,13 @@ jobs:
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/work:rw" \
             -w /work \
+            -e USER_ID="$(id -u)" \
+            -e GROUP_ID="$(id -g)" \
             -e KAS_WORK_DIR=/work/build \
             -e DL_DIR=/work/yocto-cache/downloads \
             -e SSTATE_DIR=/work/yocto-cache/sstate-cache \
             ghcr.io/siemens/kas/kas:4.5 \
-            kas build kas/ci-hosted.yml
+            kas build /work/kas/ci-hosted.yml
 
       - name: Upload Yocto image, SPDX SBOM, and license manifest
         if: inputs.mode == 'full-image'
