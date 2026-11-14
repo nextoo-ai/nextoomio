@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.7 (autonomous operation)**  
+Document version: **0.8 (autonomous operation)**  
 Date: **2026-11-14**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -16,6 +16,8 @@ Version 0.5 records the owner's decisions after the first trial run: no person i
 Version 0.6 records the first two pipeline runs and what they changed: the author roles only change files and run checks, and the pipeline creates the branch, checks the changed paths, commits, pushes, and opens the pull request (section 5 step 1, sections 7 and 8, section 9.3). It also records the bootstrap exception (section 8).
 
 Version 0.7 records the third pipeline run (section 9.3).
+
+Version 0.8 records the first complete pipeline run and ends the bootstrap exception (sections 8, 9.3, and 11).
 
 ## 1. Goal
 
@@ -175,7 +177,7 @@ A role is started with `scripts/agent-run.sh <role>`, normally by the pipeline. 
 - **Architect, Reviewer, QM** run in Claude Code as `claude --agent <role>`, with the definition's model, removed tools, and guard hook. The command-line program must be signed in.
 - **Developer, DevOps** run in Antigravity as `agy -p`, headless. Antigravity has no agent definitions or hooks of ours: the script passes the body of the role's definition together with the task, and the repository's `AGENTS.md` is read by Antigravity itself. **The guard does not run there**, and Antigravity's sandbox does not let `git` write to `.git`, so these roles only change files and run checks; the pipeline makes the branch, commit, push, and pull request for them. Before committing, the pipeline applies the guard's path rules to every changed file, which is a mechanical check of the role's paths for pipeline runs; the Reviewer applies CQ-R13 as well. The `model` field in these two definitions applies only if the role is started in Claude Code instead.
 
-**Bootstrap exception.** `scripts/agent-run.sh`, `scripts/agent-token.sh`, and `scripts/agent-pipeline.py` are DevOps paths, but they are what the DevOps role is started with. Until one pipeline run has delivered a DevOps change from start to end, the Architect may change these three files on an `arch/` branch, through the same review and rule set as any change. The Architect authorised this under D-G. It covers pull requests #154, #158, #159, and #160 and any further fix needed to reach that first complete run, and it ends with that run; after it, these files change only through DevOps issues.
+**Bootstrap exception.** `scripts/agent-run.sh`, `scripts/agent-token.sh`, and `scripts/agent-pipeline.py` are DevOps paths, but they are what the DevOps role is started with. Until one pipeline run has delivered a DevOps change from start to end, the Architect may change these three files on an `arch/` branch, through the same review and rule set as any change. The Architect authorised this under D-G. It covered pull requests #154, #158, #159, #160, and #161. **It ended on 2026-11-14** with the first complete pipeline run (section 9.3); these files now change only through DevOps issues.
 
 Paths that a story names under "Touches" outside the role's default paths are passed by the owner in `NEXTOOMIO_EXTRA_PATHS` (patterns separated by colons) when starting the session.
 
@@ -262,7 +264,27 @@ Second pipeline run, on #60: the DevOps role ended without output and the pipeli
 
 Third pipeline run, on #60: the DevOps role again ended without output and without changes; the stored conversation shows `mkdir`, outside the allow list, and a search for `cargo`, which is not installed on the workstation. The allow list was extended with file and text utilities (not `rm`), the Antigravity brief now names the allowed commands and says that any other command ends the run, and #60 was taken back from ready because its criteria need the Rust toolchain.
 
-Not yet shown: a complete run of `scripts/agent-pipeline.py`; a Developer or DevOps run in Antigravity that commits, pushes, and opens a pull request; the Reviewer on Sonnet and QM on Opus.
+**First complete pipeline run, on P0-F8.5 (#88), 2026-11-14.** One command, `scripts/agent-pipeline.py 88`, took the issue from `state:ready` to closed as completed in 91 minutes, with nobody acting in between:
+
+| Step | Observed |
+| --- | --- |
+| DevOps, Gemini 3.8 Flash (High) in Antigravity | Changed files and ran checks; the pipeline checked the paths, committed as `nextoomio-devops[bot]`, pushed, and opened pull request #162 |
+| Reviewer, Claude Sonnet | Requested changes twice, with located findings; approved the third head commit with `Completes-Story: yes` |
+| DevOps, rounds 2 and 3 | New runs addressed each review from what is on GitHub |
+| Merge | GitHub merged under the rule set after the approval and green checks |
+| QM, Claude Opus | Ran the check and its own probes on `main`, gave `QM-Verdict: PASS`, and filed a finding (#163) about two gaps that affect no current file |
+| Close | The pipeline ticked the criteria and closed the issue |
+| Finding | The Architect converted #163 into defect D-038 with criteria and marked it ready |
+
+This run used the limit of two change rounds; a third request for changes would have blocked the issue.
+
+Observed and not yet resolved:
+
+- After the run the local checkout was left on a detached commit instead of `main`. The pipeline should end on `main`.
+- A Reviewer run reported that a local fetch of the pull-request branch was denied and reviewed from the diff alone in that round.
+- The Rust toolchain is not installed on the workstation, so no role can run the core checks locally; stories that need them depend on CI.
+
+Not yet shown: a Developer run (application code under `core/`, `matter/`, or `webui/`); a story with hardware evidence; a run that the pipeline blocks after two rounds; parallel runs.
 
 ## 10. Review findings
 
@@ -287,7 +309,7 @@ Created by the Architect as stories under feature P0-F8 (#71) with the next free
 
 | # | Work item | Role |
 | --- | --- | --- |
-| 1 | First run of `scripts/agent-pipeline.py` on a small issue, recording the points still open in section 9.3 | Architect |
+| 1 | Pipeline faults seen in the first complete run: end on `main`; handle a crash between push and pull-request creation; take the required check names from the rule set instead of a fixed list | DevOps |
 | 2 | CI role path-scope check (CQ-M10), the control behind the guard and the only path control for the Antigravity roles; lock-file enforcement (CQ-M8) | DevOps |
 | 3 | Describe the rule set in `CONTRIBUTING.md` and record the evidence for P0-F8.2 (#85) | DevOps |
 | 4 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88); the key is created and placed by the owner | DevOps |
