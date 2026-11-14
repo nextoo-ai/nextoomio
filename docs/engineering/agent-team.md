@@ -1,13 +1,15 @@
-# Agent team proposal
+# Agent team
 
-Document version: **0.3 (architect review complete; identities created)**  
+Document version: **0.4 (adopted on merge)**  
 Date: **2026-11-14**  
-Status: **Reviewed by the Architect; all open questions of version 0.1 are resolved in section 9 and the review findings are in section 10. Awaiting approval by the project owner. The five GitHub Apps of OQ-01 exist and are installed (section 9.1); no agent uses them yet, and nothing else in this document is set up, configured, or in use. Statements about GitHub and Claude Code behavior marked "verify at setup" were read from documentation or are expected behavior and have not been tried in this repository.**  
-Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md).
+Status: **Adopted by the project owner by merging this document. Section 7 states what is in place and what is not. Statements about GitHub and Claude Code behavior marked "verify at setup" were read from documentation or are expected behavior; section 9.2 records what has been tried.**  
+Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
 
 Version 0.2 records the architect decisions for OQ-01 to OQ-16, adds the review findings RF-01 to RF-10, defines the content of the code-quality rules, and lists the work items that follow from approval.
 
 Version 0.3 replaces the two shared Apps of OQ-01 and OQ-12 with one App per role, as chosen by the project owner, and records what was created and checked on 2026-11-14 (section 9.1).
+
+Version 0.4 turns the proposal into the team document: it is renamed from `agent-team-proposal.md`, the code-quality rules move to their own file, the agent definitions, the guard, and the session scripts exist, and section 7 records the state of each change.
 
 ## 1. Goal
 
@@ -113,86 +115,41 @@ Pull requests never use a closing keyword under this model: an issue is closed o
 
 ## 6. Code-quality rules
 
-A new document, `docs/engineering/code-quality.md`, holds the rules the Reviewer applies. Its content is decided here (OQ-05, OQ-13); the document is written by the Architect in the introducing pull request and identifiers below are kept.
+[code-quality.md](code-quality.md) holds the rules the Reviewer applies (OQ-05, OQ-13): the mechanically enforced rules `CQ-M*` that belong in CI, the review rules for code `CQ-R*`, and the documentation checklist `CQ-D*`. The Architect maintains it; changes are reviewed and merged like any other rule change (OQ-11).
 
-### 6.1 Mechanically enforced rules
+## 7. State of the changes
 
-These belong in CI. The Reviewer checks only that the jobs ran on the reviewed commit and passed, and reports a rule that CI claims to enforce but does not as a finding.
+"In place" means the file or setting exists as described. It does not mean that an agent session has used it; section 9.2 records what was tried.
 
-| ID | Rule | Enforced today |
+| File or setting | Change | State |
 | --- | --- | --- |
-| CQ-M1 | Rust formatting (`cargo fmt --check`) and Clippy with warnings denied | Yes, `rust-core` job |
-| CQ-M2 | Rust tests pass | Yes, `rust-core` job |
-| CQ-M3 | Dependency licenses, bans, and sources (`cargo-deny`) | Yes, for `core/` only |
-| CQ-M4 | Requirement traceability and Markdown links (`scripts/check_traceability.py`) | Yes |
-| CQ-M5 | i18n catalog gate (`scripts/check_i18n.mjs`) | Partly; D-030 records what it misses |
-| CQ-M6 | WebUI type-check and build | Yes, `webui` job |
-| CQ-M7 | Yocto layer and kas definition check | Yes |
-| CQ-M8 | Lock files committed and used (`--locked`, `npm ci`) | No; neither `core/Cargo.lock` nor `webui/package-lock.json` is committed, and CI runs `npm install` without `--locked` builds |
-| CQ-M9 | Document versions and cross-references | No; P0-F8.3 (#86) |
-| CQ-M10 | Role path scope: a pull request touches only the paths of the role its branch prefix names (OQ-02) | No; new story |
+| `AGENTS.md` | Worktrees under `.claude/worktrees/` (D-C, OQ-07); `ARCHITECTURE.md` named as a source of truth (defect D-037, #69); the "Agent team" section | In place |
+| `docs/backlog/README.md` | Findings and D-B (OQ-10); `state:ready`, `state:blocked`, `risk:high`, and "Touches" (OQ-06, OQ-07); no closing keywords (RF-05); who sets `state:implemented` (RF-04); Definition of Done items 4 and 5 (RF-03) | In place |
+| `.claude/agents/` | One definition per role (section 8) | In place |
+| `.claude/hooks/role-guard.py` | Path and command guard (OQ-02) | In place |
+| `docs/engineering/code-quality.md` | Section 6 | In place |
+| `scripts/agent-token.sh`, `scripts/agent-run.sh` | Role identity for a session (OQ-12, section 8) | In place |
+| `.gitignore` | `.claude/worktrees/` | In place |
+| GitHub labels | `state:ready`, `state:blocked`, `type:finding`, `risk:high` | In place |
+| GitHub Apps | One per role (section 9.1) | In place |
+| Rule set on `main` and `.github/CODEOWNERS` | OQ-01; extends P0-F8.2 (#85) | Not in place |
+| `.github/PULL_REQUEST_TEMPLATE.md` | Role and model line and the issue reference; P0-F8.1 (#84) covers the template | Not in place |
+| CI | Role path scope (CQ-M10) and lock files (CQ-M8) | Not in place |
+| Bench key | OQ-14 | Not in place |
 
-### 6.2 Review rules for code
-
-| ID | Rule |
-| --- | --- |
-| CQ-R1 | The change does what the linked issue's acceptance criteria require and nothing unrelated. |
-| CQ-R2 | No claim beyond the code: comments, documents, test names, CI step names, and commit messages do not say "implemented", "verified", or "supported" for behavior that is absent or stubbed. A stub says it is a stub. |
-| CQ-R3 | Requirement IDs are cited only where the behavior exists. |
-| CQ-R4 | Tests are derived from the specification scenario or acceptance criterion they name and can fail; they do not restate the implementation. |
-| CQ-R5 | Errors that cross the API or MQTT boundary carry stable machine-readable codes, independent of translated text. |
-| CQ-R6 | Secrets pass only through a redacting type and never reach logs, diagnostics, error messages, or evidence. |
-| CQ-R7 | No user-supplied or network-supplied string reaches a shell or a command line unvalidated; privileged operations go only through `nx-sysd` typed requests (AD-20). |
-| CQ-R8 | Playback requests go through the session manager; configured group membership stays separate from the active playback owner. |
-| CQ-R9 | No panic, `unwrap`, or `expect` on input from the network, files, or hardware in daemon code; `unsafe` only with a comment stating why it is sound. |
-| CQ-R10 | User-facing WebUI text exists only in the English catalog behind stable keys, with interpolation and plural forms instead of concatenation. |
-| CQ-R11 | Every new third-party component is named by the story, pinned to an exact version, and recorded with its license in the recipe and the component register; model weights, firmware, and bundled assets are checked separately. |
-| CQ-R12 | Nothing in the change depends on correct wall-clock time for a local function (AD-21). |
-| CQ-R13 | The change stays inside the author role's paths (section 4). An edit to `ARCHITECTURE.md` from a `dev/` or `ops/` branch is confined to register rows in section 10. |
-| CQ-R14 | No abstraction, configuration option, or dependency without a use in this change. |
-
-### 6.3 Documentation checklist
-
-| ID | Rule |
-| --- | --- |
-| CQ-D1 | Every requirement ID remains covered in the roadmap and the architecture; none is dropped, moved beyond v0.0.5, or renumbered. |
-| CQ-D2 | Release assignments agree between specification, roadmap, architecture, and affected issues. |
-| CQ-D3 | Document versions and cross-references to other documents and sections are correct, and the version note describes the change. |
-| CQ-D4 | Planned, implemented, and hardware-verified are distinguished; no result is stated without recorded evidence. |
-| CQ-D5 | A changed or new decision (`AD-*`, `OD-*`) states the alternative and the reason, and affected stories are updated or named. |
-| CQ-D6 | License and component statements name the exact version they were checked against. |
-| CQ-D7 | `SK/` is unchanged. |
-| CQ-D8 | Evidence files contain date, image version and commit, hardware model and revision, procedure, and observed result, with missed targets recorded as missed, and no secret. |
-
-## 7. Required changes to existing rules
-
-These are proposed and not yet made. Section 11 maps them to work items.
-
-| File or setting | Change |
-| --- | --- |
-| `AGENTS.md` | Allow git worktrees under `.claude/worktrees/` for parallel agents (D-C, OQ-07). Name `ARCHITECTURE.md` as a source of truth (already defect D-037, #69). Reference the team model and the role limits. |
-| `docs/backlog/README.md` | Replace "Everyone who finds a defect files it" with D-B and the finding issue (OQ-10). Add `state:ready`, `state:blocked`, `risk:high`, and the "Touches" field (OQ-06, OQ-07). Remove the closing-keyword exception (RF-05). State who sets `state:implemented` (RF-04). Reword Definition of Done items 4 and 5 to match the role limits (RF-03). |
-| `.claude/agents/` | One definition per role (section 8). |
-| `.claude/hooks/` | The path-scope and command guard used by the agent definitions (OQ-02). |
-| `docs/engineering/code-quality.md` | New, section 6. |
-| `docs/engineering/agent-team.md` | This document, renamed when adopted, with sections 9 and 10 reduced to the decisions. Agent definitions reference it, not a proposal. |
-| `.gitignore` | Add `.claude/worktrees/`. |
-| `.github/CODEOWNERS` | `* @nextoo-ai`. |
-| `.github/PULL_REQUEST_TEMPLATE.md` | Add the role and model line and the issue reference; P0-F8.1 (#84) already covers the template. |
-| GitHub labels | `state:ready`, `state:blocked`, `type:finding`, `risk:high`. |
-| Rule set on `main` | OQ-01; extends P0-F8.2 (#85). The GitHub Apps of OQ-01 and OQ-12 exist (section 9.1). |
-
-## 8. What an agent definition contains
+## 8. Agent definitions and starting a session
 
 Each file under `.claude/agents/<role>.md` (`architect`, `developer`, `reviewer`, `qm`, `devops`) has frontmatter and a short body:
 
 - `name` and a one-line `description`.
 - `model` and `effort` as assigned in section 4.
-- `tools`: the Reviewer and QM definitions omit the file-editing tools altogether.
-- `hooks`: a `PreToolUse` hook on the editing tools and on the shell that calls the shared guard with the role name (OQ-02).
-- Body: responsibility, input, output, and limits by reference to the role's section of the team document; the instruction to read `AGENTS.md`, the backlog conventions, and the code-quality rules before acting; the role and model line; and the instruction to report to the project owner in Slovak.
+- `disallowedTools`: the Reviewer and QM definitions remove the file-editing tools altogether. Every definition removes the tool that starts subagents, because it is not established that a subagent runs under the role's guard; the DevOps delegation of log reading to `haiku` (section 4.5) is therefore not available until that is checked.
+- `hooks`: a `PreToolUse` hook on the editing tools and on the shell that calls `.claude/hooks/role-guard.py` with the role name (OQ-02).
+- Body: the role's task and limits in brief, by reference to this document; the instruction to read `AGENTS.md`, the backlog conventions, and this document before acting; the role and model line; and the instruction to report to the project owner in Slovak.
 
-The project owner starts a role as the main session with `claude --agent <role>`, adding `--worktree <name>` for Developer runs. The Claude Code documentation lists these frontmatter fields and both flags; that the tool restrictions, model, and hooks of a definition apply to a main session started this way is to be verified at setup, and the adoption story records the result.
+The project owner starts a role with `scripts/agent-run.sh <role>`, adding Claude Code arguments such as `--worktree <name>` for Developer runs. The script gives `gh` and `git` a private configuration that contains only the short-lived token of the role's App, refreshes it while the session runs, sets the commit author to the App's bot identity, and starts `claude --agent <role>`. `scripts/agent-run.sh --check <role>` sets up the identity, prints it, and exits. The script needs the `claude` command-line program to be signed in.
+
+Paths that a story names under "Touches" outside the role's default paths are passed by the owner in `NEXTOOMIO_EXTRA_PATHS` (patterns separated by colons) when starting the session.
 
 ## 9. Resolved questions
 
@@ -233,6 +190,16 @@ Checked: each token is issued for this repository only; the Reviewer token can r
 
 Not checked: opening a pull request or submitting a review as an App, approval of an App-authored pull request by the owner, the code-owner requirement, and any use of the Apps by an agent session.
 
+### 9.2 Checked at adoption (2026-11-14)
+
+| Check | Result |
+| --- | --- |
+| `role-guard.py` given hook input directly: 7 cases that must pass and 15 that must be denied (paths per role, the `SK/` archive, files outside the repository, merge, push to `main`, forced push, closing an issue, a review by a non-Reviewer, an unknown role) | All as expected |
+| `scripts/agent-run.sh --check` for `reviewer` and `developer` | The token sees only this repository; the commit identity is the App's bot; the owner's own `gh` login is unchanged afterwards |
+| A session started with `scripts/agent-run.sh qm` | **Not run:** the `claude` command-line program on the workstation was not signed in |
+
+Still to verify, in the first trial run on a small story: that a session started with `--agent` applies the definition's model, removed tools, and hook; that commits and pushes from a session carry the App's identity; that a pull request and a review can be created as an App; that the owner can approve an App-authored pull request; how `--worktree` names its branch.
+
 ## 10. Review findings
 
 Problems found in version 0.1 during architect review, and how version 0.2 resolves them.
@@ -250,22 +217,21 @@ Problems found in version 0.1 during architect review, and how version 0.2 resol
 | RF-09 | The claim that a different model avoids shared blind spots was stronger than can be shown for models of one vendor. | Reworded in OQ-03. |
 | RF-10 | P0-F8.2 (#85) lists "required human review by a second person" as out of scope and requires no review at all, which no longer matches the model. | The story is revised with an explaining comment when this document is approved (section 11). |
 
-## 11. Work items after approval
+## 11. Remaining work
 
-None of these exist yet. They are created by the Architect as stories under feature P0-F8 (#71) with the next free identifiers once the project owner approves this document.
+Created by the Architect as stories under feature P0-F8 (#71) with the next free identifiers. None of them exists as an issue yet.
 
 | # | Work item | Role | Depends on |
 | --- | --- | --- | --- |
-| 1 | Adopt the team document, write `code-quality.md`, update `AGENTS.md` and the backlog conventions, create the labels; resolves D-037 (#69) | Architect | PR #70 merged |
-| 2 | Agent definitions, guard hook, `.gitignore` entry; record what was verified about `--agent` and `--worktree` | Architect | 1 |
-| 3 | Revise P0-F8.2 (#85): rule set with code-owner review, `CODEOWNERS` | DevOps; rule set applied by the owner | 1 |
-| 4 | Token script for the existing Apps, and the check that App-authored pull requests and reviews behave as OQ-01 expects | DevOps | 3 |
-| 5 | CI role path-scope check (CQ-M10) and lock-file enforcement (CQ-M8) | DevOps | 1 |
-| 6 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88) | DevOps; key created by the owner | 1 |
+| 1 | Trial run of the whole workflow on one small story, recording the checks listed in section 9.2 | All roles | This document merged; `claude` signed in |
+| 2 | Revise P0-F8.2 (#85): rule set with code-owner review, `CODEOWNERS` | DevOps; rule set applied by the owner | This document merged |
+| 3 | CI role path-scope check (CQ-M10) and lock-file enforcement (CQ-M8) | DevOps | 1 |
+| 4 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88) | DevOps; key created by the owner | 1 |
+| 5 | Check whether a subagent runs under the role's guard, and enable the DevOps log delegation if it does | Architect | 1 |
 
-Items 3 and 6 need actions only the project owner can take: applying repository settings, and creating and placing the bench key.
+Until item 2 is done, the three Apps with contents write can push to `main` and merge; only the instructions and the guard stand against it.
 
-## 12. Out of scope of this proposal
+## 12. Out of scope
 
 - Automatic triggering by labels or events (excluded by D-A; may be revisited later).
 - A coordinator agent that starts other agents.

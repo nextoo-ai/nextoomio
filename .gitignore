@@ -12,6 +12,11 @@ Thumbs.db
 # Scratch / unmaintained local outputs
 Claude outputs/
 
+# Git worktrees of role agents (AGENTS.md, docs/engineering/agent-team.md)
+/.claude/worktrees/
+# Local Claude Code settings
+/.claude/settings.local.json
+
 # Rust build artifacts
 /core/target/
 /matter/target/
