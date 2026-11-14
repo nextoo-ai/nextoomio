@@ -53,7 +53,7 @@ VERSION_RE = re.compile(rf"(?:`v|\bversion\s+\**)({NUM})(?![\w.]*\s*[–-]\s*v?\
 
 # "<document> section 3.5", "<document>.md (section 5.4)", "sections 10–11".
 SECTION_REF_RE = re.compile(
-    r"(?<![\w/.-])(?P<doc>specification|roadmap|architecture)(?:\.md)?(?!\w)"
+    r"(?<![\w/.-])(?P<doc>specification|roadmap|architecture)(?:\.md)?`?(?!\w)"
     r"(?:\]\([^)]*\))?[\s,:(]{0,3}(?:sections?|§)\s*"
     rf"(?P<nums>{NUM}(?:\s*(?:–|-|/|and)\s*{NUM})*)",
     re.IGNORECASE,
