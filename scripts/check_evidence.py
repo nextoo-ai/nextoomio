@@ -23,8 +23,10 @@ Offline only: does not connect to GitHub or network to verify issue existence.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 from typing import NamedTuple
@@ -38,6 +40,7 @@ PLACEHOLDER_RE = re.compile(r"^\s*<[^>]+>\s*$")
 TODO_RE = re.compile(r"^\s*(?:TODO|TBD|FIXME)\b", re.IGNORECASE)
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN[ A-Z0-9_-]*PRIVATE KEY-----")
 COMMIT_HASH_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
+COMMIT_MARKER = "{{COMMIT}}"
 HEADING_LINE_RE = re.compile(r"^\s*#{1,6}(?:\s+.*)?$")
 
 REQUIRED_TEMPLATE_FIELDS = [
@@ -191,9 +194,31 @@ def check_template(template_path: pathlib.Path) -> list[str]:
     return errors
 
 
-def check_evidence_file(path: pathlib.Path) -> list[str]:
+def is_on_main() -> bool:
+    """Return True if the current git checkout or CI context is on main."""
+    if os.environ.get("GITHUB_REF") == "refs/heads/main" or os.environ.get("GITHUB_REF_NAME") == "main":
+        return True
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip() == "main":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def check_evidence_file(path: pathlib.Path, is_main: bool | None = None) -> list[str]:
     errors: list[str] = []
     rel_path = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+
+    if is_main is None:
+        is_main = is_on_main()
 
     # Check filename convention
     if not FILENAME_RE.match(path.name):
@@ -230,8 +255,14 @@ def check_evidence_file(path: pathlib.Path) -> list[str]:
             img_val = None
 
     if img_val is not None:
+        # Check for unresolved {{COMMIT}} marker on main (D-039, AC2)
+        if is_main and COMMIT_MARKER in img_val:
+            errors.append(f"{rel_path}: mandatory field 'Image version and commit' contains unresolved marker '{COMMIT_MARKER}' on main")
         if not COMMIT_HASH_RE.search(img_val):
-            errors.append(f"{rel_path}: mandatory field 'Image version and commit' must record a git commit hash")
+            if not is_main and COMMIT_MARKER in img_val:
+                pass  # Allowed on author branch before delivery replaces it
+            else:
+                errors.append(f"{rel_path}: mandatory field 'Image version and commit' must record a git commit hash")
 
     # 3. Hardware model and revision
     hw_val = extract_metadata_field(text, re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?Hardware(?:\s+model)?(?:\s+and\s+revision)?(?::\*\*|\*\*:|:)\s*(.*)$", re.IGNORECASE))
@@ -628,6 +659,67 @@ def run_self_tests() -> int:
         errs = check_evidence_file(f_multi_heading)
         assert_true(any("mandatory field 'Procedure' is empty or missing" in e for e in errs), f"Expected multi-heading Procedure error, got: {errs}")
 
+        # 21. Evidence file with {{COMMIT}} marker on working branch (is_main=False) must PASS (D-039)
+        f_marker_branch = tmp_path / "P0-F8.19.md"
+        f_marker_branch.write_text(
+            "# Evidence: P0-F8.19 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit {{COMMIT}}\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\nSteps executed here.\n\n"
+            "## Observed result\nOutput observed here.\n\n"
+            "## Missed targets\nNone.\n",
+            encoding="utf-8",
+        )
+        errs = check_evidence_file(f_marker_branch, is_main=False)
+        assert_true(len(errs) == 0, f"Expected {{COMMIT}} on branch to pass, got: {errs}")
+
+        # 22. Evidence file with unresolved {{COMMIT}} marker on main (is_main=True) must FAIL and name file (D-039, AC2)
+        errs_main = check_evidence_file(f_marker_branch, is_main=True)
+        assert_true(
+            any("{{COMMIT}}" in e for e in errs_main) and any(f_marker_branch.name in e for e in errs_main),
+            f"Expected unresolved marker error on main naming file, got: {errs_main}",
+        )
+
+        # 23. Evidence file with {{COMMIT}} marker alongside a hash on main (is_main=True) must FAIL (D-039, AC2)
+        f_marker_with_hash = tmp_path / "P0-F8.20.md"
+        f_marker_with_hash.write_text(
+            "# Evidence: P0-F8.20 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** image 1.0 commit abcdef12; commit {{COMMIT}}\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\nSteps executed here.\n\n"
+            "## Observed result\nOutput observed here.\n\n"
+            "## Missed targets\nNone.\n",
+            encoding="utf-8",
+        )
+        errs_hash_main = check_evidence_file(f_marker_with_hash, is_main=True)
+        assert_true(
+            any("{{COMMIT}}" in e for e in errs_hash_main) and any(f_marker_with_hash.name in e for e in errs_hash_main),
+            f"Expected unresolved marker error on main alongside hash, got: {errs_hash_main}",
+        )
+
+        # 24. Evidence file without commit hash and without marker on branch must FAIL (D-039)
+        f_no_hash_no_marker = tmp_path / "P0-F8.21.md"
+        f_no_hash_no_marker.write_text(
+            "# Evidence: P0-F8.21 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit unknown\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\nSteps executed here.\n\n"
+            "## Observed result\nOutput observed here.\n\n"
+            "## Missed targets\nNone.\n",
+            encoding="utf-8",
+        )
+        errs_no_hash = check_evidence_file(f_no_hash_no_marker, is_main=False)
+        assert_true(
+            any("mandatory field 'Image version and commit' must record a git commit hash" in e for e in errs_no_hash),
+            f"Expected missing commit hash error on branch, got: {errs_no_hash}",
+        )
+
     print()
     if failures:
         print(f"FAILED ({len(failures)} self-test failures):")
@@ -646,6 +738,12 @@ def main(argv: list[str] | None = None) -> int:
     if "--test" in argv:
         return run_self_tests()
 
+    force_main = False
+    if "--main" in argv:
+        argv = [a for a in argv if a != "--main"]
+        force_main = True
+
+    is_main = force_main or is_on_main()
     errors: list[str] = []
     checked_files: list[pathlib.Path] = []
 
@@ -653,7 +751,7 @@ def main(argv: list[str] | None = None) -> int:
         errors.extend(check_template(TEMPLATE_PATH))
         evidence_files = find_evidence_files(EVIDENCE_DIR)
         for ef in evidence_files:
-            errors.extend(check_evidence_file(ef))
+            errors.extend(check_evidence_file(ef, is_main=is_main))
             checked_files.append(ef)
     else:
         for arg in argv:
@@ -661,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
             if path == TEMPLATE_PATH:
                 errors.extend(check_template(path))
             else:
-                errors.extend(check_evidence_file(path))
+                errors.extend(check_evidence_file(path, is_main=is_main))
                 checked_files.append(path)
 
     if errors:

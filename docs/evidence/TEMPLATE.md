@@ -10,6 +10,7 @@ docs/evidence/<phase>/<story-id>.md (e.g. docs/evidence/p0/P0-F8.5.md) or docs/e
 Rules:
 - Never record secrets, private keys, credentials, tokens, passwords, or addresses of private networks.
 - Every mandatory field below must be filled in (not empty, whitespace, or unresolved placeholder).
+- When writing evidence in the change's own pull request, write {{COMMIT}} in 'Image version and commit' and not a hash; the pipeline replaces it with the change commit hash on delivery.
 - Missed targets must be recorded as missed; write "none" if all targets were met.
 - State explicitly if physical access to the device was needed (or "none").
 -->
@@ -18,7 +19,7 @@ Rules:
 > Secrets, private keys, credentials, tokens, passwords, and addresses of private networks must not be recorded in evidence.
 
 - **Date:** <YYYY-MM-DD>
-- **Image version and commit:** <image build/version and git commit, or "none (repository only); commit <hash>">
+- **Image version and commit:** <image build/version and git commit, or "none (repository only); commit {{COMMIT}}"; when writing evidence in the change's own pull request, write the literal marker {{COMMIT}} and not a hash (the pipeline replaces it with the change commit hash on delivery)>
 - **Hardware model and revision:** <hardware model and revision, or "none (repository only)">
 - **Physical access needed:** <none, or describe physical intervention needed>
 

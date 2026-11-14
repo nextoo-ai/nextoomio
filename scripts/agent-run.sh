@@ -114,10 +114,14 @@ The role-guard hook does not run in this program; the limits above apply all the
 How you deliver here differs from your role definition: this program cannot
 write to .git. Do not create a branch, commit, push, or open a pull request.
 You are already on the right branch. Make your changes in the working tree,
-run the checks the task needs, and leave the files as they are. The pipeline
-checks your changed paths against your role, commits and pushes them under
-your identity, and opens or updates the pull request. You may read issues,
-pull requests, and reviews with gh, and comment on your issue.
+run the checks the task needs, and leave the files as they are. When writing
+evidence in the change's own pull request, write the literal marker {{COMMIT}}
+in the "Image version and commit" field (for example, none (repository only);
+commit {{COMMIT}}) and not a hash: the pipeline replaces it with the change
+commit hash on delivery. The pipeline checks your changed paths against your
+role, commits and pushes them under your identity, and opens or updates the
+pull request. You may read issues, pull requests, and reviews with gh, and
+comment on your issue.
 
 This program runs without anyone to ask. A shell command outside its allow
 list ends your whole run with no output, and your work is lost. Use only:

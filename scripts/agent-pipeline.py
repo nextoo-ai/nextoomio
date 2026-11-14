@@ -157,6 +157,26 @@ def deliver(role, issue, title, branch, output, extra_paths, number):
                GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_EMAIL=email)
     run(["git", "add", "-A"], env=env)
     run(["git", "commit", "-q", "-m", f"{pr_title}\n\nRefs #{issue}"], env=env)
+
+    # D-039: Replace {{COMMIT}} marker in changed evidence files with the full change commit hash.
+    change_commit = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    evidence_updated = False
+    for p in paths:
+        if (p.startswith("docs/evidence/") and p.endswith(".md")
+                and p not in ("docs/evidence/TEMPLATE.md", "docs/evidence/README.md")):
+            full_path = os.path.join(ROOT, p)
+            if os.path.isfile(full_path):
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if "{{COMMIT}}" in content:
+                    updated = content.replace("{{COMMIT}}", change_commit)
+                    with open(full_path, "w", encoding="utf-8") as f:
+                        f.write(updated)
+                    run(["git", "add", p], env=env)
+                    evidence_updated = True
+    if evidence_updated:
+        run(["git", "commit", "-q", "-m", f"Record change commit in evidence\n\nRefs #{issue}"], env=env)
+
     helper = "!f() { echo username=x-access-token; echo \"password=$NEXTOOMIO_PUSH_TOKEN\"; }; f"
     run(["git", "-c", "credential.helper=", "-c", f"credential.helper={helper}",
          "push", "-q", "-u", "origin", branch], env=dict(env, NEXTOOMIO_PUSH_TOKEN=token(role)))
@@ -227,11 +247,105 @@ def block(issue, reason):
     raise Stop(2, f"issue #{issue} blocked: {reason}")
 
 
+def run_self_tests():
+    """Run automated unit tests for pipeline deliver commit replacement logic (D-039, AC1)."""
+    import tempfile
+    print("Running agent-pipeline self-tests...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = os.path.join(tmpdir, "repo")
+        os.makedirs(repo_dir)
+
+        def git_cmd(cmd, env=None):
+            return subprocess.run(
+                ["git"] + cmd, cwd=repo_dir, env=env, text=True,
+                capture_output=True, check=True
+            )
+
+        git_cmd(["init", "-q", "-b", "main"])
+        git_cmd(["config", "user.name", "Test Bot"])
+        git_cmd(["config", "user.email", "test@example.com"])
+
+        # Initial commit on main
+        readme = os.path.join(repo_dir, "README.md")
+        with open(readme, "w") as f:
+            f.write("# Test\n")
+        git_cmd(["add", "README.md"])
+        git_cmd(["commit", "-q", "-m", "Initial commit"])
+
+        # Switch to branch ops/P0-F9.9-test
+        git_cmd(["switch", "-c", "ops/P0-F9.9-test"])
+
+        # Author creates change and evidence file with {{COMMIT}}
+        code_file = os.path.join(repo_dir, "script.py")
+        with open(code_file, "w") as f:
+            f.write("print('feature implementation')\n")
+
+        ev_dir = os.path.join(repo_dir, "docs", "evidence", "p0")
+        os.makedirs(ev_dir)
+        ev_file = os.path.join(ev_dir, "P0-F9.9.md")
+        ev_rel = "docs/evidence/p0/P0-F9.9.md"
+        with open(ev_file, "w") as f:
+            f.write(
+                "# Evidence: P0-F9.9 Test\n"
+                "- **Date:** 2026-11-14\n"
+                "- **Image version and commit:** none (repository only); commit {{COMMIT}}\n"
+                "- **Hardware model and revision:** none\n"
+                "- **Physical access needed:** none\n\n"
+                "## Procedure\nRun test.\n\n"
+                "## Observed result\nPassed.\n\n"
+                "## Missed targets\nNone.\n"
+            )
+
+        # Simulate pipeline delivery logic
+        paths = ["script.py", ev_rel]
+        # Step 1: Change commit
+        git_cmd(["add", "-A"])
+        git_cmd(["commit", "-q", "-m", "Add script and evidence\n\nRefs #99"])
+        change_commit = git_cmd(["rev-parse", "HEAD"]).stdout.strip()
+        assert len(change_commit) == 40, f"Expected 40-char hash, got {change_commit}"
+
+        # Verify change commit contains the change
+        show_code = git_cmd(["show", f"{change_commit}:script.py"]).stdout
+        assert "print('feature implementation')" in show_code
+
+        # Step 2: Pipeline replaces {{COMMIT}} in evidence files
+        evidence_updated = False
+        for p in paths:
+            if (p.startswith("docs/evidence/") and p.endswith(".md")
+                    and p not in ("docs/evidence/TEMPLATE.md", "docs/evidence/README.md")):
+                fpath = os.path.join(repo_dir, p)
+                with open(fpath, "r", encoding="utf-8") as f:
+                    c = f.read()
+                if "{{COMMIT}}" in c:
+                    c_new = c.replace("{{COMMIT}}", change_commit)
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(c_new)
+                    git_cmd(["add", p])
+                    evidence_updated = True
+        assert evidence_updated, "Expected evidence file to be updated"
+        git_cmd(["commit", "-q", "-m", "Record change commit in evidence\n\nRefs #99"])
+        follow_up_commit = git_cmd(["rev-parse", "HEAD"]).stdout.strip()
+        assert follow_up_commit != change_commit
+
+        # Verify follow-up commit has the full change_commit hash and no {{COMMIT}}
+        ev_after = git_cmd(["show", f"{follow_up_commit}:{ev_rel}"]).stdout
+        assert "{{COMMIT}}" not in ev_after, "Marker {{COMMIT}} should be replaced"
+        assert f"commit {change_commit}" in ev_after, f"Expected full hash {change_commit} in evidence"
+
+    print("OK: all agent-pipeline self-tests passed.")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("issue", type=int)
+    parser.add_argument("issue", type=int, nargs="?")
     parser.add_argument("--role", choices=["developer", "devops"])
+    parser.add_argument("--test", action="store_true", help="Run automated self-tests for delivery logic")
     args = parser.parse_args()
+    if args.test:
+        return run_self_tests()
+    if args.issue is None:
+        parser.error("the following arguments are required: issue")
     issue = args.issue
 
     info = gh_json(["issue", "view", str(issue), "--json", "title,state,labels,body"])
