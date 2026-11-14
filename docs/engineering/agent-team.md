@@ -264,7 +264,7 @@ Second pipeline run, on #60: the DevOps role ended without output and the pipeli
 
 Third pipeline run, on #60: the DevOps role again ended without output and without changes; the stored conversation shows `mkdir`, outside the allow list, and a search for `cargo`, which is not installed on the workstation. The allow list was extended with file and text utilities (not `rm`), the Antigravity brief now names the allowed commands and says that any other command ends the run, and #60 was taken back from ready because its criteria need the Rust toolchain.
 
-**First complete pipeline run, on P0-F8.5 (#88), 2026-11-14.** One command, `scripts/agent-pipeline.py 88`, took the issue from `state:ready` to closed as completed in 91 minutes, with nobody acting in between:
+**First complete pipeline run, on P0-F8.5 (#88), 2026-11-14.** One command, `scripts/agent-pipeline.py 88`, took the issue from `state:ready` to closed as completed in 31 minutes (18:17 to 18:48), with nobody acting in between:
 
 | Step | Observed |
 | --- | --- |
