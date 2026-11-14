@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.5 (autonomous operation)**  
+Document version: **0.6 (autonomous operation)**  
 Date: **2026-11-14**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -12,6 +12,8 @@ Version 0.3 replaces the two shared Apps of OQ-01 and OQ-12 with one App per rol
 Version 0.4 turns the proposal into the team document: it is renamed from `agent-team-proposal.md`, the code-quality rules move to their own file, the agent definitions, the guard, and the session scripts exist, and section 7 records the state of each change.
 
 Version 0.5 records the owner's decisions after the first trial run: no person in the loop, one independent model per role with development in Antigravity, and the Architect as orchestrator (section 3.1). It adds the rule set on `main`, the pipeline, the Antigravity author roles, and the results of the trial (section 9.3).
+
+Version 0.6 records the first two pipeline runs and what they changed: the author roles only change files and run checks, and the pipeline creates the branch, checks the changed paths, commits, pushes, and opens the pull request (section 5 step 1, sections 7 and 8, section 9.3). It also records the bootstrap exception (section 8).
 
 ## 1. Goal
 
@@ -170,6 +172,8 @@ A role is started with `scripts/agent-run.sh <role>`, normally by the pipeline. 
 
 - **Architect, Reviewer, QM** run in Claude Code as `claude --agent <role>`, with the definition's model, removed tools, and guard hook. The command-line program must be signed in.
 - **Developer, DevOps** run in Antigravity as `agy -p`, headless. Antigravity has no agent definitions or hooks of ours: the script passes the body of the role's definition together with the task, and the repository's `AGENTS.md` is read by Antigravity itself. **The guard does not run there**, and Antigravity's sandbox does not let `git` write to `.git`, so these roles only change files and run checks; the pipeline makes the branch, commit, push, and pull request for them. Before committing, the pipeline applies the guard's path rules to every changed file, which is a mechanical check of the role's paths for pipeline runs; the Reviewer applies CQ-R13 as well. The `model` field in these two definitions applies only if the role is started in Claude Code instead.
+
+**Bootstrap exception.** `scripts/agent-run.sh`, `scripts/agent-token.sh`, and `scripts/agent-pipeline.py` are DevOps paths, but they are what the DevOps role is started with. Until one pipeline run has delivered a DevOps change from start to end, the Architect may change these three files on an `arch/` branch, through the same review and rule set as any change. The Architect authorised this under D-G. It covers pull requests #154, #158, #159, and #160 and any further fix needed to reach that first complete run, and it ends with that run; after it, these files change only through DevOps issues.
 
 Paths that a story names under "Touches" outside the role's default paths are passed by the owner in `NEXTOOMIO_EXTRA_PATHS` (patterns separated by colons) when starting the session.
 

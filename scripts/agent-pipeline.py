@@ -270,8 +270,12 @@ def main():
     rounds = 0
     while True:
         output = agent(role, task, log, extra_paths=touches)
-        number = deliver(role, issue, info["title"], branch, output, touches, number)
+        delivered = deliver(role, issue, info["title"], branch, output, touches, number)
+        number = delivered or number
         run(["git", "switch", "main"], check=False)
+        if not delivered and number:
+            block(issue, f"the {role} changed nothing in response to the review or CI result on "
+                         f"pull request #{number}.")
         if not number:
             current = gh_json(["issue", "view", str(issue), "--json", "labels"])
             if "state:blocked" in {l["name"] for l in current["labels"]}:
