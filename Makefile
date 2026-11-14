@@ -1,14 +1,17 @@
-.PHONY: all check check-docs check-doc-versions check-i18n check-core test-core build-webui yocto-validate
+.PHONY: all check check-docs check-doc-versions check-evidence check-i18n check-core test-core build-webui yocto-validate
 
 all: check
 
-check: check-docs check-doc-versions check-i18n
+check: check-docs check-doc-versions check-evidence check-i18n
 
 check-docs:
 	python3 scripts/check_traceability.py
 
 check-doc-versions:
 	python3 scripts/check_doc_versions.py
+
+check-evidence:
+	python3 scripts/check_evidence.py
 
 check-i18n:
 	node scripts/check_i18n.mjs
