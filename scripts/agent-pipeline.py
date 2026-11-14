@@ -374,6 +374,7 @@ def run_self_tests():
         assert branch_run_res.returncode == 127, f"Branch script did not exit 127: {branch_run_res.returncode}"
         branch_token_res = subprocess.run([main_token_sh, "devops"], capture_output=True, text=True)
         assert branch_token_res.returncode == 127, f"Branch token did not exit 127: {branch_token_res.returncode}"
+        print(f"test_ac2: direct branch agent-run.sh exit {branch_run_res.returncode}")
 
         # Test that pipeline functions use the pinned copies, NOT the branch's
         global TOOLING
@@ -397,6 +398,7 @@ def run_self_tests():
         finally:
             TOOLING = old_tooling
 
+        print("test_ac2: pinned agent-run executed; branch script does not run")
         print("test_ac2_change_branch_broken_agent_run: OK")
 
         # Test 3: verify pinned agent-run.sh uses pinned agent definitions via stubbed agy
@@ -419,6 +421,10 @@ def run_self_tests():
             f.write("---\nname: devops\n---\nCUSTOM_AGENT_BRIEF_CONTENT\n")
 
         # 1. Fallback to pinned $here/../.claude/agents when NEXTOOMIO_AGENTS_DIR is unset
+        pinned_fallback_marker = "PINNED_AGENT_DEFINITION_FALLBACK_MARKER"
+        with open(os.path.join(tooling_root.agents_dir, "devops.md"), "a") as f:
+            f.write(f"\n{pinned_fallback_marker}\n")
+
         env_fallback = dict(os.environ,
                             PATH=f"{stub_bin}:{os.environ.get('PATH', '')}",
                             NEXTOOMIO_STATE_DIR=os.path.join(tmpdir, "state"))
@@ -426,7 +432,7 @@ def run_self_tests():
         res_fallback = subprocess.run([tooling_root.agent_run, "devops", "-p", "fallback task"],
                                       capture_output=True, text=True, env=env_fallback)
         assert res_fallback.returncode == 0, f"agent-run.sh fallback failed: {res_fallback.stderr}"
-        assert "DevOps" in res_fallback.stdout, f"Pinned brief not found: {res_fallback.stdout}"
+        assert pinned_fallback_marker in res_fallback.stdout, f"Pinned fallback marker not found in output: {res_fallback.stdout}"
 
         # 2. Use NEXTOOMIO_AGENTS_DIR when set
         env_custom = dict(env_fallback, NEXTOOMIO_AGENTS_DIR=custom_agents_dir)
