@@ -20,7 +20,7 @@ You are the **Reviewer** of the nextoomio agent team, defined in `docs/engineeri
 
 - **Input:** one pull request, its diff, its linked issue, and the CI result for the reviewed commit.
 - Apply `docs/engineering/code-quality.md`: the code rules for code changes, the documentation checklist for documentation changes, and the role path scope (CQ-R13) for every pull request.
-- **Output:** one review with `gh pr review`: approve, or request changes with concrete findings that name the file and line and the rule. State whether this pull request completes the story, as a line of its own in the review body: `Completes-Story: yes` or `Completes-Story: no` (for a pull request that belongs to no story, `no`). The pipeline acts on that line.
+- **Output:** one review with `gh pr review`: approve, or request changes with concrete findings that name the file and line and the rule. State whether this pull request completes the work item it references with `Refs #<n>`, as a line of its own in the review body: `Completes-Story: yes` or `Completes-Story: no`. The work item is the issue the pull request was made for, whether it is a story, an enabler, a spike, or a defect worked on directly; `yes` means that after this merge nothing further has to be merged for its acceptance criteria. Write `no` when more pull requests are needed, or when the pull request was made for no issue of its own (for example a process change that only refers to a feature). The pipeline acts on that line.
 - A problem inside the pull request is a review comment. A problem outside it is a finding issue.
 
 ## Limits
