@@ -33,11 +33,13 @@ Identifiers are part of the issue title and never reused.
 
 ## Story format
 
-Every story issue states: type, the user-story sentence, references to requirements and architecture, dependencies, numbered acceptance criteria in Given/When/Then form as a task list, the evidence that must be recorded, and what is out of scope. Acceptance criteria are the complete test of the story: a criterion that cannot be checked by a command, a measurement, or a recorded observation is rewritten until it can. A change to the acceptance criteria of an open story is explained in a comment on the issue.
+Every story issue states: type, the user-story sentence, references to requirements and architecture, dependencies, the paths or modules it changes ("Touches"), numbered acceptance criteria in Given/When/Then form as a task list, the evidence that must be recorded, and what is out of scope. "Touches" is filled in by the Architect before the story is marked ready; stories with overlapping "Touches" are not worked on in parallel. Acceptance criteria are the complete test of the story: a criterion that cannot be checked by a command, a measurement, or a recorded observation is rewritten until it can. A change to the acceptance criteria of an open story is explained in a comment on the issue.
 
 ## Defects
 
-A defect is a place where the repository contradicts the specification, the architecture, its own claims, or verifiable upstream facts. A feature that is simply not built yet is not a defect; a stub that claims to be more than it is, is. Everyone who finds a defect files it, whether or not they intend to fix it.
+A defect is a place where the repository contradicts the specification, the architecture, its own claims, or verifiable upstream facts. A feature that is simply not built yet is not a defect; a stub that claims to be more than it is, is. Everyone who finds such a place reports it, whether or not they intend to fix it; only the Architect files the defect ([agent team](../engineering/agent-team.md), D-B).
+
+A report is a **finding**: an issue with label `type:finding`, titled `Finding: <summary>`, that states where it is, what was expected and by which document, what is actually there, and how it was established. The Architect triages a finding by converting the same issue into a defect (`D-<nnn>` title, `type:defect`, severity, area, resolving story) or by closing it as not planned or duplicate with the reason. A problem inside a pull request under review is a review comment, not a finding.
 
 | Label | Meaning |
 | --- | --- |
@@ -52,21 +54,25 @@ A defect issue states where it is, what was expected and by which document, what
 | State | Meaning |
 | --- | --- |
 | Open | Planned; no work merged. |
+| Open with `state:ready` | May be started: every dependency is closed as completed, or has `state:implemented` and its hardware result is not needed; every acceptance criterion is checkable; "Touches" is filled in. Set only by the Architect. |
+| Open with `state:blocked` | Cannot proceed as written. Replaces `state:ready`; a comment states the reason and what unblocks it. |
 | Open with `state:implemented` | Code and documentation merged with CI passing. Not yet shown on hardware. |
 | Closed as completed | **Verified:** every acceptance criterion demonstrated on the named hardware, or the defect's fix demonstrated, with evidence recorded. |
 | Closed as not planned | Withdrawn or rejected; the reason is in the closing comment. |
 
-Only closed-as-completed issues count toward a phase exit gate. Pull requests therefore reference stories with `Refs #<n>`, not with a closing keyword, unless the pull request also contains the verification evidence. A story is not closed while a defect assigned to it is open.
+Only closed-as-completed issues count toward a phase exit gate. Pull requests therefore reference stories with `Refs #<n>` and never with a closing keyword, including pull requests that add the verification evidence: the project owner closes a story after the QM verdict. A story is not closed while a defect assigned to it is open.
+
+The label `risk:high` marks stories that touch the session manager, the update engine, `nx-sysd`, authentication, secrets, or the group channel; it selects the model that implements them ([agent team](../engineering/agent-team.md), OQ-03).
 
 ## Definition of done
 
-A story gets `state:implemented` when:
+A story gets `state:implemented` from the project owner, when merging the pull request that the review states completes the story, once:
 
 1. The change is merged through a pull request with all CI jobs passing.
 2. Code, comments, documentation, and commit messages are in English.
 3. No secret, private key, or credential is in the repository, the image, logs, or recorded evidence.
-4. Every new third-party component is pinned to an exact version and its license is recorded in the recipe and in the architecture's component register.
-5. Affected documents are updated in the same pull request.
+4. Every new third-party component is one the story names, is pinned to an exact version, and has its license recorded in the recipe and in the architecture's component register (`ARCHITECTURE.md` section 10).
+5. Affected documents are updated in the same pull request. A change to requirements, release allocation, architecture decisions, or acceptance criteria is not such an update: it is made first, by the Architect, in a separate pull request.
 
 A story is closed as completed when, in addition:
 
