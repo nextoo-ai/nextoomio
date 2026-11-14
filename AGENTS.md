@@ -32,6 +32,7 @@ These rules apply to the entire repository. Follow the user's latest explicit in
 
 - Read `SPECIFICATION.md`, `ROADMAP.md`, and `ARCHITECTURE.md` before making functional or architectural changes.
 - `SPECIFICATION.md` defines behavior; `ROADMAP.md` defines cumulative delivery across v0.0.1–v0.0.5; `ARCHITECTURE.md` defines the design, the architecture decisions, and the component and license register.
+- Work items are GitHub issues; `docs/backlog/README.md` defines how features, stories, and defects are written, when they may be started, and when they may be closed.
 - Preserve requirement IDs and their roadmap coverage. When adding or changing a requirement, update both documents and affected acceptance criteria.
 - All agreed functionality must remain planned by v0.0.5. Do not silently drop requirements, move them beyond the roadmap, or label incomplete integrations as delivered.
 - Distinguish planned behavior, implemented behavior, and behavior verified on real hardware. Document actual hardware/client versions and measured results.
@@ -41,7 +42,7 @@ These rules apply to the entire repository. Follow the user's latest explicit in
 - Work is split across role agents: Architect, Developer, PR Reviewer / Code Quality, QM / Verifier, and DevOps. `docs/engineering/agent-team.md` defines each role's responsibility, inputs, outputs, and limits; `.claude/agents/` holds the definitions; `docs/engineering/code-quality.md` holds the review rules.
 - An agent started in a role stays within that role's limits. If a task needs something outside them, it stops and reports instead of working around the limit or the `role-guard` hook.
 - State is handed over through the repository and GitHub issues, pull requests, and reviews, never through conversation history.
-- No agent merges a pull request, closes an issue, pushes to `main`, or changes repository settings. The project owner approves and merges.
+- The workflow runs without the project owner in the loop: `scripts/agent-pipeline.py` starts the roles for one ready issue. GitHub merges a pull request when the rules on `main` are met (the required checks and the Reviewer's approval), and the pipeline closes an issue after a passing QM verdict. No agent merges, closes an issue, pushes to `main`, or changes repository settings at its own discretion.
 - Every agent reports problems outside its task as findings; only the Architect files defects. Suspected security vulnerabilities are reported to the project owner only, never in a public issue.
 - Changes to these rules, the agent definitions, the guard, and the code-quality rules are made by the Architect through a reviewed pull request.
 

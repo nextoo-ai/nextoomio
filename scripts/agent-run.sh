@@ -11,7 +11,8 @@
 #   - gives gh and git a private configuration that holds only the App's
 #     short-lived token and refreshes it while the session runs;
 #   - sets the commit author to the App's bot identity;
-#   - starts `claude --agent <role>`.
+#   - starts the role: Claude Code (`claude --agent <role>`) for architect,
+#     reviewer, and qm; Antigravity (`agy`) for developer and devops.
 # Nothing is written into the repository. See docs/engineering/agent-team.md.
 set -eu
 
@@ -77,6 +78,39 @@ cleanup() {
   kill "$refresher" 2>/dev/null || true
   rm -f "$gh_dir/hosts.yml"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-claude --agent "$role" "$@"
+# Which program runs the role (docs/engineering/agent-team.md, section 4).
+# Author roles run in Antigravity on a Gemini model; the others in Claude Code.
+case $role in
+  developer|devops) engine=${NEXTOOMIO_ENGINE:-antigravity} ;;
+  *)                engine=${NEXTOOMIO_ENGINE:-claude} ;;
+esac
+
+if [ "$engine" = claude ]; then
+  claude --agent "$role" "$@"
+  exit $?
+fi
+
+# Antigravity has no agent definitions or hooks of ours: the role's brief is
+# the body of its definition, passed with the task. Only the headless form
+# `agent-run.sh <role> -p "<task>"` is supported for it.
+if [ "${1:-}" != "-p" ] || [ -z "${2:-}" ]; then
+  echo "agent-run: role '$role' runs in Antigravity; use: agent-run.sh $role -p \"<task>\"" >&2
+  exit 2
+fi
+model=${NEXTOOMIO_AGY_MODEL:-gemini-3.8-flash-high}
+brief=$(awk 'f>=2; /^---$/ {f++}' "$here/../.claude/agents/$role.md")
+prompt="$brief
+
+Your model id for the role and model line is: $model (Antigravity).
+The role-guard hook does not run in this program; the limits above apply all the same.
+
+## Task
+
+$2"
+agy -p "$prompt" --model "$model" --mode accept-edits \
+  --print-timeout "${NEXTOOMIO_AGENT_TIMEOUT:-45m}" < /dev/null

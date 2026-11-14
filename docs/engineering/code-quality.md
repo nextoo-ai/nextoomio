@@ -1,6 +1,6 @@
 # Code-quality rules
 
-Document version: **1.0**  
+Document version: **1.1**  
 Date: **2026-11-14**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [agent team](agent-team.md).
 
@@ -24,7 +24,7 @@ These belong in CI. The Reviewer checks only that the jobs ran on the reviewed c
 | CQ-M6 | WebUI type-check and build | Yes, `webui` job |
 | CQ-M7 | Yocto layer and kas definition check | Yes |
 | CQ-M8 | Lock files committed and used (`--locked`, `npm ci`) | No; neither `core/Cargo.lock` nor `webui/package-lock.json` is committed, and CI runs `npm install` without `--locked` builds |
-| CQ-M9 | Document versions and cross-references | No; P0-F8.3 (#86) |
+| CQ-M9 | Document versions and cross-references (`scripts/check_doc_versions.py`) | Yes, since P0-F8.3 (#86) |
 | CQ-M10 | Role path scope: a pull request touches only the paths of the role its branch prefix names ([agent team](agent-team.md), OQ-02) | No; new story |
 
 ## 2. Review rules for code

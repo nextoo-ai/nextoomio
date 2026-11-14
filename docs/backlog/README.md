@@ -60,13 +60,13 @@ A defect issue states where it is, what was expected and by which document, what
 | Closed as completed | **Verified:** every acceptance criterion demonstrated on the named hardware, or the defect's fix demonstrated, with evidence recorded. |
 | Closed as not planned | Withdrawn or rejected; the reason is in the closing comment. |
 
-Only closed-as-completed issues count toward a phase exit gate. Pull requests therefore reference stories with `Refs #<n>` and never with a closing keyword, including pull requests that add the verification evidence: the project owner closes a story after the QM verdict. A story is not closed while a defect assigned to it is open.
+Only closed-as-completed issues count toward a phase exit gate. Pull requests therefore reference stories with `Refs #<n>` and never with a closing keyword, including pull requests that add the verification evidence: a story is closed only after a passing QM verdict. A story is not closed while a defect assigned to it is open.
 
 The label `risk:high` marks stories that touch the session manager, the update engine, `nx-sysd`, authentication, secrets, or the group channel; it selects the model that implements them ([agent team](../engineering/agent-team.md), OQ-03).
 
 ## Definition of done
 
-A story gets `state:implemented` from the project owner, when merging the pull request that the review states completes the story, once:
+A story gets `state:implemented` when the pull request that the review states completes the story is merged, once:
 
 1. The change is merged through a pull request with all CI jobs passing.
 2. Code, comments, documentation, and commit messages are in English.
