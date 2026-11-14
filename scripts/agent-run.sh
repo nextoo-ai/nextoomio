@@ -105,7 +105,8 @@ if [ "${1:-}" != "-p" ] || [ -z "${2:-}" ]; then
   exit 2
 fi
 model=${NEXTOOMIO_AGY_MODEL:-gemini-3.8-flash-high}
-brief=$(awk 'f>=2; /^---$/ {f++}' "$here/../.claude/agents/$role.md")
+agents_dir=${NEXTOOMIO_AGENTS_DIR:-$here/../.claude/agents}
+brief=$(awk 'f>=2; /^---$/ {f++}' "$agents_dir/$role.md")
 prompt="$brief
 
 Your model id for the role and model line is: $model (Antigravity).

@@ -2,6 +2,7 @@
 """Run one ready issue through the agent team without a person in the loop.
 
 Usage: scripts/agent-pipeline.py <issue number> [--role developer|devops]
+       scripts/agent-pipeline.py --test
 
 Steps (docs/engineering/agent-team.md, section 5):
   1. The author role implements the issue in the working tree. The pipeline
@@ -24,9 +25,12 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from typing import NamedTuple
 
 REPO = os.environ.get("NEXTOOMIO_REPO", "nextoo-ai/nextoomio")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +46,60 @@ AUTHOR_MODEL = os.environ.get("NEXTOOMIO_AGY_MODEL", "gemini-3.8-flash-high") + 
 AGENT_TIMEOUT = int(os.environ.get("NEXTOOMIO_AGENT_TIMEOUT_SECONDS", "3600"))
 
 
+class Tooling(NamedTuple):
+    run_dir: str
+    tooling_dir: str
+    agent_run: str
+    agent_token: str
+    role_guard: str
+    agents_dir: str
+
+
+TOOLING: Tooling | None = None
+
+
+def pin_tooling(run_dir, root=ROOT):
+    """Copy the tooling from root into run_dir outside the repository (D-040).
+
+    Copies the session script, the token script, the guard, and the agent
+    definitions while on main, so unreviewed changes on a branch cannot alter
+    how the pipeline starts roles, obtains tokens, or checks paths.
+    """
+    tooling_dir = os.path.join(run_dir, "tooling")
+    scripts_dir = os.path.join(tooling_dir, "scripts")
+    hooks_dir = os.path.join(tooling_dir, ".claude", "hooks")
+    agents_dir = os.path.join(tooling_dir, ".claude", "agents")
+    os.makedirs(scripts_dir, exist_ok=True)
+    os.makedirs(hooks_dir, exist_ok=True)
+    os.makedirs(agents_dir, exist_ok=True)
+
+    agent_run = os.path.join(scripts_dir, "agent-run.sh")
+    agent_token = os.path.join(scripts_dir, "agent-token.sh")
+    role_guard = os.path.join(hooks_dir, "role-guard.py")
+
+    shutil.copy2(os.path.join(root, "scripts", "agent-run.sh"), agent_run)
+    shutil.copy2(os.path.join(root, "scripts", "agent-token.sh"), agent_token)
+    shutil.copy2(os.path.join(root, ".claude", "hooks", "role-guard.py"), role_guard)
+    os.chmod(agent_run, 0o755)
+    os.chmod(agent_token, 0o755)
+    os.chmod(role_guard, 0o755)
+
+    src_agents = os.path.join(root, ".claude", "agents")
+    if os.path.isdir(src_agents):
+        for name in os.listdir(src_agents):
+            if name.endswith(".md"):
+                shutil.copy2(os.path.join(src_agents, name), os.path.join(agents_dir, name))
+
+    return Tooling(
+        run_dir=run_dir,
+        tooling_dir=tooling_dir,
+        agent_run=agent_run,
+        agent_token=agent_token,
+        role_guard=role_guard,
+        agents_dir=agents_dir,
+    )
+
+
 def is_app(login, role):
     """GitHub reports an App as 'nextoomio-x', 'app/nextoomio-x', or 'nextoomio-x[bot]'."""
     name = (login or "").removeprefix("app/").removesuffix("[bot]")
@@ -54,8 +112,8 @@ class Stop(Exception):
         self.status = status
 
 
-def run(cmd, env=None, check=True, capture=True, log=None):
-    out = subprocess.run(cmd, cwd=ROOT, env=env, text=True,
+def run(cmd, env=None, check=True, capture=True, log=None, cwd=None):
+    out = subprocess.run(cmd, cwd=cwd or ROOT, env=env, text=True,
                          stdout=subprocess.PIPE if capture else None,
                          stderr=subprocess.STDOUT if capture else None)
     if log and out.stdout:
@@ -66,8 +124,9 @@ def run(cmd, env=None, check=True, capture=True, log=None):
     return out
 
 
-def token(role):
-    return run([os.path.join(HERE, "agent-token.sh"), role]).stdout.strip()
+def token(role, cwd=None):
+    script = TOOLING.agent_token if TOOLING else os.path.join(HERE, "agent-token.sh")
+    return run([script, role], cwd=cwd).stdout.strip()
 
 
 def gh(args, role=None, check=True):
@@ -86,17 +145,20 @@ def say(message):
     print(f"[{datetime.datetime.now():%H:%M:%S}] {message}", flush=True)
 
 
-def agent(role, task, log, extra_paths=None):
+def agent(role, task, log, extra_paths=None, cwd=None):
     """Start one role headlessly and wait for it."""
     env = dict(os.environ)
     if extra_paths:
         env["NEXTOOMIO_EXTRA_PATHS"] = ":".join(extra_paths)
-    cmd = [os.path.join(HERE, "agent-run.sh"), role, "-p", task]
+    if TOOLING:
+        env["NEXTOOMIO_AGENTS_DIR"] = TOOLING.agents_dir
+    script = TOOLING.agent_run if TOOLING else os.path.join(HERE, "agent-run.sh")
+    cmd = [script, role, "-p", task]
     if role in ("reviewer", "qm", "architect"):
         cmd += ["--permission-mode", "auto"]
     say(f"{role}: started")
     try:
-        out = subprocess.run(cmd, cwd=ROOT, env=env, text=True, stdin=subprocess.DEVNULL,
+        out = subprocess.run(cmd, cwd=cwd or ROOT, env=env, text=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=AGENT_TIMEOUT)
     except subprocess.TimeoutExpired as expired:
         with open(log, "a") as f:
@@ -119,14 +181,15 @@ def changed_paths():
     return [line[3:].split(" -> ")[-1].strip('"') for line in out.splitlines() if line.strip()]
 
 
-def outside_role_paths(role, paths, extra_paths):
+def outside_role_paths(role, paths, extra_paths, cwd=None):
     """Paths the role may not edit, judged by the same guard the Claude Code roles run under."""
+    repo_root = cwd or ROOT
     env = dict(os.environ, NEXTOOMIO_EXTRA_PATHS=":".join(extra_paths or []))
-    guard = os.path.join(ROOT, ".claude", "hooks", "role-guard.py")
+    guard = TOOLING.role_guard if TOOLING else os.path.join(ROOT, ".claude", "hooks", "role-guard.py")
     refused = []
     for path in paths:
-        event = json.dumps({"tool_name": "Write", "cwd": ROOT,
-                            "tool_input": {"file_path": os.path.join(ROOT, path)}})
+        event = json.dumps({"tool_name": "Write", "cwd": repo_root,
+                            "tool_input": {"file_path": os.path.join(repo_root, path)}})
         out = subprocess.run([sys.executable, guard, role], input=event, text=True,
                              capture_output=True, env=env)
         if out.stdout.strip():
@@ -227,11 +290,176 @@ def block(issue, reason):
     raise Stop(2, f"issue #{issue} blocked: {reason}")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("issue", type=int)
-    parser.add_argument("--role", choices=["developer", "devops"])
-    args = parser.parse_args()
+def run_self_tests():
+    """Run self-tests verifying that pinned tooling runs instead of branch tooling (D-040, AC2)."""
+    print("Running agent-pipeline self-tests...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Test 1: pin_tooling copies all required files and marks them executable (AC1)
+        tooling_root = pin_tooling(os.path.join(tmpdir, "run1"), root=ROOT)
+        assert os.path.isfile(tooling_root.agent_run), f"missing {tooling_root.agent_run}"
+        assert os.path.isfile(tooling_root.agent_token), f"missing {tooling_root.agent_token}"
+        assert os.path.isfile(tooling_root.role_guard), f"missing {tooling_root.role_guard}"
+        assert os.path.isdir(tooling_root.agents_dir), f"missing {tooling_root.agents_dir}"
+        assert os.access(tooling_root.agent_run, os.X_OK), "agent_run not executable"
+        assert os.access(tooling_root.agent_token, os.X_OK), "agent_token not executable"
+        assert os.access(tooling_root.role_guard, os.X_OK), "role_guard not executable"
+        for r in ("architect", "developer", "reviewer", "qm", "devops"):
+            assert os.path.isfile(os.path.join(tooling_root.agents_dir, f"{r}.md")), f"missing {r}.md"
+        assert not tooling_root.tooling_dir.startswith(ROOT + os.sep), "tooling_dir must be outside ROOT"
+        print("test_pin_tooling: OK")
+
+        # Test 2: AC2 verification on a change branch with broken scripts (AC2)
+        repo_dir = os.path.join(tmpdir, "test_repo")
+        run_dir = os.path.join(tmpdir, "run2")
+        os.makedirs(repo_dir)
+        os.makedirs(run_dir)
+
+        # Initialize mock repo on main
+        subprocess.run(["git", "init", "-q", "-b", "main", repo_dir], check=True)
+        subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", repo_dir, "config", "user.email", "pipeline-test@example.com"], check=True)
+
+        scripts_dir = os.path.join(repo_dir, "scripts")
+        hooks_dir = os.path.join(repo_dir, ".claude", "hooks")
+        agents_dir = os.path.join(repo_dir, ".claude", "agents")
+        os.makedirs(scripts_dir)
+        os.makedirs(hooks_dir)
+        os.makedirs(agents_dir)
+
+        # Main version of scripts
+        main_run_sh = os.path.join(scripts_dir, "agent-run.sh")
+        with open(main_run_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"PINNED_AGENT_RUN_SUCCESS: role=$1\"\nexit 0\n")
+        os.chmod(main_run_sh, 0o755)
+
+        main_token_sh = os.path.join(scripts_dir, "agent-token.sh")
+        with open(main_token_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"PINNED_TOKEN_SUCCESS\"\nexit 0\n")
+        os.chmod(main_token_sh, 0o755)
+
+        main_guard_py = os.path.join(hooks_dir, "role-guard.py")
+        with open(main_guard_py, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        os.chmod(main_guard_py, 0o755)
+
+        with open(os.path.join(agents_dir, "devops.md"), "w") as f:
+            f.write("---\nname: devops\n---\nDevOps test brief\n")
+
+        subprocess.run(["git", "-C", repo_dir, "add", "."], check=True)
+        subprocess.run(["git", "-C", repo_dir, "commit", "-q", "-m", "main commit"], check=True)
+
+        # Pin tooling while on main (stored in run_dir, outside repo)
+        tooling = pin_tooling(run_dir, root=repo_dir)
+
+        # Create and switch to change branch
+        subprocess.run(["git", "-C", repo_dir, "switch", "-q", "-c", "ops/test-branch"], check=True)
+
+        # On the change branch, replace scripts/agent-run.sh with a script that exits 127
+        with open(main_run_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"BRANCH_AGENT_RUN_FAIL\" >&2\nexit 127\n")
+        os.chmod(main_run_sh, 0o755)
+
+        # Also replace scripts/agent-token.sh with exit 127
+        with open(main_token_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"BRANCH_TOKEN_FAIL\" >&2\nexit 127\n")
+        os.chmod(main_token_sh, 0o755)
+
+        # Replace role-guard.py with one that denies everything (writes to stdout)
+        with open(main_guard_py, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport sys\nsys.stdout.write('REFUSED_BY_BRANCH_GUARD\\n')\nsys.exit(0)\n")
+        os.chmod(main_guard_py, 0o755)
+
+        # Confirm branch scripts fail if invoked directly
+        branch_run_res = subprocess.run([main_run_sh, "devops"], capture_output=True, text=True)
+        assert branch_run_res.returncode == 127, f"Branch script did not exit 127: {branch_run_res.returncode}"
+        branch_token_res = subprocess.run([main_token_sh, "devops"], capture_output=True, text=True)
+        assert branch_token_res.returncode == 127, f"Branch token did not exit 127: {branch_token_res.returncode}"
+        print(f"test_ac2: direct branch agent-run.sh exit {branch_run_res.returncode}")
+
+        # Test that pipeline functions use the pinned copies, NOT the branch's
+        global TOOLING
+        old_tooling = TOOLING
+        try:
+            TOOLING = tooling
+            log_path = os.path.join(run_dir, "test.log")
+
+            # agent() runs the pinned script and not the branch script (AC2)
+            out = agent("devops", "test task", log=log_path, cwd=repo_dir)
+            assert "PINNED_AGENT_RUN_SUCCESS: role=devops" in out, f"Pinned agent-run did not run! Output: {out}"
+            assert "BRANCH_AGENT_RUN_FAIL" not in out, f"Branch agent-run ran! Output: {out}"
+
+            # token() runs the pinned script and not the branch script
+            tok = token("devops", cwd=repo_dir)
+            assert tok == "PINNED_TOKEN_SUCCESS", f"Pinned token did not run! Token: {tok}"
+
+            # outside_role_paths() runs the pinned guard (which exits 0 with empty stdout)
+            refused = outside_role_paths("devops", ["scripts/agent-run.sh"], [], cwd=repo_dir)
+            assert refused == [], f"Pinned guard did not run (branch guard was used): {refused}"
+        finally:
+            TOOLING = old_tooling
+
+        print("test_ac2: pinned agent-run executed; branch script does not run")
+        print("test_ac2_change_branch_broken_agent_run: OK")
+
+        # Test 3: verify pinned agent-run.sh uses pinned agent definitions via stubbed agy
+        stub_bin = os.path.join(tmpdir, "stub_bin")
+        os.makedirs(stub_bin)
+        with open(os.path.join(stub_bin, "gh"), "w") as f:
+            f.write("#!/bin/sh\necho 12345\n")
+        os.chmod(os.path.join(stub_bin, "gh"), 0o755)
+        with open(os.path.join(stub_bin, "agy"), "w") as f:
+            f.write('#!/bin/sh\necho "AGY_PROMPT: $@"\n')
+        os.chmod(os.path.join(stub_bin, "agy"), 0o755)
+
+        # Stub agent-token.sh in pinned tooling so agent-run.sh needs no network
+        with open(tooling_root.agent_token, "w") as f:
+            f.write("#!/bin/sh\necho test_token\n")
+
+        custom_agents_dir = os.path.join(tmpdir, "custom_agents")
+        os.makedirs(custom_agents_dir)
+        with open(os.path.join(custom_agents_dir, "devops.md"), "w") as f:
+            f.write("---\nname: devops\n---\nCUSTOM_AGENT_BRIEF_CONTENT\n")
+
+        # 1. Fallback to pinned $here/../.claude/agents when NEXTOOMIO_AGENTS_DIR is unset
+        pinned_fallback_marker = "PINNED_AGENT_DEFINITION_FALLBACK_MARKER"
+        with open(os.path.join(tooling_root.agents_dir, "devops.md"), "a") as f:
+            f.write(f"\n{pinned_fallback_marker}\n")
+
+        env_fallback = dict(os.environ,
+                            PATH=f"{stub_bin}:{os.environ.get('PATH', '')}",
+                            NEXTOOMIO_STATE_DIR=os.path.join(tmpdir, "state"))
+        env_fallback.pop("NEXTOOMIO_AGENTS_DIR", None)
+        res_fallback = subprocess.run([tooling_root.agent_run, "devops", "-p", "fallback task"],
+                                      capture_output=True, text=True, env=env_fallback)
+        assert res_fallback.returncode == 0, f"agent-run.sh fallback failed: {res_fallback.stderr}"
+        assert pinned_fallback_marker in res_fallback.stdout, f"Pinned fallback marker not found in output: {res_fallback.stdout}"
+
+        # 2. Use NEXTOOMIO_AGENTS_DIR when set
+        env_custom = dict(env_fallback, NEXTOOMIO_AGENTS_DIR=custom_agents_dir)
+        res_custom = subprocess.run([tooling_root.agent_run, "devops", "-p", "custom task"],
+                                    capture_output=True, text=True, env=env_custom)
+        assert res_custom.returncode == 0, f"agent-run.sh with NEXTOOMIO_AGENTS_DIR failed: {res_custom.stderr}"
+        assert "CUSTOM_AGENT_BRIEF_CONTENT" in res_custom.stdout, f"Custom brief not found: {res_custom.stdout}"
+        assert "custom task" in res_custom.stdout, f"Custom task not found: {res_custom.stdout}"
+        print("test_agent_run_pinned_agents: OK")
+
+    print("OK: all self-tests passed.")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("issue", type=int, nargs="?", help="issue number to run through the pipeline")
+    parser.add_argument("--role", choices=["developer", "devops"], help="author role for the issue")
+    parser.add_argument("--test", action="store_true", help="run self-tests and exit")
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return run_self_tests()
+
+    if args.issue is None:
+        parser.error("the following arguments are required: issue")
+
     issue = args.issue
 
     info = gh_json(["issue", "view", str(issue), "--json", "title,state,labels,body"])
@@ -250,6 +478,10 @@ def main():
     os.makedirs(run_dir, mode=0o700)
     log = os.path.join(run_dir, "agents.log")
     say(f"issue #{issue} \"{info['title']}\" -> {role}; log {log}")
+
+    global TOOLING
+    TOOLING = pin_tooling(run_dir)
+    say(f"tooling pinned to {TOOLING.tooling_dir}")
 
     # "Touches" entries outside the role's default paths, for the guard where it runs.
     touches = re.findall(r"^- `([^`]+)`", (info["body"].split("### Touches", 1) + [""])[1].split("###", 1)[0], re.M)
@@ -342,7 +574,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except Stop as stop:
         say(str(stop))
         sys.exit(stop.status)
