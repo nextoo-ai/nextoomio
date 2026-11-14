@@ -30,8 +30,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 MAX_ROUNDS = 2
 DEVOPS_AREAS = {"area:ci", "area:build", "area:image", "area:tooling", "area:hardware"}
-REVIEWER = "nextoomio-reviewer"
-QM = "nextoomio-qm"
+REQUIRED_CHECKS = {
+    "Traceability, Docs & Yocto Layer Check",
+    "Rust Core & License Gate",
+    "WebUI & i18n Catalog Gate",
+}
+AGENT_TIMEOUT = int(os.environ.get("NEXTOOMIO_AGENT_TIMEOUT_SECONDS", "3600"))
+
+
+def is_app(login, role):
+    """GitHub reports an App as 'nextoomio-x', 'app/nextoomio-x', or 'nextoomio-x[bot]'."""
+    name = (login or "").removeprefix("app/").removesuffix("[bot]")
+    return name == f"nextoomio-{role}"
 
 
 class Stop(Exception):
@@ -81,8 +91,13 @@ def agent(role, task, log, extra_paths=None):
     if role in ("reviewer", "qm", "architect"):
         cmd += ["--permission-mode", "auto"]
     say(f"{role}: started")
-    out = subprocess.run(cmd, cwd=ROOT, env=env, text=True, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        out = subprocess.run(cmd, cwd=ROOT, env=env, text=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=AGENT_TIMEOUT)
+    except subprocess.TimeoutExpired as expired:
+        with open(log, "a") as f:
+            f.write(f"\n===== {role}: timed out =====\n{expired.stdout or ''}\n")
+        raise Stop(1, f"{role} did not finish within {AGENT_TIMEOUT // 60} minutes")
     with open(log, "a") as f:
         f.write(f"\n===== {role} @ {datetime.datetime.now().isoformat()} =====\n{out.stdout}\n")
     say(f"{role}: finished (exit {out.returncode})")
@@ -94,7 +109,7 @@ def find_pr(issue, author_role):
                    "--json", "number,body,author,headRefName,headRefOid"])
     pattern = re.compile(rf"\bRefs\s+#{issue}\b")
     for pr in prs:
-        if pr["author"]["login"].endswith(f"nextoomio-{author_role}") and pattern.search(pr["body"] or ""):
+        if is_app(pr["author"]["login"], author_role) and pattern.search(pr["body"] or ""):
             return pr
     return None
 
@@ -105,29 +120,26 @@ def pr_state(number):
 
 
 def wait_for_ci(number, timeout=3600):
-    """Wait until every check of the head commit has finished. True if all passed."""
+    """Wait until every required check has reported on the head commit. True if all passed."""
     deadline = time.time() + timeout
-    seen = False
     while time.time() < deadline:
         checks = pr_state(number)["statusCheckRollup"] or []
-        if checks:
-            seen = True
-            states = [c.get("conclusion") or c.get("status") or c.get("state") for c in checks]
-            if all(s in ("SUCCESS", "NEUTRAL", "SKIPPED") for s in states):
-                return True
-            if any(s in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED") for s in states):
-                return False
-        elif seen is False and time.time() > deadline - timeout + 300:
-            raise Stop(1, f"no CI checks appeared on pull request #{number} within 5 minutes")
+        states = {c.get("name") or c.get("context"): c.get("conclusion") or c.get("status") or c.get("state")
+                  for c in checks}
+        if any(s in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED") for s in states.values()):
+            return False
+        if all(states.get(name) == "SUCCESS" for name in REQUIRED_CHECKS):
+            return True
         time.sleep(20)
-    raise Stop(1, f"CI on pull request #{number} did not finish within {timeout // 60} minutes")
+    raise Stop(1, f"the required checks on pull request #{number} did not finish within {timeout // 60} minutes")
 
 
 def latest_review(number, head):
+    """State and body of the Reviewer's last verdict on the head commit, or (None, '')."""
     reviews = [r for r in pr_state(number)["reviews"]
-               if r["author"]["login"] == REVIEWER and r["commit"]["oid"] == head
+               if is_app(r["author"]["login"], "reviewer") and r["commit"]["oid"] == head
                and r["state"] in ("APPROVED", "CHANGES_REQUESTED")]
-    return reviews[-1]["state"] if reviews else None
+    return (reviews[-1]["state"], reviews[-1]["body"] or "") if reviews else (None, "")
 
 
 def wait_for_merge(number, timeout=900):
@@ -193,12 +205,12 @@ def main():
         gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
 
         if not wait_for_ci(number):
-            verdict, why = "CHANGES_REQUESTED", "CI failed on the head commit"
+            verdict, why, review_body = "CHANGES_REQUESTED", "CI failed on the head commit", ""
         else:
             agent("reviewer", f"Review pull request {number} (issue {issue}) at its current head commit. "
                               "Follow your role definition.", log)
             head = pr_state(number)["headRefOid"]
-            verdict, why = latest_review(number, head), "the review requested changes"
+            (verdict, review_body), why = latest_review(number, head), "the review requested changes"
             if verdict is None:
                 block(issue, f"the Reviewer submitted no verdict on pull request #{number} at {head[:7]}.")
         say(f"pull request #{number}: {verdict}")
@@ -215,13 +227,16 @@ def main():
         raise Stop(2, f"pull request #{number} is approved but GitHub has not merged it; check the rules on main")
     say(f"pull request #{number} merged")
     run(["git", "pull", "--ff-only"])
+    if not re.search(r"^Completes-Story:\s*yes\s*$", review_body, re.M | re.I):
+        raise Stop(2, f"pull request #{number} merged, but the review did not state 'Completes-Story: yes'; "
+                      f"issue #{issue} stays ready for a further pull request")
     gh(["issue", "edit", str(issue), "--remove-label", "state:ready", "--add-label", "state:implemented"],
        role="architect")
 
     agent("qm", f"Verify issue {issue}, which now has state:implemented; its pull request {number} is merged. "
                 "Follow your role definition.", log)
     comments = gh_json(["issue", "view", str(issue), "--json", "comments"])["comments"]
-    verdicts = [c["body"] for c in comments if c["author"]["login"] == QM]
+    verdicts = [c["body"] for c in comments if is_app(c["author"]["login"], "qm")]
     passed = bool(verdicts) and re.search(r"^QM-Verdict:\s*PASS\s*$", verdicts[-1], re.M)
     if not passed:
         raise Stop(2, f"issue #{issue} stays open: QM did not give 'QM-Verdict: PASS'")
