@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.6 (autonomous operation)**  
+Document version: **0.7 (autonomous operation)**  
 Date: **2026-11-14**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -14,6 +14,8 @@ Version 0.4 turns the proposal into the team document: it is renamed from `agent
 Version 0.5 records the owner's decisions after the first trial run: no person in the loop, one independent model per role with development in Antigravity, and the Architect as orchestrator (section 3.1). It adds the rule set on `main`, the pipeline, the Antigravity author roles, and the results of the trial (section 9.3).
 
 Version 0.6 records the first two pipeline runs and what they changed: the author roles only change files and run checks, and the pipeline creates the branch, checks the changed paths, commits, pushes, and opens the pull request (section 5 step 1, sections 7 and 8, section 9.3). It also records the bootstrap exception (section 8).
+
+Version 0.7 records the third pipeline run (section 9.3).
 
 ## 1. Goal
 
@@ -257,6 +259,8 @@ What the trial showed about the model itself:
 First pipeline run, on D-028 (#60), 2026-11-14: stopped by hand. It found two faults in `scripts/agent-run.sh`, both corrected: started with `--mode accept-edits`, Antigravity denied every shell command, because a headless run cannot ask; and the token refresher kept the caller's output open, so the pipeline waited after the role had ended. A third observation concerns GitHub: auto-merge enabled before the approval did not merge pull request #158 once the rules were met; asking for it again merged at once, and the pipeline now does that. After the corrections, a DevOps run in Antigravity reported the App's commit identity and saw only this repository through `gh`.
 
 Second pipeline run, on #60: the DevOps role ended without output and the pipeline blocked the issue, as designed. Antigravity runs headless with tool permission "request review": a command outside its allow list is denied because nobody can be asked. The owner approved allow rules for `git`, `gh`, `make`, `python3`, `cargo`, `npm`, and `node` in `~/.gemini/antigravity-cli/settings.json`. With them, a file edit worked and commands ran, but `git` could not write to `.git` inside Antigravity's sandbox. Letting `git` leave the sandbox was not done. Instead the author roles no longer use git for writing: the pipeline creates the branch, checks the changed paths, commits, pushes, and opens the pull request (section 5).
+
+Third pipeline run, on #60: the DevOps role again ended without output and without changes; the stored conversation shows `mkdir`, outside the allow list, and a search for `cargo`, which is not installed on the workstation. The allow list was extended with file and text utilities (not `rm`), the Antigravity brief now names the allowed commands and says that any other command ends the run, and #60 was taken back from ready because its criteria need the Rust toolchain.
 
 Not yet shown: a complete run of `scripts/agent-pipeline.py`; a Developer or DevOps run in Antigravity that commits, pushes, and opens a pull request; the Reviewer on Sonnet and QM on Opus.
 
