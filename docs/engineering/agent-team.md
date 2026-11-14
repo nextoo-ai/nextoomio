@@ -250,7 +250,9 @@ What the trial showed about the model itself:
 - **The session script left the token file behind** when a terminal tab was closed. It now removes it on hang-up as well.
 - **The Reviewer App needs contents write** for its approval to count. It therefore could push to branches; the rule set keeps it from `main`, and it cannot approve its own pull request.
 
-Not yet shown: a run of `scripts/agent-pipeline.py`; a Developer or DevOps run in Antigravity that commits, pushes, and opens a pull request; the Reviewer on Sonnet and QM on Opus.
+First pipeline run, on D-028 (#60), 2026-11-14: stopped by hand. It found two faults in `scripts/agent-run.sh`, both corrected: started with `--mode accept-edits`, Antigravity denied every shell command, because a headless run cannot ask; and the token refresher kept the caller's output open, so the pipeline waited after the role had ended. A third observation concerns GitHub: auto-merge enabled before the approval did not merge pull request #158 once the rules were met; asking for it again merged at once, and the pipeline now does that. After the corrections, a DevOps run in Antigravity reported the App's commit identity and saw only this repository through `gh`.
+
+Not yet shown: a complete run of `scripts/agent-pipeline.py`; a Developer or DevOps run in Antigravity that commits, pushes, and opens a pull request; the Reviewer on Sonnet and QM on Opus.
 
 ## 10. Review findings
 

@@ -70,11 +70,13 @@ if [ "$check" = 1 ]; then
 fi
 
 # Installation tokens last one hour; replace the token every 30 minutes.
+# The loop must not hold the caller's output open after the session ends.
 (
-  while sleep 1800; do write_token || echo "agent-run: token refresh failed" >&2; done
-) &
+  while sleep 1800; do write_token || true; done
+) < /dev/null > /dev/null 2>&1 &
 refresher=$!
 cleanup() {
+  pkill -P "$refresher" 2>/dev/null || true
   kill "$refresher" 2>/dev/null || true
   rm -f "$gh_dir/hosts.yml"
 }
@@ -112,5 +114,8 @@ The role-guard hook does not run in this program; the limits above apply all the
 ## Task
 
 $2"
-agy -p "$prompt" --model "$model" --mode accept-edits \
+# No --mode: headless runs start in Antigravity's Auto mode, which decides
+# tool permissions itself. With accept-edits, shell commands are denied
+# because a headless run cannot ask.
+agy -p "$prompt" --model "$model" \
   --print-timeout "${NEXTOOMIO_AGENT_TIMEOUT:-45m}" < /dev/null

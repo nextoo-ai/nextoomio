@@ -223,6 +223,10 @@ def main():
         task = (f"Pull request {number} for issue {issue} needs changes: {why}. Read the review and the CI "
                 "result on GitHub and address them on the same branch. Follow your role definition.")
 
+    # Auto-merge enabled before the approval did not fire on its own in the
+    # first runs; asking again merges at once when the rules are met, and
+    # only then.
+    gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
     if not wait_for_merge(number):
         raise Stop(2, f"pull request #{number} is approved but GitHub has not merged it; check the rules on main")
     say(f"pull request #{number} merged")
