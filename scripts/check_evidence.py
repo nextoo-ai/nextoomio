@@ -33,11 +33,12 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 EVIDENCE_DIR = ROOT / "docs" / "evidence"
 TEMPLATE_PATH = EVIDENCE_DIR / "TEMPLATE.md"
 
-FILENAME_RE = re.compile(r"^(?:P\d+-F\d+\.\d+|D-\d+)\.md$")
+FILENAME_RE = re.compile(r"^(?:P\d+-F\d+\.\d+|D-\d{3})\.md$")
 PLACEHOLDER_RE = re.compile(r"^\s*<[^>]+>\s*$")
 TODO_RE = re.compile(r"^\s*(?:TODO|TBD|FIXME)\b", re.IGNORECASE)
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN[ A-Z0-9_-]*PRIVATE KEY-----")
 COMMIT_HASH_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
+HEADING_LINE_RE = re.compile(r"^\s*#{1,6}(?:\s+.*)?$")
 
 REQUIRED_TEMPLATE_FIELDS = [
     ("Date", re.compile(r"(?:^|\n)\s*(?:[-*]\s+)?(?:\*\*)?Date(?::\*\*|\*\*:|:)", re.IGNORECASE)),
@@ -141,12 +142,21 @@ def check_table_column(section_body: str, col_name_pattern: re.Pattern) -> bool:
     return False
 
 
+def strip_heading_lines(text: str) -> str:
+    """Return text with markdown heading lines removed."""
+    return "\n".join(
+        line for line in text.splitlines()
+        if not HEADING_LINE_RE.match(line)
+    )
+
+
 def section_has_content(body: str, col_name_pattern: re.Pattern | None = None) -> bool:
-    if is_empty_value(body):
+    content_body = strip_heading_lines(body)
+    if is_empty_value(content_body):
         return False
-    if col_name_pattern and "|" in body:
+    if col_name_pattern and "|" in content_body:
         # Check if a table in this section has the expected column
-        lines = body.splitlines()
+        lines = content_body.splitlines()
         has_col = any(
             col_name_pattern.search(p)
             for line in lines
@@ -154,7 +164,7 @@ def section_has_content(body: str, col_name_pattern: re.Pattern | None = None) -
             for p in [x.strip() for x in line.strip().split("|")]
         )
         if has_col:
-            return check_table_column(body, col_name_pattern)
+            return check_table_column(content_body, col_name_pattern)
     return True
 
 
@@ -444,17 +454,18 @@ def run_self_tests() -> int:
         assert_true(any("mandatory field 'Observed result' is empty or missing" in e for e in errs), f"Expected empty result cell error, got: {errs}")
 
         # 10. Invalid filenames
-        for bad_name in ["invalid.md", "P0-F8.md", "D-abc.md", "P0_F8.5.md"]:
+        for bad_name in ["invalid.md", "P0-F8.md", "D-abc.md", "P0_F8.5.md", "D-1.md", "D-0001.md"]:
             f_bad_name = tmp_path / bad_name
             f_bad_name.write_text(f_valid.read_text(encoding="utf-8"), encoding="utf-8")
             errs = check_evidence_file(f_bad_name)
             assert_true(any("not a story or defect identifier" in e for e in errs), f"Expected invalid filename error for {bad_name}, got: {errs}")
 
-        # 11. Valid defect filename
-        f_defect = tmp_path / "D-031.md"
-        f_defect.write_text(f_valid.read_text(encoding="utf-8"), encoding="utf-8")
-        errs = check_evidence_file(f_defect)
-        assert_true(len(errs) == 0, f"Valid defect filename failed: {errs}")
+        # 11. Valid defect filenames
+        for good_defect in ["D-031.md", "D-038.md"]:
+            f_defect = tmp_path / good_defect
+            f_defect.write_text(f_valid.read_text(encoding="utf-8"), encoding="utf-8")
+            errs = check_evidence_file(f_defect)
+            assert_true(len(errs) == 0, f"Valid defect filename {good_defect} failed: {errs}")
 
         # 12. Finding 1: Image version and commit without commit hash must FAIL
         f_no_commit = tmp_path / "P0-F8.10.md"
@@ -535,6 +546,87 @@ def run_self_tests() -> int:
         )
         errs = check_evidence_file(f_privkey)
         assert_true(any("contains private key" in e for e in errs), f"Expected private key detection, got: {errs}")
+
+        # 17. Heading-only Procedure section must FAIL and name Procedure (D-038, AC1)
+        f_heading_proc = tmp_path / "P0-F8.15.md"
+        f_heading_proc.write_text(
+            "# Evidence: P0-F8.15 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit cee739f\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\n"
+            "### Step 1\n\n"
+            "## Observed result\nOutput observed here.\n\n"
+            "## Missed targets\nNone.\n",
+            encoding="utf-8",
+        )
+        errs = check_evidence_file(f_heading_proc)
+        assert_true(
+            any("mandatory field 'Procedure' is empty or missing" in e for e in errs)
+            and any(f_heading_proc.name in e for e in errs),
+            f"Expected empty Procedure error naming file and section, got: {errs}",
+        )
+
+        # 18. Heading-only Observed result section must FAIL and name Observed result (D-038, AC1)
+        f_heading_res = tmp_path / "P0-F8.16.md"
+        f_heading_res.write_text(
+            "# Evidence: P0-F8.16 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit cee739f\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\nSteps executed here.\n\n"
+            "## Observed result\n"
+            "### Step 1\n\n"
+            "## Missed targets\nNone.\n",
+            encoding="utf-8",
+        )
+        errs = check_evidence_file(f_heading_res)
+        assert_true(
+            any("mandatory field 'Observed result' is empty or missing" in e for e in errs)
+            and any(f_heading_res.name in e for e in errs),
+            f"Expected empty Observed result error naming file and section, got: {errs}",
+        )
+
+        # 19. Valid section with subheadings and non-heading body content must PASS (D-038)
+        f_subheading_content = tmp_path / "P0-F8.17.md"
+        f_subheading_content.write_text(
+            "# Evidence: P0-F8.17 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit cee739f\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\n"
+            "### Step 1\n"
+            "Steps executed here.\n\n"
+            "## Observed result\n"
+            "### Result 1\n"
+            "Output observed here.\n\n"
+            "## Missed targets\nNone.\n",
+            encoding="utf-8",
+        )
+        errs = check_evidence_file(f_subheading_content)
+        assert_true(len(errs) == 0, f"Valid section with subheadings and body failed: {errs}")
+
+        # 20. Multi-heading section without body content must FAIL (D-038)
+        f_multi_heading = tmp_path / "P0-F8.18.md"
+        f_multi_heading.write_text(
+            "# Evidence: P0-F8.18 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit cee739f\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\n"
+            "### Step 1\n"
+            "### Step 2\n"
+            "#### Substep 2.1\n\n"
+            "## Observed result\nOutput observed here.\n\n"
+            "## Missed targets\nNone.\n",
+            encoding="utf-8",
+        )
+        errs = check_evidence_file(f_multi_heading)
+        assert_true(any("mandatory field 'Procedure' is empty or missing" in e for e in errs), f"Expected multi-heading Procedure error, got: {errs}")
 
     print()
     if failures:
