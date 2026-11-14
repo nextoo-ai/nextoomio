@@ -399,23 +399,43 @@ def run_self_tests():
 
         print("test_ac2_change_branch_broken_agent_run: OK")
 
-        # Test 3: verify agent-run.sh logic for pinned agent definitions
+        # Test 3: verify pinned agent-run.sh uses pinned agent definitions via stubbed agy
+        stub_bin = os.path.join(tmpdir, "stub_bin")
+        os.makedirs(stub_bin)
+        with open(os.path.join(stub_bin, "gh"), "w") as f:
+            f.write("#!/bin/sh\necho 12345\n")
+        os.chmod(os.path.join(stub_bin, "gh"), 0o755)
+        with open(os.path.join(stub_bin, "agy"), "w") as f:
+            f.write('#!/bin/sh\necho "AGY_PROMPT: $@"\n')
+        os.chmod(os.path.join(stub_bin, "agy"), 0o755)
+
+        # Stub agent-token.sh in pinned tooling so agent-run.sh needs no network
+        with open(tooling_root.agent_token, "w") as f:
+            f.write("#!/bin/sh\necho test_token\n")
+
         custom_agents_dir = os.path.join(tmpdir, "custom_agents")
         os.makedirs(custom_agents_dir)
         with open(os.path.join(custom_agents_dir, "devops.md"), "w") as f:
             f.write("---\nname: devops\n---\nCUSTOM_AGENT_BRIEF_CONTENT\n")
-        # Pinned agent definition resolution via $here/../.claude/agents
-        fallback_agents_dir = os.path.join(os.path.dirname(tooling_root.agent_run), "..", ".claude", "agents")
-        assert os.path.isfile(os.path.join(fallback_agents_dir, "devops.md")), "fallback devops.md missing"
-        # Read brief via custom agents dir
-        awk_cmd = ["awk", "f>=2; /^---$/ {f++}", os.path.join(custom_agents_dir, "devops.md")]
-        awk_res = subprocess.run(awk_cmd, capture_output=True, text=True, check=True)
-        assert "CUSTOM_AGENT_BRIEF_CONTENT" in awk_res.stdout
-        # Verify agent-run.sh script contains the NEXTOOMIO_AGENTS_DIR parameter substitution
-        with open(tooling_root.agent_run, "r") as f:
-            content = f.read()
-        assert "NEXTOOMIO_AGENTS_DIR:-$here/../.claude/agents" in content, "agent-run.sh missing NEXTOOMIO_AGENTS_DIR logic"
-        print("test_agent_run_sh_agents_dir: OK")
+
+        # 1. Fallback to pinned $here/../.claude/agents when NEXTOOMIO_AGENTS_DIR is unset
+        env_fallback = dict(os.environ,
+                            PATH=f"{stub_bin}:{os.environ.get('PATH', '')}",
+                            NEXTOOMIO_STATE_DIR=os.path.join(tmpdir, "state"))
+        env_fallback.pop("NEXTOOMIO_AGENTS_DIR", None)
+        res_fallback = subprocess.run([tooling_root.agent_run, "devops", "-p", "fallback task"],
+                                      capture_output=True, text=True, env=env_fallback)
+        assert res_fallback.returncode == 0, f"agent-run.sh fallback failed: {res_fallback.stderr}"
+        assert "DevOps" in res_fallback.stdout, f"Pinned brief not found: {res_fallback.stdout}"
+
+        # 2. Use NEXTOOMIO_AGENTS_DIR when set
+        env_custom = dict(env_fallback, NEXTOOMIO_AGENTS_DIR=custom_agents_dir)
+        res_custom = subprocess.run([tooling_root.agent_run, "devops", "-p", "custom task"],
+                                    capture_output=True, text=True, env=env_custom)
+        assert res_custom.returncode == 0, f"agent-run.sh with NEXTOOMIO_AGENTS_DIR failed: {res_custom.stderr}"
+        assert "CUSTOM_AGENT_BRIEF_CONTENT" in res_custom.stdout, f"Custom brief not found: {res_custom.stdout}"
+        assert "custom task" in res_custom.stdout, f"Custom task not found: {res_custom.stdout}"
+        print("test_agent_run_pinned_agents: OK")
 
     print("OK: all self-tests passed.")
     return 0
