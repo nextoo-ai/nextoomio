@@ -1,6 +1,6 @@
 # nextoomio – functional specification
 
-Document version: **1.13**  
+Document version: **1.15**  
 First prototype version: **nextoomio v0.0.1**  
 Planned delivery: **v0.0.1–v0.0.5 according to [ROADMAP.md](ROADMAP.md)**  
 Date: **2026-11-13**  
@@ -255,13 +255,15 @@ The following minimum requirements apply to v0.0.1–v0.0.5 on a local network. 
 - Salted administrator-password hashes; other secrets in persistent storage accessible only to necessary services and excluded from ordinary logs.
 - A/B updates and automatic return after failed boot or health checks.
 - Configuration and user-data preservation during updates and return to the previous slot.
-- Least-privilege services and removal/limitation of unnecessary network services.
+- Least-privilege services and removal/limitation of unnecessary network services. Shell access (SSH) is off unless enabled through the storage card as described in section 10.1.
 - Controlled execution of local actions and protection against loops.
 - Safe initial setup, configuration backup, and restore.
 
 Operate the prototype on a local network without direct internet exposure. Choose authentication implementation, certificates, partition layout, and update tooling during technical design. Verify rollback data preservation including schema compatibility: a new version must not irreversibly overwrite configuration needed by the previous slot.
 
 ### 10.1 Manual updates for v0.0.1–v0.0.5
+
+SSH access is disabled by default. It is enabled only by placing a public-key file on the first FAT partition of the storage card, uses key authentication only, and is disabled again by removing the file. Enabling it therefore requires physical possession of the card; it cannot be enabled through the WebUI, API, MQTT, or Matter. While it is enabled, a developer may start an image upload from a workstation over SSH and may require a confirmation from that workstation before a trial slot is committed. This path uses the same A/B mechanism, validation, and rollback rules as below and is not an online update. The WebUI and diagnostics show whether SSH access is enabled.
 
 - **UPD-01:** Start updates through manual system-image upload in the local WebUI. Device internet access is not required.
 - **UPD-02:** Do not discover, download, or automatically install online updates. A manually uploaded image is the only update input.
@@ -297,6 +299,7 @@ The full functionality, dependencies, release gates, and requirement-ID coverage
 
 | Version | New functionality |
 | --- | --- |
+| Phase 0 (v0.0.0, internal) | No user functionality. A/B base image for the reference hardware that is installed and replaced remotely, with automatic return from a bad image, so later releases can be tested without physical access to the device. Not a public release. |
 | v0.0.1 | Standalone Yocto player targeting Raspberry Pi 4 + HiFiBerry Amp+: local files, radio, API, English-only translation-ready WebUI, safe initial setup, manual A/B updates, and configuration backup/restore. Reference hardware is closed under section 2.1. |
 | v0.0.2 | NAS, Wi-Fi configuration, and native multiroom with central volume, satellite references, group control, and failure recovery. |
 | v0.0.3 | AirPlay 2, Spotify Connect, Bluetooth reception, and Music Assistant with complete input arbitration and group isolation. |
