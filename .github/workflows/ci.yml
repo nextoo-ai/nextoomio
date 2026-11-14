@@ -25,6 +25,9 @@ jobs:
       - name: Verify 78 requirement IDs and Markdown links
         run: python3 scripts/check_traceability.py
 
+      - name: Verify document versions and cross-document section references
+        run: python3 scripts/check_doc_versions.py
+
       - name: Validate meta-nextoomio layer and kas definitions
         run: python3 scripts/check_yocto_layer.py
 
