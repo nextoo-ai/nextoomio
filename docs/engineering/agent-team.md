@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.5 (autonomous operation)**  
+Document version: **0.6 (autonomous operation)**  
 Date: **2026-11-14**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -12,6 +12,8 @@ Version 0.3 replaces the two shared Apps of OQ-01 and OQ-12 with one App per rol
 Version 0.4 turns the proposal into the team document: it is renamed from `agent-team-proposal.md`, the code-quality rules move to their own file, the agent definitions, the guard, and the session scripts exist, and section 7 records the state of each change.
 
 Version 0.5 records the owner's decisions after the first trial run: no person in the loop, one independent model per role with development in Antigravity, and the Architect as orchestrator (section 3.1). It adds the rule set on `main`, the pipeline, the Antigravity author roles, and the results of the trial (section 9.3).
+
+Version 0.6 records the first two pipeline runs and what they changed: the author roles only change files and run checks, and the pipeline creates the branch, checks the changed paths, commits, pushes, and opens the pull request (section 5 step 1, sections 7 and 8, section 9.3). It also records the bootstrap exception (section 8).
 
 ## 1. Goal
 
@@ -116,7 +118,7 @@ SPECIFICATION ─► Architect ─► story (state:ready) ─► pipeline
 
 `scripts/agent-pipeline.py <issue>` runs one issue labelled `state:ready` to its end:
 
-1. The author role (Developer, or DevOps for build, CI, image, tooling, and hardware work) implements the issue on its branch and opens a pull request that references it with `Refs #<n>`.
+1. The author role (Developer, or DevOps for build, CI, image, tooling, and hardware work) implements the issue in the working tree, on a branch the pipeline created. The pipeline then checks every changed path against the role with the guard's own rules; if any is outside, it commits nothing, keeps the changes in a local stash, and blocks the issue. Otherwise it commits and pushes under the role's identity and opens the pull request with the author's summary and `Refs #<n>`.
 2. The pipeline enables auto-merge on the pull request as the author's App. GitHub merges it when the rule set on `main` is satisfied, not before.
 3. CI runs; the pipeline waits until all required checks have reported. The Reviewer reviews the head commit and states `Completes-Story: yes` or `Completes-Story: no` in the review. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
 4. After the merge, if the review said `Completes-Story: yes`, the pipeline sets `state:implemented` and starts QM. If it said `no`, the pipeline stops and leaves the issue ready for the next pull request, which a further run delivers.
@@ -153,7 +155,7 @@ Pull requests never use a closing keyword: an issue is closed only after the QM 
 | Rule set on `main` | Changes only through a pull request; the three CI checks; one approval of the head commit by someone other than the last pusher; no forced push or deletion; no bypass actor. Auto-merge and branch deletion on merge are enabled in the repository | In place since 2026-11-14; not yet described in `CONTRIBUTING.md` (P0-F8.2, #85) |
 | `scripts/agent-pipeline.py` | The workflow of section 5 | In place; section 9.3 records whether it has run. It takes the "Touches" list from the issue body as extra paths for the guard; that list is written by the Architect and is trusted |
 | `.github/PULL_REQUEST_TEMPLATE.md` | Role and model line and the issue reference; P0-F8.1 (#84) covers the template | Not in place |
-| CI | Role path scope (CQ-M10) and lock files (CQ-M8) | Not in place. Until CQ-M10 exists, the path scope of the Developer and DevOps roles, which run in Antigravity without the guard, is enforced by review only (CQ-R13) |
+| CI | Role path scope (CQ-M10) and lock files (CQ-M8) | Not in place. For the Developer and DevOps roles, which run in Antigravity without the guard, the pipeline checks the changed paths before it commits, and the Reviewer applies CQ-R13; a pull request made outside the pipeline has the review only |
 | Bench key | OQ-14 | Not in place |
 
 ## 8. Agent definitions and starting a session
@@ -169,7 +171,9 @@ Each file under `.claude/agents/<role>.md` (`architect`, `developer`, `reviewer`
 A role is started with `scripts/agent-run.sh <role>`, normally by the pipeline. The script gives `gh` and `git` a private configuration that contains only the short-lived token of the role's App, refreshes it while the session runs, removes it afterwards, and sets the commit author to the App's bot identity. `scripts/agent-run.sh --check <role>` sets up the identity, prints it, and exits.
 
 - **Architect, Reviewer, QM** run in Claude Code as `claude --agent <role>`, with the definition's model, removed tools, and guard hook. The command-line program must be signed in.
-- **Developer, DevOps** run in Antigravity as `agy -p`, headless. Antigravity has no agent definitions or hooks of ours: the script passes the body of the role's definition together with the task, and the repository's `AGENTS.md` is read by Antigravity itself. **The guard does not run there.** The role's path limits are checked by the Reviewer (CQ-R13) and, once it exists, by the CI path-scope check (CQ-M10). The `model` field in these two definitions applies only if the role is started in Claude Code instead.
+- **Developer, DevOps** run in Antigravity as `agy -p`, headless. Antigravity has no agent definitions or hooks of ours: the script passes the body of the role's definition together with the task, and the repository's `AGENTS.md` is read by Antigravity itself. **The guard does not run there**, and Antigravity's sandbox does not let `git` write to `.git`, so these roles only change files and run checks; the pipeline makes the branch, commit, push, and pull request for them. Before committing, the pipeline applies the guard's path rules to every changed file, which is a mechanical check of the role's paths for pipeline runs; the Reviewer applies CQ-R13 as well. The `model` field in these two definitions applies only if the role is started in Claude Code instead.
+
+**Bootstrap exception.** `scripts/agent-run.sh`, `scripts/agent-token.sh`, and `scripts/agent-pipeline.py` are DevOps paths, but they are what the DevOps role is started with. Until one pipeline run has delivered a DevOps change from start to end, the Architect may change these three files on an `arch/` branch, through the same review and rule set as any change. The Architect authorised this under D-G. It covers pull requests #154, #158, #159, and #160 and any further fix needed to reach that first complete run, and it ends with that run; after it, these files change only through DevOps issues.
 
 Paths that a story names under "Touches" outside the role's default paths are passed by the owner in `NEXTOOMIO_EXTRA_PATHS` (patterns separated by colons) when starting the session.
 
@@ -251,6 +255,8 @@ What the trial showed about the model itself:
 - **The Reviewer App needs contents write** for its approval to count. It therefore could push to branches; the rule set keeps it from `main`, and it cannot approve its own pull request.
 
 First pipeline run, on D-028 (#60), 2026-11-14: stopped by hand. It found two faults in `scripts/agent-run.sh`, both corrected: started with `--mode accept-edits`, Antigravity denied every shell command, because a headless run cannot ask; and the token refresher kept the caller's output open, so the pipeline waited after the role had ended. A third observation concerns GitHub: auto-merge enabled before the approval did not merge pull request #158 once the rules were met; asking for it again merged at once, and the pipeline now does that. After the corrections, a DevOps run in Antigravity reported the App's commit identity and saw only this repository through `gh`.
+
+Second pipeline run, on #60: the DevOps role ended without output and the pipeline blocked the issue, as designed. Antigravity runs headless with tool permission "request review": a command outside its allow list is denied because nobody can be asked. The owner approved allow rules for `git`, `gh`, `make`, `python3`, `cargo`, `npm`, and `node` in `~/.gemini/antigravity-cli/settings.json`. With them, a file edit worked and commands ran, but `git` could not write to `.git` inside Antigravity's sandbox. Letting `git` leave the sandbox was not done. Instead the author roles no longer use git for writing: the pipeline creates the branch, checks the changed paths, commits, pushes, and opens the pull request (section 5).
 
 Not yet shown: a complete run of `scripts/agent-pipeline.py`; a Developer or DevOps run in Antigravity that commits, pushes, and opens a pull request; the Reviewer on Sonnet and QM on Opus.
 

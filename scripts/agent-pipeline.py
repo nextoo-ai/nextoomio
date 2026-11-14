@@ -4,7 +4,10 @@
 Usage: scripts/agent-pipeline.py <issue number> [--role developer|devops]
 
 Steps (docs/engineering/agent-team.md, section 5):
-  1. The author role implements the issue and opens a pull request.
+  1. The author role implements the issue in the working tree. The pipeline
+     checks that the changed paths belong to the role, then commits, pushes,
+     and opens the pull request under the role's identity. (The author roles
+     run in Antigravity, whose sandbox does not let git write to .git.)
   2. Auto-merge is enabled, so GitHub merges once the rules on main are met.
   3. CI runs; the Reviewer reviews. Requested changes or a CI failure go back
      to the author, at most MAX_ROUNDS times, then the issue is blocked.
@@ -35,6 +38,7 @@ REQUIRED_CHECKS = {
     "Rust Core & License Gate",
     "WebUI & i18n Catalog Gate",
 }
+AUTHOR_MODEL = os.environ.get("NEXTOOMIO_AGY_MODEL", "gemini-3.8-flash-high") + " (Antigravity)"
 AGENT_TIMEOUT = int(os.environ.get("NEXTOOMIO_AGENT_TIMEOUT_SECONDS", "3600"))
 
 
@@ -101,7 +105,71 @@ def agent(role, task, log, extra_paths=None):
     with open(log, "a") as f:
         f.write(f"\n===== {role} @ {datetime.datetime.now().isoformat()} =====\n{out.stdout}\n")
     say(f"{role}: finished (exit {out.returncode})")
-    return out.returncode
+    return out.stdout or ""
+
+
+def bot_identity(role):
+    bot = f"nextoomio-{role}[bot]"
+    bot_id = gh(["api", f"users/nextoomio-{role}%5Bbot%5D", "--jq", ".id"]).strip()
+    return bot, f"{bot_id}+{bot}@users.noreply.github.com"
+
+
+def changed_paths():
+    out = run(["git", "status", "--porcelain", "-uall"]).stdout
+    return [line[3:].split(" -> ")[-1].strip('"') for line in out.splitlines() if line.strip()]
+
+
+def outside_role_paths(role, paths, extra_paths):
+    """Paths the role may not edit, judged by the same guard the Claude Code roles run under."""
+    env = dict(os.environ, NEXTOOMIO_EXTRA_PATHS=":".join(extra_paths or []))
+    guard = os.path.join(ROOT, ".claude", "hooks", "role-guard.py")
+    refused = []
+    for path in paths:
+        event = json.dumps({"tool_name": "Write", "cwd": ROOT,
+                            "tool_input": {"file_path": os.path.join(ROOT, path)}})
+        out = subprocess.run([sys.executable, guard, role], input=event, text=True,
+                             capture_output=True, env=env)
+        if out.stdout.strip():
+            refused.append(path)
+    return refused
+
+
+def deliver(role, issue, title, branch, output, extra_paths, number):
+    """Commit and push the author's changes as the role; open the pull request if there is none.
+
+    Returns the pull request number, or None when the author changed nothing.
+    """
+    paths = changed_paths()
+    if not paths:
+        return None
+    refused = outside_role_paths(role, paths, extra_paths)
+    if refused:
+        run(["git", "stash", "push", "-u", "-m", f"pipeline: refused changes for issue {issue}"])
+        run(["git", "switch", "main"])
+        block(issue, f"the {role} changed paths outside its role, so nothing was committed: "
+                     + ", ".join(f"`{p}`" for p in refused) + ". The changes are kept in a local stash.")
+    found = re.search(r"^PR-Title:\s*(.+)$", output, re.M)
+    pr_title = found.group(1).strip() if found else title
+    summary = output.split("PR-Summary:", 1)[1].strip() if "PR-Summary:" in output else \
+        "The author gave no summary; see the diff."
+    bot, email = bot_identity(role)
+    env = dict(os.environ, GIT_AUTHOR_NAME=bot, GIT_COMMITTER_NAME=bot,
+               GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_EMAIL=email)
+    run(["git", "add", "-A"], env=env)
+    run(["git", "commit", "-q", "-m", f"{pr_title}\n\nRefs #{issue}"], env=env)
+    helper = "!f() { echo username=x-access-token; echo \"password=$NEXTOOMIO_PUSH_TOKEN\"; }; f"
+    run(["git", "-c", "credential.helper=", "-c", f"credential.helper={helper}",
+         "push", "-q", "-u", "origin", branch], env=dict(env, NEXTOOMIO_PUSH_TOKEN=token(role)))
+    if number:
+        gh(["pr", "comment", str(number), "--body",
+            f"{summary}\n\nRole: {role.capitalize()} · Model: {AUTHOR_MODEL}"], role=role)
+        return number
+    body = (f"Refs #{issue}\n\n{summary}\n\nThe branch, commit, and this pull request were made by the "
+            f"pipeline from the author's working tree, after checking the changed paths against the role.\n\n"
+            f"Role: {'DevOps' if role == 'devops' else 'Developer'} · Model: {AUTHOR_MODEL}")
+    url = gh(["pr", "create", "--base", "main", "--head", branch, "--title", pr_title, "--body", body],
+             role=role).strip().splitlines()[-1]
+    return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
 def find_pr(issue, author_role):
@@ -186,21 +254,34 @@ def main():
     # "Touches" entries outside the role's default paths, for the guard where it runs.
     touches = re.findall(r"^- `([^`]+)`", (info["body"].split("### Touches", 1) + [""])[1].split("###", 1)[0], re.M)
 
-    task = (f"Work on issue {issue} ({info['title']}) in repository {REPO}. "
-            "Follow your role definition. Open one pull request that references the issue with "
-            f"'Refs #{issue}' in its description.")
-    pr = None
+    ident = re.match(r"[A-Za-z0-9.-]+", info["title"]).group(0)
+    slug = re.sub(r"[^a-z0-9]+", "-", info["title"][len(ident):].lower()).strip("-")[:32].strip("-")
+    branch = f"{'ops' if role == 'devops' else 'dev'}/{ident}-{slug}"
+    existing = find_pr(issue, role)
+    number = existing["number"] if existing else None
+    if run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"], check=False).returncode == 0:
+        if run(["git", "switch", branch], check=False).returncode != 0:
+            run(["git", "switch", "-c", branch, f"origin/{branch}"])
+        run(["git", "pull", "--ff-only"], check=False)
+    else:
+        run(["git", "switch", "-c", branch])
+
+    task = (f"Work on issue {issue} ({info['title']}) in repository {REPO}. Follow your role definition.")
     rounds = 0
     while True:
-        agent(role, task, log, extra_paths=touches)
+        output = agent(role, task, log, extra_paths=touches)
+        delivered = deliver(role, issue, info["title"], branch, output, touches, number)
+        number = delivered or number
         run(["git", "switch", "main"], check=False)
-        pr = find_pr(issue, role)
-        if not pr:
+        if not delivered and number:
+            block(issue, f"the {role} changed nothing in response to the review or CI result on "
+                         f"pull request #{number}.")
+        if not number:
             current = gh_json(["issue", "view", str(issue), "--json", "labels"])
             if "state:blocked" in {l["name"] for l in current["labels"]}:
                 raise Stop(2, f"issue #{issue} was blocked by the {role}; see its comment")
-            block(issue, f"the {role} finished without opening a pull request that references the issue.")
-        number, head = pr["number"], pr_state(pr["number"])["headRefOid"]
+            block(issue, f"the {role} finished without changing anything.")
+        head = pr_state(number)["headRefOid"]
         say(f"pull request #{number} at {head[:7]}")
         gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
 
@@ -221,7 +302,9 @@ def main():
             block(issue, f"pull request #{number} was not approved after {MAX_ROUNDS} rounds of changes; "
                          "the Architect decides whether the story or the approach is wrong.")
         task = (f"Pull request {number} for issue {issue} needs changes: {why}. Read the review and the CI "
-                "result on GitHub and address them on the same branch. Follow your role definition.")
+                f"result with `gh pr view {number} --comments` and `gh pr checks {number}`, and address them. "
+                "Follow your role definition.")
+        run(["git", "switch", branch])
 
     # Auto-merge enabled before the approval did not fire on its own in the
     # first runs; asking again merges at once when the rules are met, and
