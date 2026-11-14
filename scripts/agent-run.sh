@@ -119,6 +119,16 @@ checks your changed paths against your role, commits and pushes them under
 your identity, and opens or updates the pull request. You may read issues,
 pull requests, and reviews with gh, and comment on your issue.
 
+This program runs without anyone to ask. A shell command outside its allow
+list ends your whole run with no output, and your work is lost. Use only:
+git (reading only), gh, make, python3, node, npm, cargo, and the utilities
+mkdir, ls, cat, cp, mv, find, grep, head, tail, sed, awk, wc, diff, sort,
+touch, echo, printf, pwd, which, test, mktemp, tee, tr, cut, dirname,
+basename. Do not use rm, curl, chmod, or any other command, and do not
+wrap commands in bash -c or sh -c. Prefer your file-editing tools to shell
+commands for creating and changing files. If a tool the task needs is not
+installed (for example cargo), do not search for it: say so in the summary.
+
 End your reply with exactly this block, in English:
 
 PR-Title: <one line that says what the change does>
