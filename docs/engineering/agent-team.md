@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.8 (autonomous operation)**  
+Document version: **0.9 (autonomous operation)**  
 Date: **2026-11-14**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -18,6 +18,8 @@ Version 0.6 records the first two pipeline runs and what they changed: the autho
 Version 0.7 records the third pipeline run (section 9.3).
 
 Version 0.8 records the first complete pipeline run and ends the bootstrap exception (sections 8, 9.3, and 11).
+
+Version 0.9 records the pipeline run on D-038 and the correction to the Reviewer definition that it led to (sections 5 and 9.3).
 
 ## 1. Goal
 
@@ -124,7 +126,7 @@ SPECIFICATION ─► Architect ─► story (state:ready) ─► pipeline
 
 1. The author role (Developer, or DevOps for build, CI, image, tooling, and hardware work) implements the issue in the working tree, on a branch the pipeline created. The pipeline then checks every changed path against the role with the guard's own rules; if any is outside, it commits nothing, keeps the changes in a local stash, and blocks the issue. Otherwise it commits and pushes under the role's identity and opens the pull request with the author's summary and `Refs #<n>`.
 2. The pipeline enables auto-merge on the pull request as the author's App. GitHub merges it when the rule set on `main` is satisfied, not before.
-3. CI runs; the pipeline waits until all required checks have reported. The Reviewer reviews the head commit and states `Completes-Story: yes` or `Completes-Story: no` in the review. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
+3. CI runs; the pipeline waits until all required checks have reported. The Reviewer reviews the head commit and states `Completes-Story: yes` or `Completes-Story: no` in the review; the line refers to the issue the pull request was made for, including a defect worked on directly. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
 4. After the merge, if the review said `Completes-Story: yes`, the pipeline sets `state:implemented` and starts QM. If it said `no`, the pipeline stops and leaves the issue ready for the next pull request, which a further run delivers.
 5. QM ends its verdict with `QM-Verdict: PASS` or `QM-Verdict: FAIL`. On PASS the pipeline ticks the acceptance criteria and closes the issue as completed. Otherwise the issue stays open with the verdict, for the Architect.
 6. Any role that finds a problem outside its task reports a finding; the Architect files the defect.
@@ -283,6 +285,8 @@ Observed and not yet resolved:
 - After the run the local checkout was left on a detached commit instead of `main`. The pipeline should end on `main`.
 - A Reviewer run reported that a local fetch of the pull-request branch was denied and reviewed from the diff alone in that round.
 - The Rust toolchain is not installed on the workstation, so no role can run the core checks locally; stories that need them depend on CI.
+
+**Pipeline run on D-038 (#163), 2026-11-14.** The DevOps role delivered the fix in seven minutes, the Reviewer approved the first head commit, and GitHub merged pull request #166, nine minutes after the start. The pipeline then stopped before QM: the review said `Completes-Story: no`, because the Reviewer definition told it to write `no` for a pull request that belongs to no story, and the work item was a defect. The definition now says that the line refers to the issue the pull request was made for, whatever its type. The Architect completed #163 outside the pipeline with the same steps: `state:implemented`, the QM run, and closing on its verdict.
 
 Not yet shown: a Developer run (application code under `core/`, `matter/`, or `webui/`); a story with hardware evidence; a run that the pipeline blocks after two rounds; parallel runs.
 
