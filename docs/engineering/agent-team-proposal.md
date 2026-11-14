@@ -1,11 +1,13 @@
 # Agent team proposal
 
-Document version: **0.2 (architect review complete)**  
+Document version: **0.3 (architect review complete; identities created)**  
 Date: **2026-11-14**  
-Status: **Reviewed by the Architect; all open questions of version 0.1 are resolved in section 9 and the review findings are in section 10. Awaiting approval by the project owner. Nothing in this document is set up, configured, or in use. Statements about GitHub and Claude Code behavior marked "verify at setup" were read from documentation or are expected behavior and have not been tried in this repository.**  
+Status: **Reviewed by the Architect; all open questions of version 0.1 are resolved in section 9 and the review findings are in section 10. Awaiting approval by the project owner. The five GitHub Apps of OQ-01 exist and are installed (section 9.1); no agent uses them yet, and nothing else in this document is set up, configured, or in use. Statements about GitHub and Claude Code behavior marked "verify at setup" were read from documentation or are expected behavior and have not been tried in this repository.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md).
 
 Version 0.2 records the architect decisions for OQ-01 to OQ-16, adds the review findings RF-01 to RF-10, defines the content of the code-quality rules, and lists the work items that follow from approval.
+
+Version 0.3 replaces the two shared Apps of OQ-01 and OQ-12 with one App per role, as chosen by the project owner, and records what was created and checked on 2026-11-14 (section 9.1).
 
 ## 1. Goal
 
@@ -178,7 +180,7 @@ These are proposed and not yet made. Section 11 maps them to work items.
 | `.github/CODEOWNERS` | `* @nextoo-ai`. |
 | `.github/PULL_REQUEST_TEMPLATE.md` | Add the role and model line and the issue reference; P0-F8.1 (#84) already covers the template. |
 | GitHub labels | `state:ready`, `state:blocked`, `type:finding`, `risk:high`. |
-| GitHub Apps and rule set on `main` | OQ-01 and OQ-12; extends P0-F8.2 (#85). |
+| Rule set on `main` | OQ-01; extends P0-F8.2 (#85). The GitHub Apps of OQ-01 and OQ-12 exist (section 9.1). |
 
 ## 8. What an agent definition contains
 
@@ -198,7 +200,7 @@ Decisions are by the Architect unless marked otherwise. They take effect when th
 
 | ID | Question | Decision and reason |
 | --- | --- | --- |
-| OQ-01 | Reviewer identity | **Two GitHub Apps, and the owner's approval as the enforced gate.** `nextoomio-author` is used by the Architect, Developer, and DevOps; `nextoomio-reviewer` by the Reviewer and QM. The project owner keeps the personal account `nextoo-ai` and no agent uses it. The rule set on `main` requires a pull request, the CI checks, and a code-owner review with `* @nextoo-ai` as the only code owner. Pull requests are then authored by an App, so the owner can approve them, which the shared identity prevents today; neither App can satisfy the code-owner requirement, so no agent can merge. The Reviewer's review is the owner's input, not a second required approval. Separate identities per author role add nothing that the branch prefix and the role line do not already give. Option (b) is rejected: a second user account cannot use a fine-grained token on a repository owned by another user. Option (c) alone leaves "no agent merges" unenforced. Verify at setup that a code-owner review can be required on this user-owned repository and that App-authored pull requests behave as described. **Until the Apps exist**, all agents act as `nextoo-ai`, the Reviewer submits a comment review with an explicit verdict line, and the merge rule rests on instructions and the local guard only; this interim state is not separation of duties and is recorded as such. |
+| OQ-01 | Reviewer identity | **One GitHub App per role, and the owner's approval as the enforced gate.** The Apps are `nextoomio-architect`, `nextoomio-developer`, `nextoomio-reviewer`, `nextoomio-qm`, and `nextoomio-devops` (section 9.1); the choice of one identity per role instead of two shared ones was made by the project owner, so that every pull request, review, and comment shows its role in GitHub itself. The project owner keeps the personal account `nextoo-ai` and no agent uses it. The rule set on `main` requires a pull request, the CI checks, and a code-owner review with `* @nextoo-ai` as the only code owner. Pull requests are then authored by an App, so the owner can approve them, which the shared identity prevents today; no App can satisfy the code-owner requirement, so no agent can merge. The Reviewer's review is the owner's input, not a second required approval. Option (b) is rejected: GitHub's terms allow one person a single free machine account, which does not cover five roles. Option (c) alone leaves "no agent merges" unenforced. **Not yet in place:** the rule set does not exist, so the three Apps with contents write can at present push to `main` and merge. Verify at setup that a code-owner review can be required on this user-owned repository and that the owner can approve App-authored pull requests. **Until agents use the Apps**, all agents act as `nextoo-ai`, the Reviewer submits a comment review with an explicit verdict line, and the merge rule rests on instructions and the local guard only; this interim state is not separation of duties and is recorded as such. |
 | OQ-02 | Enforcing write scopes | **Three layers.** (1) The Reviewer and QM definitions have no editing tools. (2) Each definition carries a `PreToolUse` hook that calls one shared guard script: it rejects edits outside the role's paths and rejects `gh pr merge`, pushes to `main`, forced pushes, and issue closing from the shell. Claude Code cannot restrict paths or command prefixes per agent through permission rules, only through such a hook. (3) Because a shell command can still write any file, CI check CQ-M10 fails a pull request that touches paths outside the role named by its branch prefix (`arch/`, `dev/`, `ops/`), and the Reviewer applies CQ-R13. The branch prefix is a declaration by the author; the check catches drift and mistakes, and the owner's approval remains the control against deliberate circumvention. The guard and the agent definitions are themselves Architect-owned paths. |
 | OQ-03 | Model and effort per role | As assigned in section 4: Architect `fable` high; Developer `sonnet` medium, `fable` high for `risk:high`; Reviewer `opus` high; QM `sonnet` high; DevOps `sonnet` medium with `haiku` for logs. The Architect sets `risk:high` on stories that touch the session manager, the update engine, `nx-sysd`, authentication, secrets, or the group channel. The Reviewer never runs on the same model as the author of the pull request it reviews. All models come from one vendor, so the independence of a review comes mainly from the separate context and the separate brief; the different model is an additional measure, not the main one. Fallback when a model is unavailable: the next more capable one, never the author's for a review; the role and model line records what actually ran. Definitions use model aliases, not dated identifiers. |
 | OQ-04 | Where agents run | **Local sessions for every role.** Cloud sessions have no bench access and would need the App tokens distributed to another environment. Revisit when automatic triggering (D-A) is revisited. |
@@ -209,11 +211,27 @@ Decisions are by the Architect unless marked otherwise. They take effect when th
 | OQ-09 | Story that cannot be delivered as written | **Confirmed, with one addition.** The Developer stops, pushes nothing that contradicts the story, sets `state:blocked`, and comments what cannot be delivered, why, and what change to the story or documents would resolve it. The Architect changes the documents or the story in a separate pull request and re-marks the story ready. This also applies when a needed third-party component is not named by the story. |
 | OQ-10 | Channel for findings | **Option (b): a finding issue** with label `type:finding`, titled `Finding: <summary>`, stating where, what was expected and by which document, what is there, and how it was established. The Architect triages by converting the same issue into `D-<nnn>` (title, `type:defect`, severity, area, resolving story) or closing it as not planned or duplicate with the reason, so the history stays in one place. Problems inside the pull request under review are review comments, not findings. Suspected security vulnerabilities are never filed publicly: the agent reports them to the project owner only, who uses the private process in `SECURITY.md`. |
 | OQ-11 | Who reviews the Architect | **The Reviewer with the documentation checklist, then the owner**, as proposed. Changes to `AGENTS.md`, `.claude/`, and `docs/engineering/` follow the same path. |
-| OQ-12 | Credentials per agent | `nextoomio-author`: contents, pull requests, issues, and workflows write; Actions read. `nextoomio-reviewer`: contents and Actions read; pull requests and issues write. Neither has administration rights. Finer separation between Architect, Developer, and DevOps is not available at token level and is covered by OQ-02. App private keys stay outside the repository on the owner's workstation; a script under `scripts/` mints a short-lived installation token that the owner passes to the session through the environment. Tokens and keys never appear in the repository, logs, or evidence. |
+| OQ-12 | Credentials per agent | Each role uses the installation token of its own App with the permissions in section 9.1. No App has administration rights, and every App is installed on this repository only. The Architect and the Developer have the same permissions because GitHub permissions do not distinguish paths; their separation is covered by OQ-02. App private keys stay outside the repository on the owner's workstation; a script under `scripts/` mints a short-lived installation token that the owner passes to the session through the environment. Tokens and keys never appear in the repository, logs, or evidence. |
 | OQ-13 | Documentation checks in review | Section 6.3. CQ-D1 is automated today, CQ-D3 by P0-F8.3 (#86); the rest is review. |
 | OQ-14 | Bench access for DevOps | **A dedicated bench key pair**, added to the key file on the card (AD-23 allows several keys), loaded in an SSH agent for DevOps sessions; the agent process never reads the private key and the owner's personal key is not used. **Without asking**, within an issue that names bench work: read-only diagnostics over SSH, deploying through the update engine, rebooting, and switching the outlet where the story's procedure requires it or to recover an unreachable device; each outlet action is written into the evidence. **Always with the owner's confirmation:** raw writes to block devices or to the `select` partition outside the update engine, changes to the key file or network configuration, a data-partition reset, any action whose failure needs physical access to recover, and any connection to a host other than the bench device and the outlet. One bench session at a time. |
 | OQ-15 | Transition | **Confirmed.** PR #70 is merged as it is and does not include this document. The team model arrives in its own pull requests (section 11). Existing issues stay valid; the Architect adds "Touches" and `state:ready` to stories as they come up for work, not in one pass. |
 | OQ-16 | Cost and limits | **No monetary budget per role**; the limits are structural: the model and effort assignments of OQ-03, one issue or pull request per run, `fable` only for the Architect and `risk:high` stories, the two-round limit on review cycles (section 5), and the rule that an agent stops and reports instead of widening its task. Revisit with measured usage after Phase 0. |
+
+### 9.1 Identities created on 2026-11-14
+
+The five Apps are private, owned by `nextoo-ai`, without webhooks, and installed on `nextoo-ai/nextoomio` only. The permissions below are those GitHub returned for an installation token of each App on 2026-11-14.
+
+| App | Role | Write | Read |
+| --- | --- | --- | --- |
+| `nextoomio-architect` | Architect | contents, issues, pull requests | metadata |
+| `nextoomio-developer` | Developer | contents, issues, pull requests | metadata |
+| `nextoomio-devops` | DevOps | contents, issues, pull requests, workflows | actions, metadata |
+| `nextoomio-reviewer` | Reviewer | issues, pull requests | contents, actions, checks, metadata |
+| `nextoomio-qm` | QM | issues | contents, pull requests, actions, metadata |
+
+Checked: each token is issued for this repository only; the Reviewer token can read a pull request and is refused (HTTP 403) when writing repository content.
+
+Not checked: opening a pull request or submitting a review as an App, approval of an App-authored pull request by the owner, the code-owner requirement, and any use of the Apps by an agent session.
 
 ## 10. Review findings
 
@@ -241,11 +259,11 @@ None of these exist yet. They are created by the Architect as stories under feat
 | 1 | Adopt the team document, write `code-quality.md`, update `AGENTS.md` and the backlog conventions, create the labels; resolves D-037 (#69) | Architect | PR #70 merged |
 | 2 | Agent definitions, guard hook, `.gitignore` entry; record what was verified about `--agent` and `--worktree` | Architect | 1 |
 | 3 | Revise P0-F8.2 (#85): rule set with code-owner review, `CODEOWNERS` | DevOps; rule set applied by the owner | 1 |
-| 4 | GitHub Apps and the token script | DevOps; Apps created by the owner | 3 |
+| 4 | Token script for the existing Apps, and the check that App-authored pull requests and reviews behave as OQ-01 expects | DevOps | 3 |
 | 5 | CI role path-scope check (CQ-M10) and lock-file enforcement (CQ-M8) | DevOps | 1 |
 | 6 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88) | DevOps; key created by the owner | 1 |
 
-Items 3, 4, and 6 need actions only the project owner can take: creating the Apps, applying repository settings, and creating and placing the bench key.
+Items 3 and 6 need actions only the project owner can take: applying repository settings, and creating and placing the bench key.
 
 ## 12. Out of scope of this proposal
 
