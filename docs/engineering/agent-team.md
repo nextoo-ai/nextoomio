@@ -147,7 +147,7 @@ Each file under `.claude/agents/<role>.md` (`architect`, `developer`, `reviewer`
 - `hooks`: a `PreToolUse` hook on the editing tools and on the shell that calls `.claude/hooks/role-guard.py` with the role name (OQ-02).
 - Body: the role's task and limits in brief, by reference to this document; the instruction to read `AGENTS.md`, the backlog conventions, and this document before acting; the role and model line; and the instruction to report to the project owner in Slovak.
 
-The project owner starts a role with `scripts/agent-run.sh <role>`, adding Claude Code arguments such as `--worktree <name>` for Developer runs. The script gives `gh` and `git` a private configuration that contains only the short-lived token of the role's App, refreshes it while the session runs, sets the commit author to the App's bot identity, and starts `claude --agent <role>`. `scripts/agent-run.sh --check <role>` sets up the identity, prints it, and exits. The script needs the `claude` command-line program to be signed in.
+The project owner starts a role with `scripts/agent-run.sh <role>`, adding Claude Code arguments such as `--worktree <name>` for Developer runs. The script gives `gh` and `git` a private configuration that contains only the short-lived token of the role's App, refreshes it while the session runs, sets the commit author to the App's bot identity, and starts `claude --agent <role>`. `scripts/agent-run.sh --check <role>` sets up the identity, prints it, and exits. The script needs the `claude` command-line program to be signed in. Section 9.2 records the sessions that were started this way.
 
 Paths that a story names under "Touches" outside the role's default paths are passed by the owner in `NEXTOOMIO_EXTRA_PATHS` (patterns separated by colons) when starting the session.
 
@@ -196,9 +196,12 @@ Not checked: opening a pull request or submitting a review as an App, approval o
 | --- | --- |
 | `role-guard.py` given hook input directly: 7 cases that must pass and 15 that must be denied (paths per role, the `SK/` archive, files outside the repository, merge, push to `main`, forced push, closing an issue, a review by a non-Reviewer, an unknown role) | All as expected |
 | `scripts/agent-run.sh --check` for `reviewer` and `developer` | The token sees only this repository; the commit identity is the App's bot; the owner's own `gh` login is unchanged afterwards |
-| A session started with `scripts/agent-run.sh qm` | **Not run:** the `claude` command-line program on the workstation was not signed in |
+| A non-interactive session started with `scripts/agent-run.sh qm` | Ran on `claude-sonnet-5-5`, the model the definition assigns. `gh` inside the session saw only this repository through the App's token. The tools Write, Edit, and Agent were not available. `gh issue close --help` was denied by the guard |
+| A non-interactive session started with `scripts/agent-run.sh developer` | Ran on `claude-sonnet-5-5`. The guard denied an Edit of `SPECIFICATION.md`, a Write to `docs/guard-check.md`, and `git push --dry-run origin HEAD:main`; a Write under `core/` was allowed. The git author identity was `nextoomio-developer[bot]`. The tool Agent was not available |
 
-Still to verify, in the first trial run on a small story: that a session started with `--agent` applies the definition's model, removed tools, and hook; that commits and pushes from a session carry the App's identity; that a pull request and a review can be created as an App; that the owner can approve an App-authored pull request; how `--worktree` names its branch.
+These runs show that a session started with `--agent` applies the definition's model, removed tools, and hook, for these two roles and Claude Code 2.1.285. The guard matches command text, so it also denies harmless forms such as `--help` of a denied command.
+
+Still to verify, in the first trial run on a small story: that the `effort` setting is applied; that an actual commit, push, pull request, and review from a session appear on GitHub under the App's identity; that the owner can approve an App-authored pull request; how `--worktree` names its branch; and the Architect, Reviewer, and DevOps definitions, which were not started.
 
 ## 10. Review findings
 
@@ -223,7 +226,7 @@ Created by the Architect as stories under feature P0-F8 (#71) with the next free
 
 | # | Work item | Role | Depends on |
 | --- | --- | --- | --- |
-| 1 | Trial run of the whole workflow on one small story, recording the checks listed in section 9.2 | All roles | This document merged; `claude` signed in |
+| 1 | Trial run of the whole workflow on one small story, recording the checks still open in section 9.2 | All roles | This document merged |
 | 2 | Revise P0-F8.2 (#85): rule set with code-owner review, `CODEOWNERS` | DevOps; rule set applied by the owner | This document merged |
 | 3 | CI role path-scope check (CQ-M10) and lock-file enforcement (CQ-M8) | DevOps | 1 |
 | 4 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88) | DevOps; key created by the owner | 1 |
