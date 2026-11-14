@@ -1,8 +1,8 @@
 # Agent team
 
-Document version: **0.4 (adopted on merge)**  
+Document version: **0.5 (autonomous operation)**  
 Date: **2026-11-14**  
-Status: **Adopted by the project owner by merging this document. Section 7 states what is in place and what is not. Statements about GitHub and Claude Code behavior marked "verify at setup" were read from documentation or are expected behavior; section 9.2 records what has been tried.**  
+Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
 
 Version 0.2 records the architect decisions for OQ-01 to OQ-16, adds the review findings RF-01 to RF-10, defines the content of the code-quality rules, and lists the work items that follow from approval.
@@ -10,6 +10,8 @@ Version 0.2 records the architect decisions for OQ-01 to OQ-16, adds the review 
 Version 0.3 replaces the two shared Apps of OQ-01 and OQ-12 with one App per role, as chosen by the project owner, and records what was created and checked on 2026-11-14 (section 9.1).
 
 Version 0.4 turns the proposal into the team document: it is renamed from `agent-team-proposal.md`, the code-quality rules move to their own file, the agent definitions, the guard, and the session scripts exist, and section 7 records the state of each change.
+
+Version 0.5 records the owner's decisions after the first trial run: no person in the loop, one independent model per role with development in Antigravity, and the Architect as orchestrator (section 3.1). It adds the rule set on `main`, the pipeline, the Antigravity author roles, and the results of the trial (section 9.3).
 
 ## 1. Goal
 
@@ -25,7 +27,7 @@ Reasons recorded by the project owner:
 
 1. **Artifacts, not chat history, carry state.** Agents never inherit each other's conversation. The shared state is the repository (specification, roadmap, architecture, rules) and GitHub (issues, labels, pull requests, reviews). Every agent starts from one input artifact and finishes with one output artifact that can be checked.
 2. **One owner per artifact type.** Requirements and architecture documents, backlog issues, defects, and the agent rules themselves are owned by the Architect; code changes by the Developer; CI, build, and bench by DevOps; reviews by the Reviewer; verification verdicts by QM.
-3. **The project owner approves and merges.** Approving and merging a pull request is the only mandatory human gate and stays with the project owner. No agent merges. Section 9, OQ-01, makes this technically enforced instead of a convention.
+3. **GitHub merges by rule; nobody merges at discretion.** A pull request reaches `main` only when the rule set is satisfied: the required checks passed and the Reviewer approved the head commit. The author role enables auto-merge and GitHub performs the merge. No agent and no script decides a merge, and the project owner is not a gate (section 3.1).
 4. **Rules are referenced, not copied.** Every agent definition points to `AGENTS.md`, the backlog conventions, and the code-quality rules. Agent definitions add only role-specific responsibilities, inputs, outputs, and limits, so the shared rules cannot drift apart.
 5. **No agent claims what it has not shown.** The existing rule (no "passed", "verified", or "supported" without evidence) applies to every agent's output, including review verdicts.
 6. **Language.** All artifacts (issues, pull requests, review comments, documents, commit messages) are English. Reports addressed directly to the project owner are Slovak, as `AGENTS.md` requires.
@@ -35,10 +37,20 @@ Reasons recorded by the project owner:
 
 | # | Decision |
 | --- | --- |
-| D-A | Agents are started **manually** by the project owner for a specific issue or pull request. No coordinator agent and no label-triggered automation for now. |
+| D-A | *Replaced by D-E.* Agents are started **manually** by the project owner for a specific issue or pull request. No coordinator agent and no label-triggered automation for now. |
 | D-B | **Every agent reports findings; only the Architect files defects.** The Architect deduplicates, assigns the resolving story, and creates the `D-<nnn>` issue. |
 | D-C | **Several Developer agents may work in parallel**, each in its own git worktree and branch. This requires changing the worktree rule in `AGENTS.md` (section 7). |
 | D-D | Roles: Architect, Developer, PR Reviewer / Code Quality, QM / Verifier, DevOps. |
+
+### 3.1 Decided by the project owner after the trial run (2026-11-14)
+
+| # | Decision |
+| --- | --- |
+| D-E | **No person in the loop.** The project owner sees only the result. Starting roles, review cycles, merging, verification, and closing run without the owner. This replaces D-A and the owner's approval and merge. |
+| D-F | **Each role runs on an independent model.** Development runs in Antigravity; review runs on Sonnet; the chief Architect is Fable. The assignments for DevOps and QM in section 4 are the Architect's, made so that no role checks work produced by its own model. |
+| D-G | **The Architect orchestrates.** It prepares and marks stories ready, starts the pipeline, triages findings, decides blocked stories, and keeps the rules. |
+
+The owner still acts where GitHub requires the account holder: confirming access for changes to App permissions and repository settings.
 
 ## 4. Roles
 
@@ -51,7 +63,7 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Output:** A documentation pull request on an `arch/` branch, new or edited backlog issues, defect issues.
 - **May edit:** Markdown documents in the repository root and under `docs/` except `docs/evidence/`; `AGENTS.md`; `.claude/agents/`; issues and labels.
 - **May not:** Edit source code, build configuration, CI, or recorded evidence; approve or merge pull requests.
-- **Model:** `fable`, effort high.
+- **Model:** Claude Fable (`fable`), in Claude Code.
 
 ### 4.2 Developer
 
@@ -60,7 +72,7 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Output:** One `dev/` branch and one pull request referencing the issue with `Refs #<n>`, with CI passing and the Definition of Done items 1–5 of the backlog conventions addressed.
 - **May edit:** `core/`, `matter/`, `webui/`, `docs/api/`, tests, and other files the story names under "Touches"; `README.md` and `CONTRIBUTING.md` where the change affects them; the rows of the component and license register (`ARCHITECTURE.md` section 10) for a component the story names, to pin its exact version and record its license (RF-03).
 - **May not:** Change `SPECIFICATION.md`, `ROADMAP.md`, any other part of `ARCHITECTURE.md`, acceptance criteria, CI workflows, or the agent rules; introduce a third-party component the story does not name. If a story cannot be delivered as written, it stops and follows OQ-09. It does not review or merge pull requests and does not close issues.
-- **Model:** `sonnet`, effort medium; `fable`, effort high, for stories labelled `risk:high`.
+- **Model:** Gemini 3.8 Flash (High) in Antigravity (`agy`). The label `risk:high` is kept as information for the Reviewer and the Architect; it no longer selects another model.
 
 ### 4.3 PR Reviewer / Code Quality
 
@@ -69,16 +81,16 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Output:** One review: approve, or request changes with concrete, located findings, and the statement whether this pull request completes the story (RF-04). Problems outside the pull request are reported as findings (OQ-10).
 - **May edit:** Nothing. It writes the review and finding issues.
 - **May not:** Push commits, edit files, merge, or review a pull request produced by the same role and model in the same session.
-- **Model:** `opus`, effort high. This always differs from the author's model under the assignments in this section.
+- **Model:** Claude Sonnet (`sonnet`), in Claude Code. This always differs from the author's model under the assignments in this section.
 
 ### 4.4 QM / Verifier
 
 - **Responsibility:** Decide whether a story meets its Definition of Done. Check the evidence recorded under `docs/evidence/<phase>/<story-id>.md` against every acceptance criterion, and look for claims in code, documents, or CI that go beyond the evidence.
 - **Input:** One issue with `state:implemented`, its merged pull requests, and its evidence file.
-- **Output:** A verdict comment on the issue (criteria met or not, criterion by criterion) and findings (OQ-10). It recommends closing; the project owner closes.
+- **Output:** A verdict comment on the issue (criteria met or not, criterion by criterion) and findings (OQ-10). It ends with `QM-Verdict: PASS` or `QM-Verdict: FAIL`; the pipeline closes the issue on PASS.
 - **May edit:** Nothing. It writes issue comments and finding issues.
 - **May not:** Edit files, record evidence itself, tick acceptance criteria, or close issues.
-- **Model:** `sonnet`, effort high.
+- **Model:** Claude Opus (`opus`), in Claude Code. It differs from the models of the roles whose work and evidence it checks.
 
 ### 4.5 DevOps
 
@@ -87,31 +99,37 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Output:** A pull request on an `ops/` branch with build or CI changes, or with an evidence file stating the observed result.
 - **May edit:** `.github/`, `kas/`, `meta-nextoomio/`, `scripts/`, `Makefile`, `.gitignore`, and `docs/evidence/`; the register rows of `ARCHITECTURE.md` section 10 under the same condition as the Developer.
 - **May not:** Edit original application code, the maintained requirement documents, or the agent rules. Bench limits are in OQ-14.
-- **Model:** `sonnet`, effort medium; it may delegate reading long build logs to `haiku`.
+- **Model:** Gemini 3.8 Flash (High) in Antigravity (`agy`).
 - **Concurrency:** One DevOps agent at a time, because the bench and the build cache are single resources.
 
 ## 5. Workflow
 
 ```
-SPECIFICATION ─► Architect ─► stories (ready) ─► Developer ─► PR ─► CI ─► Reviewer ─► owner approves and merges
-                    ▲                                                                  │
-                    │                                                     DevOps: bench evidence (PR)
-                    │                                                                  │
-                    └──────────── findings ◄─── Reviewer / QM / DevOps ◄─── QM verdict ┘
+SPECIFICATION ─► Architect ─► story (state:ready) ─► pipeline
+                    ▲                                   │
+                    │        author role ─► PR ─► CI ─► Reviewer ──► GitHub merges by rule
+                    │             ▲                        │                  │
+                    │             └── changes requested ───┘          state:implemented
+                    │                                                         │
+                    └────────── findings, blocked stories ◄──── QM verdict ─► closed
 ```
 
-1. The Architect writes or updates the stories for a feature and labels them `state:ready` (OQ-06).
-2. The project owner starts a Developer agent for one ready story. Parallel stories run in separate worktrees (OQ-07).
-3. The Developer opens a pull request. CI runs.
-4. The project owner starts the Reviewer for the pull request. Requested changes go back to the Developer (a new Developer run on the same branch and worktree). After two rounds of requested changes without approval, the pull request goes to the Architect to decide whether the story or the approach is wrong.
-5. The project owner approves and merges. When the Reviewer stated that the pull request completes the story, the owner sets `state:implemented`.
-6. DevOps records hardware evidence where the story requires it, as a pull request that goes through steps 3–5.
-7. The project owner starts QM. A positive verdict lets the owner tick the criteria and close the story as completed.
-8. Any agent that finds a problem outside its task reports a finding; the Architect files the defect.
+`scripts/agent-pipeline.py <issue>` runs one issue labelled `state:ready` to its end:
 
-Documentation pull requests from the Architect follow steps 3–5 with the Reviewer applying the documentation checklist (section 6.3).
+1. The author role (Developer, or DevOps for build, CI, image, tooling, and hardware work) implements the issue on its branch and opens a pull request that references it with `Refs #<n>`.
+2. The pipeline enables auto-merge on the pull request as the author's App. GitHub merges it when the rule set on `main` is satisfied, not before.
+3. CI runs. The Reviewer reviews the head commit. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
+4. After the merge the pipeline sets `state:implemented` and starts QM.
+5. QM ends its verdict with `QM-Verdict: PASS` or `QM-Verdict: FAIL`. On PASS the pipeline ticks the acceptance criteria and closes the issue as completed. Otherwise the issue stays open with the verdict, for the Architect.
+6. Any role that finds a problem outside its task reports a finding; the Architect files the defect.
 
-Pull requests never use a closing keyword under this model: an issue is closed only by the owner after the QM verdict (RF-05).
+The pipeline makes no judgment of its own: it starts roles and acts on the review state, the CI result, the merge state, and the verdict line that GitHub and the roles report. Its log is kept outside the repository.
+
+Hardware evidence: a story whose criteria need the bench is implemented and merged the same way; DevOps records the evidence in a further pull request, and QM gives `PASS` only when the evidence covers every criterion.
+
+Documentation pull requests from the Architect are reviewed with the documentation checklist ([code-quality.md](code-quality.md), section 3) and merge under the same rule set.
+
+Pull requests never use a closing keyword: an issue is closed only after the QM verdict (RF-05).
 
 ## 6. Code-quality rules
 
@@ -128,11 +146,12 @@ Pull requests never use a closing keyword under this model: an issue is closed o
 | `.claude/agents/` | One definition per role (section 8) | In place |
 | `.claude/hooks/role-guard.py` | Path and command guard (OQ-02) | In place |
 | `docs/engineering/code-quality.md` | Section 6 | In place |
-| `scripts/agent-token.sh`, `scripts/agent-run.sh` | Role identity for a session (OQ-12, section 8) | In place |
+| `scripts/agent-token.sh`, `scripts/agent-run.sh` | Role identity for a session (OQ-12, section 8); Developer and DevOps start in Antigravity | In place |
 | `.gitignore` | `.claude/worktrees/` | In place |
 | GitHub labels | `state:ready`, `state:blocked`, `type:finding`, `risk:high` | In place |
 | GitHub Apps | One per role (section 9.1) | In place |
-| Rule set on `main` and `.github/CODEOWNERS` | OQ-01; extends P0-F8.2 (#85) | Not in place |
+| Rule set on `main` | Changes only through a pull request; the three CI checks; one approval of the head commit by someone other than the last pusher; no forced push or deletion; no bypass actor. Auto-merge and branch deletion on merge are enabled in the repository | In place since 2026-11-14; not yet described in `CONTRIBUTING.md` (P0-F8.2, #85) |
+| `scripts/agent-pipeline.py` | The workflow of section 5 | In place; section 9.3 records whether it has run |
 | `.github/PULL_REQUEST_TEMPLATE.md` | Role and model line and the issue reference; P0-F8.1 (#84) covers the template | Not in place |
 | CI | Role path scope (CQ-M10) and lock files (CQ-M8) | Not in place |
 | Bench key | OQ-14 | Not in place |
@@ -147,7 +166,10 @@ Each file under `.claude/agents/<role>.md` (`architect`, `developer`, `reviewer`
 - `hooks`: a `PreToolUse` hook on the editing tools and on the shell that calls `.claude/hooks/role-guard.py` with the role name (OQ-02).
 - Body: the role's task and limits in brief, by reference to this document; the instruction to read `AGENTS.md`, the backlog conventions, and this document before acting; the role and model line; and the instruction to report to the project owner in Slovak.
 
-The project owner starts a role with `scripts/agent-run.sh <role>`, adding Claude Code arguments such as `--worktree <name>` for Developer runs. The script gives `gh` and `git` a private configuration that contains only the short-lived token of the role's App, refreshes it while the session runs, sets the commit author to the App's bot identity, and starts `claude --agent <role>`. `scripts/agent-run.sh --check <role>` sets up the identity, prints it, and exits. The script needs the `claude` command-line program to be signed in. Section 9.2 records the sessions that were started this way.
+A role is started with `scripts/agent-run.sh <role>`, normally by the pipeline. The script gives `gh` and `git` a private configuration that contains only the short-lived token of the role's App, refreshes it while the session runs, removes it afterwards, and sets the commit author to the App's bot identity. `scripts/agent-run.sh --check <role>` sets up the identity, prints it, and exits.
+
+- **Architect, Reviewer, QM** run in Claude Code as `claude --agent <role>`, with the definition's model, removed tools, and guard hook. The command-line program must be signed in.
+- **Developer, DevOps** run in Antigravity as `agy -p`, headless. Antigravity has no agent definitions or hooks of ours: the script passes the body of the role's definition together with the task, and the repository's `AGENTS.md` is read by Antigravity itself. **The guard does not run there.** The role's path limits are checked by the Reviewer (CQ-R13) and, once it exists, by the CI path-scope check (CQ-M10). The `model` field in these two definitions applies only if the role is started in Claude Code instead.
 
 Paths that a story names under "Touches" outside the role's default paths are passed by the owner in `NEXTOOMIO_EXTRA_PATHS` (patterns separated by colons) when starting the session.
 
@@ -157,10 +179,10 @@ Decisions are by the Architect unless marked otherwise. They take effect when th
 
 | ID | Question | Decision and reason |
 | --- | --- | --- |
-| OQ-01 | Reviewer identity | **One GitHub App per role, and the owner's approval as the enforced gate.** The Apps are `nextoomio-architect`, `nextoomio-developer`, `nextoomio-reviewer`, `nextoomio-qm`, and `nextoomio-devops` (section 9.1); the choice of one identity per role instead of two shared ones was made by the project owner, so that every pull request, review, and comment shows its role in GitHub itself. The project owner keeps the personal account `nextoo-ai` and no agent uses it. The rule set on `main` requires a pull request, the CI checks, and a code-owner review with `* @nextoo-ai` as the only code owner. Pull requests are then authored by an App, so the owner can approve them, which the shared identity prevents today; no App can satisfy the code-owner requirement, so no agent can merge. The Reviewer's review is the owner's input, not a second required approval. Option (b) is rejected: GitHub's terms allow one person a single free machine account, which does not cover five roles. Option (c) alone leaves "no agent merges" unenforced. **Not yet in place:** the rule set does not exist, so the three Apps with contents write can at present push to `main` and merge. Verify at setup that a code-owner review can be required on this user-owned repository and that the owner can approve App-authored pull requests. **Until agents use the Apps**, all agents act as `nextoo-ai`, the Reviewer submits a comment review with an explicit verdict line, and the merge rule rests on instructions and the local guard only; this interim state is not separation of duties and is recorded as such. |
+| OQ-01 | Reviewer identity | **One GitHub App per role; the rule set on `main` as the gate.** The Apps are `nextoomio-architect`, `nextoomio-developer`, `nextoomio-reviewer`, `nextoomio-qm`, and `nextoomio-devops` (section 9.1); one identity per role was the project owner's choice, so that every pull request, review, and comment shows its role in GitHub itself. No agent uses the owner's account `nextoo-ai`. The rule set requires a pull request, the CI checks, and one approval of the head commit by someone other than the last pusher. An author App cannot approve its own pull request, so the approval can only come from the Reviewer App, and GitHub merges through auto-merge once the rules are met (D-E). The earlier design, a code-owner review by the owner as the gate, was dropped with D-E. A second user account (option b) is not possible for five roles under GitHub's terms, and a review that is only a comment (option c) enforces nothing. Section 9.3 records that the Reviewer App needs contents write for its approval to count. |
 | OQ-02 | Enforcing write scopes | **Three layers.** (1) The Reviewer and QM definitions have no editing tools. (2) Each definition carries a `PreToolUse` hook that calls one shared guard script: it rejects edits outside the role's paths and rejects `gh pr merge`, pushes to `main`, forced pushes, and issue closing from the shell. Claude Code cannot restrict paths or command prefixes per agent through permission rules, only through such a hook. (3) Because a shell command can still write any file, CI check CQ-M10 fails a pull request that touches paths outside the role named by its branch prefix (`arch/`, `dev/`, `ops/`), and the Reviewer applies CQ-R13. The branch prefix is a declaration by the author; the check catches drift and mistakes, and the owner's approval remains the control against deliberate circumvention. The guard and the agent definitions are themselves Architect-owned paths. |
-| OQ-03 | Model and effort per role | As assigned in section 4: Architect `fable` high; Developer `sonnet` medium, `fable` high for `risk:high`; Reviewer `opus` high; QM `sonnet` high; DevOps `sonnet` medium with `haiku` for logs. The Architect sets `risk:high` on stories that touch the session manager, the update engine, `nx-sysd`, authentication, secrets, or the group channel. The Reviewer never runs on the same model as the author of the pull request it reviews. All models come from one vendor, so the independence of a review comes mainly from the separate context and the separate brief; the different model is an additional measure, not the main one. Fallback when a model is unavailable: the next more capable one, never the author's for a review; the role and model line records what actually ran. Definitions use model aliases, not dated identifiers. |
-| OQ-04 | Where agents run | **Local sessions for every role.** Cloud sessions have no bench access and would need the App tokens distributed to another environment. Revisit when automatic triggering (D-A) is revisited. |
+| OQ-03 | Model and effort per role (superseded by D-F and section 4 for the assignments) | As assigned in section 4: Architect `fable` high; Developer `sonnet` medium, `fable` high for `risk:high`; Reviewer `opus` high; QM `sonnet` high; DevOps `sonnet` medium with `haiku` for logs. The Architect sets `risk:high` on stories that touch the session manager, the update engine, `nx-sysd`, authentication, secrets, or the group channel. The Reviewer never runs on the same model as the author of the pull request it reviews. All models come from one vendor, so the independence of a review comes mainly from the separate context and the separate brief; the different model is an additional measure, not the main one. Fallback when a model is unavailable: the next more capable one, never the author's for a review; the role and model line records what actually ran. Definitions use model aliases, not dated identifiers. |
+| OQ-04 | Where agents run (still local; started by the pipeline, D-E) | **Local sessions for every role.** Cloud sessions have no bench access and would need the App tokens distributed to another environment. Revisit when automatic triggering (D-A) is revisited. |
 | OQ-05 | Code-quality rule content | Section 6. Documentation pull requests get their own checklist (6.3). |
 | OQ-06 | Ready state | `state:ready` is set only by the Architect when: every dependency is closed as completed, or has `state:implemented` and the story does not need the dependency's hardware result; every acceptance criterion is checkable; "Touches" is filled in; and `risk:high` is set where it applies. `state:blocked` replaces `state:ready`, always with a comment stating the reason and what unblocks it. A Developer or DevOps agent refuses to start on an issue without `state:ready` and removes neither label itself except to set `state:blocked`. |
 | OQ-07 | Worktree conventions | **Location:** `.claude/worktrees/<name>` inside the checkout, the location of Claude Code's `--worktree` option, ignored by git; this keeps the `AGENTS.md` rule that nothing lives outside the project directory. **Branches:** `dev/<issue-id>-<slug>`, `ops/<issue-id>-<slug>`, `arch/<slug>`, for example `dev/P0-F4.5-trial-deadline` or `dev/D-031-plural-format`. **Conflicts:** every story lists the paths or modules it changes under "Touches"; stories with overlapping "Touches" are not run in parallel, and a Developer checks the open pull requests for overlap before starting and stops if it finds one. **Cleanup:** the head branch is deleted on merge; the worktree is removed by the owner, or by the next agent run asked to do so, after the pull request is merged or closed, never while it is open. Architect and DevOps work in the main checkout, one at a time each. Verify at setup how `--worktree` names its branch and whether the branch name can be set. |
@@ -203,6 +225,31 @@ These runs show that a session started with `--agent` applies the definition's m
 
 Still to verify, in the first trial run on a small story: that the `effort` setting is applied; that an actual commit, push, pull request, and review from a session appear on GitHub under the App's identity; that the owner can approve an App-authored pull request; how `--worktree` names its branch; and the Architect, Reviewer, and DevOps definitions, which were not started.
 
+### 9.3 Trial run on P0-F8.3 (#86), 2026-11-14
+
+The first story went through every role. It ran before D-F, with DevOps on Claude Sonnet, the Reviewer on Claude Opus, and QM on Claude Sonnet, all in Claude Code.
+
+| Step | Observed |
+| --- | --- |
+| Architect prepares the story | Body edit, `state:ready`, and comment appear on GitHub under `nextoomio-architect[bot]` |
+| DevOps implements | Commits, push, and pull request #157 under `nextoomio-devops[bot]`; CI passed |
+| Review, round 1 | Changes requested under `nextoomio-reviewer`, with a defect the Reviewer reproduced: section references with the document name in backticks were not checked |
+| DevOps, round 2 | A new session with no earlier context fixed both findings from the review on GitHub |
+| Review, round 2 | Started without an interactive session; approved the head commit |
+| Rule set | With contents read-only, the Reviewer App's approval did **not** count toward the required approval. After its contents permission was raised to read and write, the same approval counted |
+| Merge | Auto-merge enabled as the DevOps App; GitHub merged at once because the rules were met |
+| QM | Started without an interactive session; verdict on the issue under `nextoomio-qm`; it pointed out an open defect still assigned to the story |
+| Close | The Architect detached the half-fixed defect (#69) with a comment, ticked the criteria, and closed the story as completed |
+
+What the trial showed about the model itself:
+
+- **The guard can be bypassed through the shell**, as OQ-02 expected: DevOps changed `ROADMAP.md` with `sed` on a demonstration branch. It disclosed this itself and the change never reached the pull request. The CI path-scope check (CQ-M10) is the missing control.
+- **The `effort` setting of a definition was not applied**: the Reviewer's definition says high and the session showed medium. The model setting was applied.
+- **The session script left the token file behind** when a terminal tab was closed. It now removes it on hang-up as well.
+- **The Reviewer App needs contents write** for its approval to count. It therefore could push to branches; the rule set keeps it from `main`, and it cannot approve its own pull request.
+
+Not yet shown: a run of `scripts/agent-pipeline.py`; a Developer or DevOps run in Antigravity that commits, pushes, and opens a pull request; the Reviewer on Sonnet and QM on Opus.
+
 ## 10. Review findings
 
 Problems found in version 0.1 during architect review, and how version 0.2 resolves them.
@@ -222,20 +269,18 @@ Problems found in version 0.1 during architect review, and how version 0.2 resol
 
 ## 11. Remaining work
 
-Created by the Architect as stories under feature P0-F8 (#71) with the next free identifiers. None of them exists as an issue yet.
+Created by the Architect as stories under feature P0-F8 (#71) with the next free identifiers, unless a story is named.
 
-| # | Work item | Role | Depends on |
-| --- | --- | --- | --- |
-| 1 | Trial run of the whole workflow on one small story, recording the checks still open in section 9.2 | All roles | This document merged |
-| 2 | Revise P0-F8.2 (#85): rule set with code-owner review, `CODEOWNERS` | DevOps; rule set applied by the owner | This document merged |
-| 3 | CI role path-scope check (CQ-M10) and lock-file enforcement (CQ-M8) | DevOps | 1 |
-| 4 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88) | DevOps; key created by the owner | 1 |
-| 5 | Check whether a subagent runs under the role's guard, and enable the DevOps log delegation if it does | Architect | 1 |
-
-Until item 2 is done, the three Apps with contents write can push to `main` and merge; only the instructions and the guard stand against it.
+| # | Work item | Role |
+| --- | --- | --- |
+| 1 | First run of `scripts/agent-pipeline.py` on a small issue, recording the points still open in section 9.3 | Architect |
+| 2 | CI role path-scope check (CQ-M10), the control behind the guard and the only path control for the Antigravity roles; lock-file enforcement (CQ-M8) | DevOps |
+| 3 | Describe the rule set in `CONTRIBUTING.md` and record the evidence for P0-F8.2 (#85) | DevOps |
+| 4 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88); the key is created and placed by the owner | DevOps |
+| 5 | Parallel author runs in worktrees under the pipeline (D-C, OQ-07); the pipeline runs one issue at a time | DevOps |
+| 6 | Find out why `effort` is not applied and whether a subagent runs under the role's guard | Architect |
 
 ## 12. Out of scope
 
-- Automatic triggering by labels or events (excluded by D-A; may be revisited later).
-- A coordinator agent that starts other agents.
+- Starting the pipeline from GitHub events; it is started by the Architect.
 - Changes to product scope, requirements, or release allocation.

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Run one ready issue through the agent team without a person in the loop.
+
+Usage: scripts/agent-pipeline.py <issue number> [--role developer|devops]
+
+Steps (docs/engineering/agent-team.md, section 5):
+  1. The author role implements the issue and opens a pull request.
+  2. Auto-merge is enabled, so GitHub merges once the rules on main are met.
+  3. CI runs; the Reviewer reviews. Requested changes or a CI failure go back
+     to the author, at most MAX_ROUNDS times, then the issue is blocked.
+  4. After the merge the issue gets state:implemented and QM gives a verdict.
+  5. On "QM-Verdict: PASS" the acceptance criteria are ticked and the issue
+     is closed as completed; otherwise it stays open.
+
+The script decides nothing itself: it starts roles and acts on what GitHub
+and the roles report. Logs go to ~/.config/nextoomio/runs/, never into the
+repository. Exit status: 0 closed, 1 error, 2 blocked or left open.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+REPO = os.environ.get("NEXTOOMIO_REPO", "nextoo-ai/nextoomio")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+MAX_ROUNDS = 2
+DEVOPS_AREAS = {"area:ci", "area:build", "area:image", "area:tooling", "area:hardware"}
+REVIEWER = "nextoomio-reviewer"
+QM = "nextoomio-qm"
+
+
+class Stop(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+def run(cmd, env=None, check=True, capture=True, log=None):
+    out = subprocess.run(cmd, cwd=ROOT, env=env, text=True,
+                         stdout=subprocess.PIPE if capture else None,
+                         stderr=subprocess.STDOUT if capture else None)
+    if log and out.stdout:
+        with open(log, "a") as f:
+            f.write(out.stdout)
+    if check and out.returncode != 0:
+        raise Stop(1, f"command failed ({out.returncode}): {' '.join(cmd[:4])} ...\n{(out.stdout or '')[-800:]}")
+    return out
+
+
+def token(role):
+    return run([os.path.join(HERE, "agent-token.sh"), role]).stdout.strip()
+
+
+def gh(args, role=None, check=True):
+    env = dict(os.environ)
+    if role:
+        env["GH_TOKEN"] = token(role)
+    return run(["gh"] + args + ([] if "--repo" in args or args[0] == "api" else ["--repo", REPO]),
+               env=env, check=check).stdout
+
+
+def gh_json(args, role=None):
+    return json.loads(gh(args, role=role))
+
+
+def say(message):
+    print(f"[{datetime.datetime.now():%H:%M:%S}] {message}", flush=True)
+
+
+def agent(role, task, log, extra_paths=None):
+    """Start one role headlessly and wait for it."""
+    env = dict(os.environ)
+    if extra_paths:
+        env["NEXTOOMIO_EXTRA_PATHS"] = ":".join(extra_paths)
+    cmd = [os.path.join(HERE, "agent-run.sh"), role, "-p", task]
+    if role in ("reviewer", "qm", "architect"):
+        cmd += ["--permission-mode", "auto"]
+    say(f"{role}: started")
+    out = subprocess.run(cmd, cwd=ROOT, env=env, text=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    with open(log, "a") as f:
+        f.write(f"\n===== {role} @ {datetime.datetime.now().isoformat()} =====\n{out.stdout}\n")
+    say(f"{role}: finished (exit {out.returncode})")
+    return out.returncode
+
+
+def find_pr(issue, author_role):
+    prs = gh_json(["pr", "list", "--state", "open", "--limit", "50",
+                   "--json", "number,body,author,headRefName,headRefOid"])
+    pattern = re.compile(rf"\bRefs\s+#{issue}\b")
+    for pr in prs:
+        if pr["author"]["login"].endswith(f"nextoomio-{author_role}") and pattern.search(pr["body"] or ""):
+            return pr
+    return None
+
+
+def pr_state(number):
+    return gh_json(["pr", "view", str(number), "--json",
+                    "state,headRefOid,reviewDecision,mergeStateStatus,reviews,statusCheckRollup"])
+
+
+def wait_for_ci(number, timeout=3600):
+    """Wait until every check of the head commit has finished. True if all passed."""
+    deadline = time.time() + timeout
+    seen = False
+    while time.time() < deadline:
+        checks = pr_state(number)["statusCheckRollup"] or []
+        if checks:
+            seen = True
+            states = [c.get("conclusion") or c.get("status") or c.get("state") for c in checks]
+            if all(s in ("SUCCESS", "NEUTRAL", "SKIPPED") for s in states):
+                return True
+            if any(s in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED") for s in states):
+                return False
+        elif seen is False and time.time() > deadline - timeout + 300:
+            raise Stop(1, f"no CI checks appeared on pull request #{number} within 5 minutes")
+        time.sleep(20)
+    raise Stop(1, f"CI on pull request #{number} did not finish within {timeout // 60} minutes")
+
+
+def latest_review(number, head):
+    reviews = [r for r in pr_state(number)["reviews"]
+               if r["author"]["login"] == REVIEWER and r["commit"]["oid"] == head
+               and r["state"] in ("APPROVED", "CHANGES_REQUESTED")]
+    return reviews[-1]["state"] if reviews else None
+
+
+def wait_for_merge(number, timeout=900):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pr_state(number)["state"] == "MERGED":
+            return True
+        time.sleep(15)
+    return False
+
+
+def block(issue, reason):
+    gh(["issue", "edit", str(issue), "--remove-label", "state:ready", "--add-label", "state:blocked"],
+       role="architect", check=False)
+    gh(["issue", "comment", str(issue), "--body",
+        f"Blocked by the pipeline: {reason}\n\nRole: Architect (pipeline) · Model: none"], role="architect")
+    raise Stop(2, f"issue #{issue} blocked: {reason}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("issue", type=int)
+    parser.add_argument("--role", choices=["developer", "devops"])
+    args = parser.parse_args()
+    issue = args.issue
+
+    info = gh_json(["issue", "view", str(issue), "--json", "title,state,labels,body"])
+    labels = {l["name"] for l in info["labels"]}
+    if info["state"] != "OPEN" or "state:ready" not in labels:
+        raise Stop(1, f"issue #{issue} is not open with state:ready")
+    role = args.role or ("devops" if labels & DEVOPS_AREAS or "type:enabler" in labels else "developer")
+
+    if run(["git", "status", "--porcelain"]).stdout.strip():
+        raise Stop(1, "the working tree is not clean")
+    run(["git", "switch", "main"])
+    run(["git", "pull", "--ff-only"])
+
+    run_dir = os.path.expanduser(
+        f"~/.config/nextoomio/runs/{issue}-{datetime.datetime.now():%Y%m%d-%H%M%S}")
+    os.makedirs(run_dir, mode=0o700)
+    log = os.path.join(run_dir, "agents.log")
+    say(f"issue #{issue} \"{info['title']}\" -> {role}; log {log}")
+
+    # "Touches" entries outside the role's default paths, for the guard where it runs.
+    touches = re.findall(r"^- `([^`]+)`", (info["body"].split("### Touches", 1) + [""])[1].split("###", 1)[0], re.M)
+
+    task = (f"Work on issue {issue} ({info['title']}) in repository {REPO}. "
+            "Follow your role definition. Open one pull request that references the issue with "
+            f"'Refs #{issue}' in its description.")
+    pr = None
+    rounds = 0
+    while True:
+        agent(role, task, log, extra_paths=touches)
+        run(["git", "switch", "main"], check=False)
+        pr = find_pr(issue, role)
+        if not pr:
+            current = gh_json(["issue", "view", str(issue), "--json", "labels"])
+            if "state:blocked" in {l["name"] for l in current["labels"]}:
+                raise Stop(2, f"issue #{issue} was blocked by the {role}; see its comment")
+            block(issue, f"the {role} finished without opening a pull request that references the issue.")
+        number, head = pr["number"], pr_state(pr["number"])["headRefOid"]
+        say(f"pull request #{number} at {head[:7]}")
+        gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
+
+        if not wait_for_ci(number):
+            verdict, why = "CHANGES_REQUESTED", "CI failed on the head commit"
+        else:
+            agent("reviewer", f"Review pull request {number} (issue {issue}) at its current head commit. "
+                              "Follow your role definition.", log)
+            head = pr_state(number)["headRefOid"]
+            verdict, why = latest_review(number, head), "the review requested changes"
+            if verdict is None:
+                block(issue, f"the Reviewer submitted no verdict on pull request #{number} at {head[:7]}.")
+        say(f"pull request #{number}: {verdict}")
+        if verdict == "APPROVED":
+            break
+        rounds += 1
+        if rounds > MAX_ROUNDS:
+            block(issue, f"pull request #{number} was not approved after {MAX_ROUNDS} rounds of changes; "
+                         "the Architect decides whether the story or the approach is wrong.")
+        task = (f"Pull request {number} for issue {issue} needs changes: {why}. Read the review and the CI "
+                "result on GitHub and address them on the same branch. Follow your role definition.")
+
+    if not wait_for_merge(number):
+        raise Stop(2, f"pull request #{number} is approved but GitHub has not merged it; check the rules on main")
+    say(f"pull request #{number} merged")
+    run(["git", "pull", "--ff-only"])
+    gh(["issue", "edit", str(issue), "--remove-label", "state:ready", "--add-label", "state:implemented"],
+       role="architect")
+
+    agent("qm", f"Verify issue {issue}, which now has state:implemented; its pull request {number} is merged. "
+                "Follow your role definition.", log)
+    comments = gh_json(["issue", "view", str(issue), "--json", "comments"])["comments"]
+    verdicts = [c["body"] for c in comments if c["author"]["login"] == QM]
+    passed = bool(verdicts) and re.search(r"^QM-Verdict:\s*PASS\s*$", verdicts[-1], re.M)
+    if not passed:
+        raise Stop(2, f"issue #{issue} stays open: QM did not give 'QM-Verdict: PASS'")
+
+    body = gh_json(["issue", "view", str(issue), "--json", "body"])["body"].replace("- [ ] **AC", "- [x] **AC")
+    body_file = os.path.join(run_dir, "body.md")
+    with open(body_file, "w") as f:
+        f.write(body)
+    gh(["issue", "edit", str(issue), "--body-file", body_file], role="architect")
+    gh(["issue", "close", str(issue), "--reason", "completed", "--comment",
+        f"Closed as completed after the QM verdict above; pull request #{number} merged under the rules on "
+        "main. Acceptance criteria ticked on the basis of that verdict.\n\n"
+        "Role: Architect (pipeline) · Model: none"], role="architect")
+    say(f"issue #{issue} closed as completed")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Stop as stop:
+        say(str(stop))
+        sys.exit(stop.status)
