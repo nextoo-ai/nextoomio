@@ -111,6 +111,21 @@ prompt="$brief
 Your model id for the role and model line is: $model (Antigravity).
 The role-guard hook does not run in this program; the limits above apply all the same.
 
+How you deliver here differs from your role definition: this program cannot
+write to .git. Do not create a branch, commit, push, or open a pull request.
+You are already on the right branch. Make your changes in the working tree,
+run the checks the task needs, and leave the files as they are. The pipeline
+checks your changed paths against your role, commits and pushes them under
+your identity, and opens or updates the pull request. You may read issues,
+pull requests, and reviews with gh, and comment on your issue.
+
+End your reply with exactly this block, in English:
+
+PR-Title: <one line that says what the change does>
+PR-Summary:
+<what you changed, what you ran and what it showed, and what you did not
+check; this becomes the pull-request description>
+
 ## Task
 
 $2"
