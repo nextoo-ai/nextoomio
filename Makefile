@@ -11,6 +11,7 @@ check-doc-versions:
 	python3 scripts/check_doc_versions.py
 
 check-evidence:
+	python3 scripts/check_evidence.py --test
 	python3 scripts/check_evidence.py
 
 check-i18n:

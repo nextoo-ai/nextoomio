@@ -29,7 +29,9 @@ jobs:
         run: python3 scripts/check_doc_versions.py
 
       - name: Verify verification evidence files and template
-        run: python3 scripts/check_evidence.py
+        run: |
+          python3 scripts/check_evidence.py --test
+          python3 scripts/check_evidence.py
 
       - name: Validate meta-nextoomio layer and kas definitions
         run: python3 scripts/check_yocto_layer.py
