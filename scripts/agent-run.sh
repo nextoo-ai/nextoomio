@@ -105,7 +105,8 @@ if [ "${1:-}" != "-p" ] || [ -z "${2:-}" ]; then
   exit 2
 fi
 model=${NEXTOOMIO_AGY_MODEL:-gemini-3.8-flash-high}
-brief=$(awk 'f>=2; /^---$/ {f++}' "$here/../.claude/agents/$role.md")
+agents_dir=${NEXTOOMIO_AGENTS_DIR:-$here/../.claude/agents}
+brief=$(awk 'f>=2; /^---$/ {f++}' "$agents_dir/$role.md")
 prompt="$brief
 
 Your model id for the role and model line is: $model (Antigravity).
@@ -116,7 +117,7 @@ write to .git. Do not create a branch, commit, push, or open a pull request.
 You are already on the right branch. Make your changes in the working tree,
 run the checks the task needs, and leave the files as they are. When writing
 evidence in the change's own pull request, write the literal marker {{COMMIT}}
-in the "Image version and commit" field (for example, none (repository only);
+in the 'Image version and commit' field (for example, none (repository only);
 commit {{COMMIT}}) and not a hash: the pipeline replaces it with the change
 commit hash on delivery. The pipeline checks your changed paths against your
 role, commits and pushes them under your identity, and opens or updates the

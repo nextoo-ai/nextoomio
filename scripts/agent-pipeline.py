@@ -2,6 +2,7 @@
 """Run one ready issue through the agent team without a person in the loop.
 
 Usage: scripts/agent-pipeline.py <issue number> [--role developer|devops]
+       scripts/agent-pipeline.py --test
 
 Steps (docs/engineering/agent-team.md, section 5):
   1. The author role implements the issue in the working tree. The pipeline
@@ -24,9 +25,12 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from typing import NamedTuple
 
 REPO = os.environ.get("NEXTOOMIO_REPO", "nextoo-ai/nextoomio")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +46,60 @@ AUTHOR_MODEL = os.environ.get("NEXTOOMIO_AGY_MODEL", "gemini-3.8-flash-high") + 
 AGENT_TIMEOUT = int(os.environ.get("NEXTOOMIO_AGENT_TIMEOUT_SECONDS", "3600"))
 
 
+class Tooling(NamedTuple):
+    run_dir: str
+    tooling_dir: str
+    agent_run: str
+    agent_token: str
+    role_guard: str
+    agents_dir: str
+
+
+TOOLING: Tooling | None = None
+
+
+def pin_tooling(run_dir, root=ROOT):
+    """Copy the tooling from root into run_dir outside the repository (D-040).
+
+    Copies the session script, the token script, the guard, and the agent
+    definitions while on main, so unreviewed changes on a branch cannot alter
+    how the pipeline starts roles, obtains tokens, or checks paths.
+    """
+    tooling_dir = os.path.join(run_dir, "tooling")
+    scripts_dir = os.path.join(tooling_dir, "scripts")
+    hooks_dir = os.path.join(tooling_dir, ".claude", "hooks")
+    agents_dir = os.path.join(tooling_dir, ".claude", "agents")
+    os.makedirs(scripts_dir, exist_ok=True)
+    os.makedirs(hooks_dir, exist_ok=True)
+    os.makedirs(agents_dir, exist_ok=True)
+
+    agent_run = os.path.join(scripts_dir, "agent-run.sh")
+    agent_token = os.path.join(scripts_dir, "agent-token.sh")
+    role_guard = os.path.join(hooks_dir, "role-guard.py")
+
+    shutil.copy2(os.path.join(root, "scripts", "agent-run.sh"), agent_run)
+    shutil.copy2(os.path.join(root, "scripts", "agent-token.sh"), agent_token)
+    shutil.copy2(os.path.join(root, ".claude", "hooks", "role-guard.py"), role_guard)
+    os.chmod(agent_run, 0o755)
+    os.chmod(agent_token, 0o755)
+    os.chmod(role_guard, 0o755)
+
+    src_agents = os.path.join(root, ".claude", "agents")
+    if os.path.isdir(src_agents):
+        for name in os.listdir(src_agents):
+            if name.endswith(".md"):
+                shutil.copy2(os.path.join(src_agents, name), os.path.join(agents_dir, name))
+
+    return Tooling(
+        run_dir=run_dir,
+        tooling_dir=tooling_dir,
+        agent_run=agent_run,
+        agent_token=agent_token,
+        role_guard=role_guard,
+        agents_dir=agents_dir,
+    )
+
+
 def is_app(login, role):
     """GitHub reports an App as 'nextoomio-x', 'app/nextoomio-x', or 'nextoomio-x[bot]'."""
     name = (login or "").removeprefix("app/").removesuffix("[bot]")
@@ -54,8 +112,8 @@ class Stop(Exception):
         self.status = status
 
 
-def run(cmd, env=None, check=True, capture=True, log=None):
-    out = subprocess.run(cmd, cwd=ROOT, env=env, text=True,
+def run(cmd, env=None, check=True, capture=True, log=None, cwd=None):
+    out = subprocess.run(cmd, cwd=cwd or ROOT, env=env, text=True,
                          stdout=subprocess.PIPE if capture else None,
                          stderr=subprocess.STDOUT if capture else None)
     if log and out.stdout:
@@ -66,8 +124,9 @@ def run(cmd, env=None, check=True, capture=True, log=None):
     return out
 
 
-def token(role):
-    return run([os.path.join(HERE, "agent-token.sh"), role]).stdout.strip()
+def token(role, cwd=None):
+    script = TOOLING.agent_token if TOOLING else os.path.join(HERE, "agent-token.sh")
+    return run([script, role], cwd=cwd).stdout.strip()
 
 
 def gh(args, role=None, check=True):
@@ -86,17 +145,20 @@ def say(message):
     print(f"[{datetime.datetime.now():%H:%M:%S}] {message}", flush=True)
 
 
-def agent(role, task, log, extra_paths=None):
+def agent(role, task, log, extra_paths=None, cwd=None):
     """Start one role headlessly and wait for it."""
     env = dict(os.environ)
     if extra_paths:
         env["NEXTOOMIO_EXTRA_PATHS"] = ":".join(extra_paths)
-    cmd = [os.path.join(HERE, "agent-run.sh"), role, "-p", task]
+    if TOOLING:
+        env["NEXTOOMIO_AGENTS_DIR"] = TOOLING.agents_dir
+    script = TOOLING.agent_run if TOOLING else os.path.join(HERE, "agent-run.sh")
+    cmd = [script, role, "-p", task]
     if role in ("reviewer", "qm", "architect"):
         cmd += ["--permission-mode", "auto"]
     say(f"{role}: started")
     try:
-        out = subprocess.run(cmd, cwd=ROOT, env=env, text=True, stdin=subprocess.DEVNULL,
+        out = subprocess.run(cmd, cwd=cwd or ROOT, env=env, text=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=AGENT_TIMEOUT)
     except subprocess.TimeoutExpired as expired:
         with open(log, "a") as f:
@@ -119,19 +181,65 @@ def changed_paths():
     return [line[3:].split(" -> ")[-1].strip('"') for line in out.splitlines() if line.strip()]
 
 
-def outside_role_paths(role, paths, extra_paths):
+def outside_role_paths(role, paths, extra_paths, cwd=None):
     """Paths the role may not edit, judged by the same guard the Claude Code roles run under."""
+    repo_root = cwd or ROOT
     env = dict(os.environ, NEXTOOMIO_EXTRA_PATHS=":".join(extra_paths or []))
-    guard = os.path.join(ROOT, ".claude", "hooks", "role-guard.py")
+    guard = TOOLING.role_guard if TOOLING else os.path.join(ROOT, ".claude", "hooks", "role-guard.py")
     refused = []
     for path in paths:
-        event = json.dumps({"tool_name": "Write", "cwd": ROOT,
-                            "tool_input": {"file_path": os.path.join(ROOT, path)}})
+        event = json.dumps({"tool_name": "Write", "cwd": repo_root,
+                            "tool_input": {"file_path": os.path.join(repo_root, path)}})
         out = subprocess.run([sys.executable, guard, role], input=event, text=True,
                              capture_output=True, env=env)
         if out.stdout.strip():
             refused.append(path)
     return refused
+
+
+def replace_commit_marker_in_text(text: str, commit_hash: str) -> tuple[str, int]:
+    """Replace {{COMMIT}} only in the 'Image version and commit' field line (D-039).
+
+    Preserves occurrences of {{COMMIT}} in prose (e.g. in Procedure or Observed result).
+    Returns (new_text, replacement_count).
+    """
+    field_prefix_re = re.compile(
+        r"^(\s*(?:[-*]\s+)?(?:\*\*)?Image(?:\s+version)?(?:\s+and\s+commit)?(?::\*\*|\*\*:|:)\s*)(.*)$",
+        re.IGNORECASE,
+    )
+    lines = text.splitlines(keepends=True)
+    new_lines = []
+    count = 0
+    for line in lines:
+        m = field_prefix_re.match(line)
+        if m and "{{COMMIT}}" in m.group(2):
+            new_value = m.group(2).replace("{{COMMIT}}", commit_hash)
+            count += m.group(2).count("{{COMMIT}}")
+            new_lines.append(f"{m.group(1)}{new_value}")
+        else:
+            new_lines.append(line)
+    return "".join(new_lines), count
+
+
+def replace_commit_markers(paths, commit_hash, root=ROOT):
+    """Replace {{COMMIT}} in 'Image version and commit' field of changed evidence files (D-039).
+
+    Returns the list of relative file paths that were updated.
+    """
+    updated_files = []
+    for p in paths:
+        if (p.startswith("docs/evidence/") and p.endswith(".md")
+                and p not in ("docs/evidence/TEMPLATE.md", "docs/evidence/README.md")):
+            full_path = os.path.join(root, p)
+            if os.path.isfile(full_path):
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                new_content, count = replace_commit_marker_in_text(content, commit_hash)
+                if count > 0:
+                    with open(full_path, "w", encoding="utf-8") as f:
+                        f.write(new_content)
+                    updated_files.append(p)
+    return updated_files
 
 
 def deliver(role, issue, title, branch, output, extra_paths, number):
@@ -160,21 +268,10 @@ def deliver(role, issue, title, branch, output, extra_paths, number):
 
     # D-039: Replace {{COMMIT}} marker in changed evidence files with the full change commit hash.
     change_commit = run(["git", "rev-parse", "HEAD"]).stdout.strip()
-    evidence_updated = False
-    for p in paths:
-        if (p.startswith("docs/evidence/") and p.endswith(".md")
-                and p not in ("docs/evidence/TEMPLATE.md", "docs/evidence/README.md")):
-            full_path = os.path.join(ROOT, p)
-            if os.path.isfile(full_path):
-                with open(full_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                if "{{COMMIT}}" in content:
-                    updated = content.replace("{{COMMIT}}", change_commit)
-                    with open(full_path, "w", encoding="utf-8") as f:
-                        f.write(updated)
-                    run(["git", "add", p], env=env)
-                    evidence_updated = True
-    if evidence_updated:
+    updated_evidence = replace_commit_markers(paths, change_commit)
+    if updated_evidence:
+        for p in updated_evidence:
+            run(["git", "add", p], env=env)
         run(["git", "commit", "-q", "-m", f"Record change commit in evidence\n\nRefs #{issue}"], env=env)
 
     helper = "!f() { echo username=x-access-token; echo \"password=$NEXTOOMIO_PUSH_TOKEN\"; }; f"
@@ -248,104 +345,261 @@ def block(issue, reason):
 
 
 def run_self_tests():
-    """Run automated unit tests for pipeline deliver commit replacement logic (D-039, AC1)."""
-    import tempfile
+    """Run self-tests for pinned tooling (D-040) and commit marker replacement (D-039)."""
     print("Running agent-pipeline self-tests...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        repo_dir = os.path.join(tmpdir, "repo")
+        # Test 1: pin_tooling copies all required files and marks them executable (D-040, AC1)
+        tooling_root = pin_tooling(os.path.join(tmpdir, "run1"), root=ROOT)
+        assert os.path.isfile(tooling_root.agent_run), f"missing {tooling_root.agent_run}"
+        assert os.path.isfile(tooling_root.agent_token), f"missing {tooling_root.agent_token}"
+        assert os.path.isfile(tooling_root.role_guard), f"missing {tooling_root.role_guard}"
+        assert os.path.isdir(tooling_root.agents_dir), f"missing {tooling_root.agents_dir}"
+        assert os.access(tooling_root.agent_run, os.X_OK), "agent_run not executable"
+        assert os.access(tooling_root.agent_token, os.X_OK), "agent_token not executable"
+        assert os.access(tooling_root.role_guard, os.X_OK), "role_guard not executable"
+        for r in ("architect", "developer", "reviewer", "qm", "devops"):
+            assert os.path.isfile(os.path.join(tooling_root.agents_dir, f"{r}.md")), f"missing {r}.md"
+        assert not tooling_root.tooling_dir.startswith(ROOT + os.sep), "tooling_dir must be outside ROOT"
+        print("test_pin_tooling: OK")
+
+        # Test 2: AC2 verification on a change branch with broken scripts (D-040, AC2)
+        repo_dir = os.path.join(tmpdir, "test_repo")
+        run_dir = os.path.join(tmpdir, "run2")
         os.makedirs(repo_dir)
+        os.makedirs(run_dir)
 
-        def git_cmd(cmd, env=None):
-            return subprocess.run(
-                ["git"] + cmd, cwd=repo_dir, env=env, text=True,
-                capture_output=True, check=True
-            )
+        # Initialize mock repo on main
+        subprocess.run(["git", "init", "-q", "-b", "main", repo_dir], check=True)
+        subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", repo_dir, "config", "user.email", "pipeline-test@example.com"], check=True)
 
-        git_cmd(["init", "-q", "-b", "main"])
-        git_cmd(["config", "user.name", "Test Bot"])
-        git_cmd(["config", "user.email", "test@example.com"])
+        scripts_dir = os.path.join(repo_dir, "scripts")
+        hooks_dir = os.path.join(repo_dir, ".claude", "hooks")
+        agents_dir = os.path.join(repo_dir, ".claude", "agents")
+        os.makedirs(scripts_dir)
+        os.makedirs(hooks_dir)
+        os.makedirs(agents_dir)
 
-        # Initial commit on main
-        readme = os.path.join(repo_dir, "README.md")
-        with open(readme, "w") as f:
+        # Main version of scripts
+        main_run_sh = os.path.join(scripts_dir, "agent-run.sh")
+        with open(main_run_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"PINNED_AGENT_RUN_SUCCESS: role=$1\"\nexit 0\n")
+        os.chmod(main_run_sh, 0o755)
+
+        main_token_sh = os.path.join(scripts_dir, "agent-token.sh")
+        with open(main_token_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"PINNED_TOKEN_SUCCESS\"\nexit 0\n")
+        os.chmod(main_token_sh, 0o755)
+
+        main_guard_py = os.path.join(hooks_dir, "role-guard.py")
+        with open(main_guard_py, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        os.chmod(main_guard_py, 0o755)
+
+        with open(os.path.join(agents_dir, "devops.md"), "w") as f:
+            f.write("---\nname: devops\n---\nDevOps test brief\n")
+
+        subprocess.run(["git", "-C", repo_dir, "add", "."], check=True)
+        subprocess.run(["git", "-C", repo_dir, "commit", "-q", "-m", "main commit"], check=True)
+
+        # Pin tooling while on main (stored in run_dir, outside repo)
+        tooling = pin_tooling(run_dir, root=repo_dir)
+
+        # Create and switch to change branch
+        subprocess.run(["git", "-C", repo_dir, "switch", "-q", "-c", "ops/test-branch"], check=True)
+
+        # On the change branch, replace scripts/agent-run.sh with a script that exits 127
+        with open(main_run_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"BRANCH_AGENT_RUN_FAIL\" >&2\nexit 127\n")
+        os.chmod(main_run_sh, 0o755)
+
+        # Also replace scripts/agent-token.sh with exit 127
+        with open(main_token_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"BRANCH_TOKEN_FAIL\" >&2\nexit 127\n")
+        os.chmod(main_token_sh, 0o755)
+
+        # Replace role-guard.py with one that denies everything (writes to stdout)
+        with open(main_guard_py, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport sys\nsys.stdout.write('REFUSED_BY_BRANCH_GUARD\\n')\nsys.exit(0)\n")
+        os.chmod(main_guard_py, 0o755)
+
+        # Confirm branch scripts fail if invoked directly
+        branch_run_res = subprocess.run([main_run_sh, "devops"], capture_output=True, text=True)
+        assert branch_run_res.returncode == 127, f"Branch script did not exit 127: {branch_run_res.returncode}"
+        branch_token_res = subprocess.run([main_token_sh, "devops"], capture_output=True, text=True)
+        assert branch_token_res.returncode == 127, f"Branch token did not exit 127: {branch_token_res.returncode}"
+        print(f"test_ac2: direct branch agent-run.sh exit {branch_run_res.returncode}")
+
+        # Test that pipeline functions use the pinned copies, NOT the branch's
+        global TOOLING
+        old_tooling = TOOLING
+        try:
+            TOOLING = tooling
+            log_path = os.path.join(run_dir, "test.log")
+
+            # agent() runs the pinned script and not the branch script (AC2)
+            out = agent("devops", "test task", log=log_path, cwd=repo_dir)
+            assert "PINNED_AGENT_RUN_SUCCESS: role=devops" in out, f"Pinned agent-run did not run! Output: {out}"
+            assert "BRANCH_AGENT_RUN_FAIL" not in out, f"Branch agent-run ran! Output: {out}"
+
+            # token() runs the pinned script and not the branch script
+            tok = token("devops", cwd=repo_dir)
+            assert tok == "PINNED_TOKEN_SUCCESS", f"Pinned token did not run! Token: {tok}"
+
+            # outside_role_paths() runs the pinned guard (which exits 0 with empty stdout)
+            refused = outside_role_paths("devops", ["scripts/agent-run.sh"], [], cwd=repo_dir)
+            assert refused == [], f"Pinned guard did not run (branch guard was used): {refused}"
+        finally:
+            TOOLING = old_tooling
+
+        print("test_ac2: pinned agent-run executed; branch script does not run")
+        print("test_ac2_change_branch_broken_agent_run: OK")
+
+        # Test 3: verify pinned agent-run.sh uses pinned agent definitions via stubbed agy
+        stub_bin = os.path.join(tmpdir, "stub_bin")
+        os.makedirs(stub_bin)
+        with open(os.path.join(stub_bin, "gh"), "w") as f:
+            f.write("#!/bin/sh\necho 12345\n")
+        os.chmod(os.path.join(stub_bin, "gh"), 0o755)
+        with open(os.path.join(stub_bin, "agy"), "w") as f:
+            f.write('#!/bin/sh\necho "AGY_PROMPT: $@"\n')
+        os.chmod(os.path.join(stub_bin, "agy"), 0o755)
+
+        # Stub agent-token.sh in pinned tooling so agent-run.sh needs no network
+        with open(tooling_root.agent_token, "w") as f:
+            f.write("#!/bin/sh\necho test_token\n")
+
+        custom_agents_dir = os.path.join(tmpdir, "custom_agents")
+        os.makedirs(custom_agents_dir)
+        with open(os.path.join(custom_agents_dir, "devops.md"), "w") as f:
+            f.write("---\nname: devops\n---\nCUSTOM_AGENT_BRIEF_CONTENT\n")
+
+        # 1. Fallback to pinned $here/../.claude/agents when NEXTOOMIO_AGENTS_DIR is unset
+        pinned_fallback_marker = "PINNED_AGENT_DEFINITION_FALLBACK_MARKER"
+        with open(os.path.join(tooling_root.agents_dir, "devops.md"), "a") as f:
+            f.write(f"\n{pinned_fallback_marker}\n")
+
+        env_fallback = dict(os.environ,
+                            PATH=f"{stub_bin}:{os.environ.get('PATH', '')}",
+                            NEXTOOMIO_STATE_DIR=os.path.join(tmpdir, "state"))
+        env_fallback.pop("NEXTOOMIO_AGENTS_DIR", None)
+        res_fallback = subprocess.run([tooling_root.agent_run, "devops", "-p", "fallback task"],
+                                      capture_output=True, text=True, env=env_fallback)
+        assert res_fallback.returncode == 0, f"agent-run.sh fallback failed: {res_fallback.stderr}"
+        assert pinned_fallback_marker in res_fallback.stdout, f"Pinned fallback marker not found in output: {res_fallback.stdout}"
+
+        # 2. Use NEXTOOMIO_AGENTS_DIR when set
+        env_custom = dict(env_fallback, NEXTOOMIO_AGENTS_DIR=custom_agents_dir)
+        res_custom = subprocess.run([tooling_root.agent_run, "devops", "-p", "custom task"],
+                                    capture_output=True, text=True, env=env_custom)
+        assert res_custom.returncode == 0, f"agent-run.sh with NEXTOOMIO_AGENTS_DIR failed: {res_custom.stderr}"
+        assert "CUSTOM_AGENT_BRIEF_CONTENT" in res_custom.stdout, f"Custom brief not found: {res_custom.stdout}"
+        assert "custom task" in res_custom.stdout, f"Custom task not found: {res_custom.stdout}"
+        print("test_agent_run_pinned_agents: OK")
+
+        # Test 4: AC1 verification of replace_commit_markers and deliver commit replacement (D-039)
+        test_text = (
+            "# Evidence: P0-F9.9 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit {{COMMIT}}\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\n"
+            "Verify that {{COMMIT}} in prose is preserved and not replaced.\n\n"
+            "## Observed result\n"
+            "The {{COMMIT}} marker in prose remains.\n\n"
+            "## Missed targets\nNone.\n"
+        )
+        fake_sha = "0123456789abcdef0123456789abcdef01234567"
+        replaced_text, rep_count = replace_commit_marker_in_text(test_text, fake_sha)
+        assert rep_count == 1, f"Expected exactly 1 replacement, got {rep_count}"
+        assert f"commit {fake_sha}" in replaced_text, f"Field not updated: {replaced_text}"
+        assert "Verify that {{COMMIT}} in prose is preserved" in replaced_text, "Prose marker was rewritten!"
+        assert "The {{COMMIT}} marker in prose remains" in replaced_text, "Prose marker in observed result rewritten!"
+
+        # In-repo git workflow test for replace_commit_markers
+        d039_repo = os.path.join(tmpdir, "d039_repo")
+        os.makedirs(d039_repo)
+        subprocess.run(["git", "init", "-q", "-b", "main", d039_repo], check=True)
+        subprocess.run(["git", "-C", d039_repo, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", d039_repo, "config", "user.email", "pipeline-test@example.com"], check=True)
+
+        readme_d039 = os.path.join(d039_repo, "README.md")
+        with open(readme_d039, "w") as f:
             f.write("# Test\n")
-        git_cmd(["add", "README.md"])
-        git_cmd(["commit", "-q", "-m", "Initial commit"])
+        subprocess.run(["git", "-C", d039_repo, "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", d039_repo, "commit", "-q", "-m", "Initial commit"], check=True)
 
-        # Switch to branch ops/P0-F9.9-test
-        git_cmd(["switch", "-c", "ops/P0-F9.9-test"])
+        subprocess.run(["git", "-C", d039_repo, "switch", "-q", "-c", "ops/P0-F9.9-test"], check=True)
 
-        # Author creates change and evidence file with {{COMMIT}}
-        code_file = os.path.join(repo_dir, "script.py")
+        code_file = os.path.join(d039_repo, "feature.py")
         with open(code_file, "w") as f:
-            f.write("print('feature implementation')\n")
+            f.write("def run():\n    return 42\n")
 
-        ev_dir = os.path.join(repo_dir, "docs", "evidence", "p0")
+        ev_dir = os.path.join(d039_repo, "docs", "evidence", "p0")
         os.makedirs(ev_dir)
         ev_file = os.path.join(ev_dir, "P0-F9.9.md")
         ev_rel = "docs/evidence/p0/P0-F9.9.md"
         with open(ev_file, "w") as f:
-            f.write(
-                "# Evidence: P0-F9.9 Test\n"
-                "- **Date:** 2026-11-14\n"
-                "- **Image version and commit:** none (repository only); commit {{COMMIT}}\n"
-                "- **Hardware model and revision:** none\n"
-                "- **Physical access needed:** none\n\n"
-                "## Procedure\nRun test.\n\n"
-                "## Observed result\nPassed.\n\n"
-                "## Missed targets\nNone.\n"
-            )
+            f.write(test_text)
 
-        # Simulate pipeline delivery logic
-        paths = ["script.py", ev_rel]
-        # Step 1: Change commit
-        git_cmd(["add", "-A"])
-        git_cmd(["commit", "-q", "-m", "Add script and evidence\n\nRefs #99"])
-        change_commit = git_cmd(["rev-parse", "HEAD"]).stdout.strip()
-        assert len(change_commit) == 40, f"Expected 40-char hash, got {change_commit}"
+        paths = ["feature.py", ev_rel]
+        subprocess.run(["git", "-C", d039_repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", d039_repo, "commit", "-q", "-m", "Implement feature and add evidence\n\nRefs #99"], check=True)
 
-        # Verify change commit contains the change
-        show_code = git_cmd(["show", f"{change_commit}:script.py"]).stdout
-        assert "print('feature implementation')" in show_code
+        change_commit = subprocess.run(["git", "-C", d039_repo, "rev-parse", "HEAD"],
+                                       capture_output=True, text=True, check=True).stdout.strip()
+        assert len(change_commit) == 40, f"Expected 40-character sha, got: {change_commit}"
 
-        # Step 2: Pipeline replaces {{COMMIT}} in evidence files
-        evidence_updated = False
-        for p in paths:
-            if (p.startswith("docs/evidence/") and p.endswith(".md")
-                    and p not in ("docs/evidence/TEMPLATE.md", "docs/evidence/README.md")):
-                fpath = os.path.join(repo_dir, p)
-                with open(fpath, "r", encoding="utf-8") as f:
-                    c = f.read()
-                if "{{COMMIT}}" in c:
-                    c_new = c.replace("{{COMMIT}}", change_commit)
-                    with open(fpath, "w", encoding="utf-8") as f:
-                        f.write(c_new)
-                    git_cmd(["add", p])
-                    evidence_updated = True
-        assert evidence_updated, "Expected evidence file to be updated"
-        git_cmd(["commit", "-q", "-m", "Record change commit in evidence\n\nRefs #99"])
-        follow_up_commit = git_cmd(["rev-parse", "HEAD"]).stdout.strip()
+        # Verify change commit contains the feature code
+        show_code = subprocess.run(["git", "-C", d039_repo, "show", f"{change_commit}:feature.py"],
+                                   capture_output=True, text=True, check=True).stdout
+        assert "def run():" in show_code
+
+        # Run replace_commit_markers (called by deliver)
+        updated = replace_commit_markers(paths, change_commit, root=d039_repo)
+        assert updated == [ev_rel], f"Expected [{ev_rel}], got: {updated}"
+
+        # Verify file content
+        with open(ev_file, "r") as f:
+            final_content = f.read()
+        assert f"- **Image version and commit:** none (repository only); commit {change_commit}" in final_content
+        assert "Verify that {{COMMIT}} in prose is preserved" in final_content
+        assert "The {{COMMIT}} marker in prose remains" in final_content
+
+        # Create follow-up commit as deliver() does
+        for p in updated:
+            subprocess.run(["git", "-C", d039_repo, "add", p], check=True)
+        subprocess.run(["git", "-C", d039_repo, "commit", "-q", "-m", "Record change commit in evidence\n\nRefs #99"], check=True)
+
+        follow_up_commit = subprocess.run(["git", "-C", d039_repo, "rev-parse", "HEAD"],
+                                          capture_output=True, text=True, check=True).stdout.strip()
         assert follow_up_commit != change_commit
 
-        # Verify follow-up commit has the full change_commit hash and no {{COMMIT}}
-        ev_after = git_cmd(["show", f"{follow_up_commit}:{ev_rel}"]).stdout
-        assert "{{COMMIT}}" not in ev_after, "Marker {{COMMIT}} should be replaced"
-        assert f"commit {change_commit}" in ev_after, f"Expected full hash {change_commit} in evidence"
+        # Verify follow-up commit touched only the evidence file
+        diff_files = subprocess.run(["git", "-C", d039_repo, "diff-tree", "--no-commit-id", "--name-only", "-r", follow_up_commit],
+                                    capture_output=True, text=True, check=True).stdout.strip().splitlines()
+        assert diff_files == [ev_rel], f"Follow-up commit changed unexpected files: {diff_files}"
 
-    print("OK: all agent-pipeline self-tests passed.")
+        print("test_d039_commit_marker_replacement: OK")
+
+    print("OK: all self-tests passed.")
     return 0
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("issue", type=int, nargs="?")
-    parser.add_argument("--role", choices=["developer", "devops"])
-    parser.add_argument("--test", action="store_true", help="Run automated self-tests for delivery logic")
-    args = parser.parse_args()
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("issue", type=int, nargs="?", help="issue number to run through the pipeline")
+    parser.add_argument("--role", choices=["developer", "devops"], help="author role for the issue")
+    parser.add_argument("--test", action="store_true", help="run self-tests and exit")
+    args = parser.parse_args(argv)
+
     if args.test:
         return run_self_tests()
+
     if args.issue is None:
         parser.error("the following arguments are required: issue")
+
     issue = args.issue
 
     info = gh_json(["issue", "view", str(issue), "--json", "title,state,labels,body"])
@@ -364,6 +618,10 @@ def main():
     os.makedirs(run_dir, mode=0o700)
     log = os.path.join(run_dir, "agents.log")
     say(f"issue #{issue} \"{info['title']}\" -> {role}; log {log}")
+
+    global TOOLING
+    TOOLING = pin_tooling(run_dir)
+    say(f"tooling pinned to {TOOLING.tooling_dir}")
 
     # "Touches" entries outside the role's default paths, for the guard where it runs.
     touches = re.findall(r"^- `([^`]+)`", (info["body"].split("### Touches", 1) + [""])[1].split("###", 1)[0], re.M)
@@ -456,7 +714,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except Stop as stop:
         say(str(stop))
         sys.exit(stop.status)

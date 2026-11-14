@@ -720,6 +720,22 @@ def run_self_tests() -> int:
             f"Expected missing commit hash error on branch, got: {errs_no_hash}",
         )
 
+        # 25. Evidence file with valid commit hash and {{COMMIT}} marker in prose on main must PASS (D-039)
+        f_marker_in_prose = tmp_path / "P0-F8.22.md"
+        f_marker_in_prose.write_text(
+            "# Evidence: P0-F8.22 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\nVerify {{COMMIT}} marker in prose is ignored on main.\n\n"
+            "## Observed result\nThe {{COMMIT}} marker in prose does not fail on main.\n\n"
+            "## Missed targets\nNone.\n",
+            encoding="utf-8",
+        )
+        errs_prose_main = check_evidence_file(f_marker_in_prose, is_main=True)
+        assert_true(len(errs_prose_main) == 0, f"Expected {{COMMIT}} in prose on main to pass, got: {errs_prose_main}")
+
     print()
     if failures:
         print(f"FAILED ({len(failures)} self-test failures):")
