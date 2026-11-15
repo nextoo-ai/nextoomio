@@ -350,28 +350,24 @@ def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
     return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
-def find_pr(issue, author_role=None):
+def find_pr(issue, role):
     prs = gh_json(["pr", "list", "--state", "open", "--limit", "50",
                    "--json", "number,body,author,headRefName,headRefOid"])
     pattern = re.compile(rf"\bRefs\s+#{issue}\b")
-    matching = [pr for pr in prs if pattern.search(pr.get("body") or "")]
-    if author_role:
-        for pr in matching:
-            if is_app(pr.get("author", {}).get("login"), author_role):
-                return pr
-    return matching[0] if matching else None
+    for pr in prs:
+        if is_app((pr.get("author") or {}).get("login", ""), role) and pattern.search(pr.get("body") or ""):
+            return pr
+    return None
 
 
-def find_merged_pr(issue, author_role=None):
+def find_merged_pr(issue, role):
     prs = gh_json(["pr", "list", "--state", "merged", "--limit", "50",
                    "--json", "number,body,author,headRefName,headRefOid"])
     pattern = re.compile(rf"\bRefs\s+#{issue}\b")
-    matching = [pr for pr in prs if pattern.search(pr.get("body") or "")]
-    if author_role:
-        for pr in matching:
-            if is_app(pr.get("author", {}).get("login"), author_role):
-                return pr
-    return matching[0] if matching else None
+    for pr in prs:
+        if is_app((pr.get("author") or {}).get("login", ""), role) and pattern.search(pr.get("body") or ""):
+            return pr
+    return None
 
 
 def choose_branch(branch, pr=None, cwd=None):
@@ -1901,13 +1897,24 @@ sys.exit(0)
                 "labels": [{"name": "state:ready"}, {"name": "area:tooling"}],
                 "body": "### Touches\n- `scripts/agent-pipeline.py`\n",
             }
-            gh_state.open_prs = [{
-                "number": 2010,
-                "headRefName": "ops/D-051-ac1-branch",
-                "headRefOid": head_ac1,
-                "author": {"login": "nextoomio-devops[bot]"},
-                "body": "Refs #201\n\nOpen PR with no verdict yet",
-            }]
+            gh_state.open_prs = [
+                {
+                    "number": 2019,
+                    "headRefName": "ops/D-051-foreign",
+                    "headRefOid": head_ac1,
+                    "author": {"login": "untrusted-user"},
+                    "body": "Refs #201\n\nAttacker PR",
+                },
+                {
+                    "number": 2010,
+                    "headRefName": "ops/D-051-ac1-branch",
+                    "headRefOid": head_ac1,
+                    "author": {"login": "nextoomio-devops[bot]"},
+                    "body": "Refs #201\n\nOpen PR with no verdict yet",
+                },
+            ]
+            assert find_pr(201, "devops")["number"] == 2010, "find_pr did not select role app PR"
+            assert find_pr(201, "developer") is None, "find_pr matched wrong role app"
             gh_state.merged_prs = []
 
             def pr_view_2010(num):
@@ -2068,11 +2075,20 @@ sys.exit(0)
                 "body": "### Touches\n- `scripts/agent-pipeline.py`\n",
             }
             gh_state.open_prs = []
-            gh_state.merged_prs = [{
-                "number": 2040,
-                "author": {"login": "nextoomio-devops[bot]"},
-                "body": "Refs #204\n\nMerged PR for AC4",
-            }]
+            gh_state.merged_prs = [
+                {
+                    "number": 2049,
+                    "author": {"login": "untrusted-user"},
+                    "body": "Refs #204\n\nAttacker merged PR",
+                },
+                {
+                    "number": 2040,
+                    "author": {"login": "nextoomio-devops[bot]"},
+                    "body": "Refs #204\n\nMerged PR for AC4",
+                },
+            ]
+            assert find_merged_pr(204, "devops")["number"] == 2040, "find_merged_pr did not select role app PR"
+            assert find_merged_pr(204, "developer") is None, "find_merged_pr matched wrong role app"
 
             if os.path.exists(mock_agent_record):
                 os.remove(mock_agent_record)
@@ -2132,6 +2148,14 @@ sys.exit(0)
             print("test_d051_ac5_ready_issue_no_pr_starts_author_first: OK")
 
             # --- AC6: All cases covered offline without network ---
+            assert gh is mock_gh_d051, "AC6 failed: gh was not substituted with mock"
+            assert TOOLING is d051_tooling, "AC6 failed: TOOLING was not substituted"
+            assert TOOLING.agent_run == mock_agent_runner, "AC6 failed: mock_agent_runner was not used"
+            origin_url = subprocess.run(["git", "-C", d051_local, "remote", "get-url", "origin"],
+                                        capture_output=True, text=True, check=True).stdout.strip()
+            assert os.path.isdir(origin_url), f"AC6 failed: origin is not a local directory: {origin_url}"
+            assert not any(origin_url.startswith(p) for p in ("http://", "https://", "git@", "ssh://")), \
+                f"AC6 failed: remote is not offline: {origin_url}"
             print("test_d051_ac6_offline_coverage: OK")
 
         finally:
@@ -2192,7 +2216,7 @@ def main(argv=None, cwd=None, run_dir=None):
             say(f"tooling pinned to {TOOLING.tooling_dir}")
 
         if "state:implemented" in labels:
-            merged = find_merged_pr(issue)
+            merged = find_merged_pr(issue, role)
             if not merged:
                 raise Stop(1, f"issue #{issue} has state:implemented but no merged pull request that references it")
             return run_qm_and_close(issue, merged["number"], log, run_dir, cwd=cwd)
