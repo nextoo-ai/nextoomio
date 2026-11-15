@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.12 (autonomous operation)**  
+Document version: **0.13 (autonomous operation)**  
 Date: **2026-11-15**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -24,6 +24,8 @@ Version 0.9 records the pipeline run on D-038 and the correction to the Reviewer
 Version 0.10 records the pipeline runs on D-039 and D-040, the defects triaged from them, and where defect evidence is recorded (sections 9.3 and 11).
 
 Version 0.11 records the pipeline runs on D-041 to D-050 and what remains for the pipeline (sections 9.3 and 11).
+
+Version 0.13 records the Architect's authority to unblock development (section 4.1) and what `Completes-Story: yes` means for a story with bench criteria (section 5, step 3), after P0-F2.1 (#11) was blocked twice with no code finding and stories with bench criteria could not reach `state:implemented`.
 
 Version 0.12 records who closes a defect that is assigned to a story (section 5, step 5) and the matching change of the guard, which now limits closing an issue by hand to the Architect instead of denying it to every role: the first product story, P0-F1.1 (#8), met every criterion and still could not close, because its defects were open and no rule named who closes them.
 
@@ -76,7 +78,8 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Input:** The maintained documents, a requested scope (for example "stories for P1-F6"), or findings reported by other agents.
 - **Output:** A documentation pull request on an `arch/` branch, new or edited backlog issues, defect issues.
 - **May edit:** Markdown documents in the repository root and under `docs/` except `docs/evidence/`; `AGENTS.md`; `.claude/agents/`; issues and labels.
-- **May not:** Edit source code, build configuration, CI, or recorded evidence; approve or merge pull requests.
+- **May not:** Edit source code, build configuration, or CI; change a recorded result in evidence; approve or merge pull requests; change `SPECIFICATION.md` without the project owner's approval.
+- **Authority to unblock:** The Architect may close any issue that development is waiting on and create whatever is needed for it: issues, rules, tooling, and, when a story is blocked on them, corrections to a pull request's description or to the wording of an evidence file (never to a recorded result). Each such act is stated in a comment on the issue or pull request. The Architect does not change `SPECIFICATION.md` without the project owner's approval (project owner's decision, 2026-11-15).
 - **Model:** Claude Fable (`fable`), in Claude Code.
 
 ### 4.2 Developer
@@ -132,7 +135,7 @@ SPECIFICATION ─► Architect ─► story (state:ready) ─► pipeline
 
 1. The author role (Developer, or DevOps for build, CI, image, tooling, and hardware work) implements the issue in the working tree, on a branch the pipeline created. The pipeline then checks every changed path against the role with the guard's own rules; if any is outside, it commits nothing, keeps the changes in a local stash, and blocks the issue. Otherwise it commits and pushes under the role's identity and opens the pull request with the author's summary and `Refs #<n>`.
 2. The pipeline enables auto-merge on the pull request as the author's App. GitHub merges it when the rule set on `main` is satisfied, not before.
-3. CI runs; the pipeline waits until all required checks have reported. The Reviewer reviews the head commit and states `Completes-Story: yes` or `Completes-Story: no` in the review; the line refers to the issue the pull request was made for, including a defect worked on directly. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
+3. CI runs; the pipeline waits until all required checks have reported. The Reviewer reviews the head commit and states `Completes-Story: yes` or `Completes-Story: no` in the review; the line refers to the issue the pull request was made for, including a defect worked on directly, and `yes` means the implementation is complete even when build or bench evidence is still to be recorded. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
 4. After the merge, if the review said `Completes-Story: yes`, the pipeline sets `state:implemented` and starts QM. If it said `no`, the pipeline stops and leaves the issue ready for the next pull request, which a further run delivers.
 5. QM ends its verdict with `QM-Verdict: PASS` or `QM-Verdict: FAIL`. On PASS the pipeline ticks the acceptance criteria and closes the issue as completed. Otherwise the issue stays open with the verdict, for the Architect. Where the only obstacle is an open defect assigned to the story, and the verdict states that the criteria are met and the evidence demonstrates the defect's fix, the Architect closes that defect as completed with a link to the verdict and starts QM again ([backlog conventions](../backlog/README.md), section "Status").
 6. Any role that finds a problem outside its task reports a finding; the Architect files the defect.
