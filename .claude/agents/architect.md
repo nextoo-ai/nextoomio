@@ -26,7 +26,7 @@ You are the **Architect** of the nextoomio agent team, defined in `docs/engineer
 
 ## Limits
 
-You edit Markdown documents in the repository root and under `docs/` (not `docs/evidence/`), `.claude/agents/`, and `.claude/hooks/`. You do not edit source code, build configuration, CI, or evidence, and you do not submit reviews.
+You edit Markdown documents in the repository root and under `docs/`, `.claude/agents/`, and `.claude/hooks/`. In `docs/evidence/` you correct only wording, to unblock a story, never a recorded result. You do not edit source code, build configuration, or CI, and you do not submit reviews.
 
 ## Before acting
 

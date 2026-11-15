@@ -25,9 +25,9 @@ Version 0.10 records the pipeline runs on D-039 and D-040, the defects triaged f
 
 Version 0.11 records the pipeline runs on D-041 to D-050 and what remains for the pipeline (sections 9.3 and 11).
 
-Version 0.13 records the Architect's authority to unblock development (section 4.1) and what `Completes-Story: yes` means for a story with bench criteria (section 5, step 3), after P0-F2.1 (#11) was blocked twice with no code finding and stories with bench criteria could not reach `state:implemented`.
-
 Version 0.12 records who closes a defect that is assigned to a story (section 5, step 5) and the matching change of the guard, which now limits closing an issue by hand to the Architect instead of denying it to every role: the first product story, P0-F1.1 (#8), met every criterion and still could not close, because its defects were open and no rule named who closes them.
+
+Version 0.13 records the Architect's authority to unblock development (section 4.1) and what `Completes-Story: yes` means for a story with bench criteria (section 5, step 3), after P0-F2.1 (#11) was blocked twice with no code finding and stories with bench criteria could not reach `state:implemented`.
 
 ## 1. Goal
 
@@ -77,9 +77,9 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Responsibility:** From the specification, design the approach and components (architecture decisions `AD-*`, open decisions `OD-*`); write features and stories; triage findings into defects; mark stories ready; keep `SPECIFICATION.md`, `ROADMAP.md`, and `ARCHITECTURE.md` consistent and requirement coverage complete; maintain the agent rules.
 - **Input:** The maintained documents, a requested scope (for example "stories for P1-F6"), or findings reported by other agents.
 - **Output:** A documentation pull request on an `arch/` branch, new or edited backlog issues, defect issues.
-- **May edit:** Markdown documents in the repository root and under `docs/` except `docs/evidence/`; `AGENTS.md`; `.claude/agents/`; issues and labels.
+- **May edit:** Markdown documents in the repository root and under `docs/`; in `docs/evidence/` only the wording, to unblock a story, never a recorded result; `AGENTS.md`; `.claude/agents/`; issues and labels.
 - **May not:** Edit source code, build configuration, or CI; change a recorded result in evidence; approve or merge pull requests; change `SPECIFICATION.md` without the project owner's approval.
-- **Authority to unblock:** The Architect may close any issue that development is waiting on and create whatever is needed for it: issues, rules, tooling, and, when a story is blocked on them, corrections to a pull request's description or to the wording of an evidence file (never to a recorded result). Each such act is stated in a comment on the issue or pull request. The Architect does not change `SPECIFICATION.md` without the project owner's approval (project owner's decision, 2026-11-15).
+- **Authority to unblock:** The Architect may close any issue that development is waiting on and create whatever is needed for it: issues, rules, and, when a story is blocked on them, corrections to a pull request's description or to the wording of an evidence file (never to a recorded result). Tooling inside the repository still goes through a DevOps issue; the Architect may set up the workstation and local builds outside the repository. Each such act is stated in a comment on the issue or pull request. The Architect does not change `SPECIFICATION.md` without the project owner's approval (project owner's decision, 2026-11-15).
 - **Model:** Claude Fable (`fable`), in Claude Code.
 
 ### 4.2 Developer
