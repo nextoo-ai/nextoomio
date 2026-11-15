@@ -4,12 +4,13 @@ HOMEPAGE = "https://github.com/nextoo-ai/nextoomio"
 LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10"
 
-inherit cargo cargo-update-recipe-crates
+inherit cargo cargo-update-recipe-crates systemd
 
-FILESEXTRAPATHS:prepend := "${THISDIR}/../../..:"
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:${THISDIR}/../../..:"
 
 SRC_URI = " \
     file://core \
+    file://nextoomio-device-id.service \
 "
 
 require ${BPN}-crates.inc
@@ -18,3 +19,27 @@ S = "${UNPACKDIR}/core"
 CARGO_SRC_DIR = ""
 
 CARGO_BUILD_FLAGS:append = " -p nx-sysd"
+
+SYSTEMD_SERVICE:${PN} = "nextoomio-device-id.service"
+SYSTEMD_AUTO_ENABLE = "enable"
+
+do_install:append() {
+    install -d ${D}${bindir}
+    ln -sf nx-sysd ${D}${bindir}/nx-identity
+
+    if ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'true', 'false', d)}; then
+        install -d ${D}${systemd_system_unitdir}
+        if [ -f "${WORKDIR}/sources-unpack/nextoomio-device-id.service" ]; then
+            install -m 0644 "${WORKDIR}/sources-unpack/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
+        elif [ -f "${UNPACKDIR}/nextoomio-device-id.service" ]; then
+            install -m 0644 "${UNPACKDIR}/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
+        else
+            install -m 0644 "${WORKDIR}/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
+        fi
+    fi
+}
+
+FILES:${PN} += " \
+    ${bindir}/nx-identity \
+    ${systemd_system_unitdir}/nextoomio-device-id.service \
+"

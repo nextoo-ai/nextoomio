@@ -2,7 +2,7 @@ SUMMARY = "nextoomio read-only release image (v0.0.1 baseline)"
 DESCRIPTION = "Production-style read-only image with PipeWire, MPD, SWUpdate, NetworkManager, Avahi, nftables, and nx-sysd privileged helper daemon. Excludes SSH server and debug tooling per ARCHITECTURE.md section 3.7."
 LICENSE = "MIT"
 
-inherit core-image
+inherit core-image nextoomio-image-version
 
 # Enforce read-only rootfs and remove debug/SSH from release image (ARCHITECTURE.md section 3.7)
 IMAGE_FEATURES += "read-only-rootfs"

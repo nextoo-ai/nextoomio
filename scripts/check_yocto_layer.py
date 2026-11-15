@@ -38,8 +38,11 @@ def main() -> int:
         ROOT / "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend",
         ROOT / "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
         ROOT / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
+        ROOT / "meta-nextoomio/recipes-core/os-release/os-release.bbappend",
+        ROOT / "meta-nextoomio/classes/nextoomio-image-version.bbclass",
         ROOT / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
         ROOT / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
+        ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/files/nextoomio-device-id.service",
     ]
 
     for path in required_files:
@@ -279,6 +282,52 @@ def main() -> int:
         ts_text = ts_preset.read_text(encoding="utf-8")
         if "disable systemd-time-wait-sync.service" not in ts_text:
             errors.append("systemd preset must disable systemd-time-wait-sync.service (AD-21, AC5)")
+
+    # P0-F2.3: Validate device identity, image version release metadata, and persistent device ID
+    os_release_append = ROOT / "meta-nextoomio/recipes-core/os-release/os-release.bbappend"
+    if os_release_append.is_file():
+        osr_text = os_release_append.read_text(encoding="utf-8")
+        for field in ("BUILD_ID", "IMAGE_VERSION", "NEXTOOMIO_SOURCE_COMMIT", "NEXTOOMIO_BUILD_ID", "NEXTOOMIO_IMAGE_VERSION", "NEXTOOMIO_HARDWARE_COMPAT"):
+            if field not in osr_text:
+                errors.append(f"os-release.bbappend must include '{field}' in OS_RELEASE_FIELDS (AC1, AC2, P0-F2.3)")
+        if "nextoomio-release" not in osr_text:
+            errors.append("os-release.bbappend must install /etc/nextoomio-release convenience release file (AC1, P0-F2.3)")
+
+    image_version_class = ROOT / "meta-nextoomio/classes/nextoomio-image-version.bbclass"
+    if image_version_class.is_file():
+        iv_text = image_version_class.read_text(encoding="utf-8")
+        if "IMAGE_PREPROCESS_COMMAND" not in iv_text or "nextoomio-release" not in iv_text:
+            errors.append("nextoomio-image-version.bbclass must write /etc/nextoomio-release via IMAGE_PREPROCESS_COMMAND")
+
+    image_bb = ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+    if image_bb.is_file():
+        img_text = image_bb.read_text(encoding="utf-8")
+        if "nextoomio-image-version" not in img_text:
+            errors.append("nextoomio-image.bb must inherit nextoomio-image-version (AC1, AC4)")
+
+    devid_service = ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/files/nextoomio-device-id.service"
+    if devid_service.is_file():
+        svc_text = devid_service.read_text(encoding="utf-8")
+        if "ExecStart=/usr/bin/nx-sysd init-device-id" not in svc_text:
+            errors.append("nextoomio-device-id.service must execute '/usr/bin/nx-sysd init-device-id' (AC3)")
+        if "Requires=data.mount" not in svc_text or "After=data.mount" not in svc_text:
+            errors.append("nextoomio-device-id.service must depend on data.mount (AC3)")
+
+    nx_sysd_bb = ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb"
+    if nx_sysd_bb.is_file():
+        sysd_text = nx_sysd_bb.read_text(encoding="utf-8")
+        if "nextoomio-device-id.service" not in sysd_text:
+            errors.append("nx-sysd_0.0.1.bb must package nextoomio-device-id.service (AC3)")
+        if "nx-identity" not in sysd_text:
+            errors.append("nx-sysd_0.0.1.bb must create /usr/bin/nx-identity symlink to nx-sysd")
+
+    base_files_append = ROOT / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend"
+    if base_files_append.is_file():
+        bf_text = base_files_append.read_text(encoding="utf-8")
+        if "${D}/data" not in bf_text:
+            errors.append("base-files_%.bbappend must create ${D}/data mount point directory (SYS-04, AC3)")
+        if "LABEL=data" not in bf_text:
+            errors.append("base-files_%.bbappend must configure persistent /data mount in /etc/fstab (SYS-04, AC3)")
 
     if errors:
         for err in errors:
