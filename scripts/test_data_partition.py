@@ -16,53 +16,141 @@ DATA_RECIPE_FILES = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-data/file
 
 class TestDataPartition(unittest.TestCase):
     def test_shell_syntax(self) -> None:
-        """Verify shell scripts have valid syntax via sh -n."""
-        for script_name in ("nextoomio-data-grow.sh", "nextoomio-data-check.sh", "nextoomio-data-init.sh"):
+        """Verify all recipe shell scripts have valid syntax via sh -n."""
+        for script_name in (
+            "nextoomio-boot-mount.sh",
+            "nextoomio-data-grow.sh",
+            "nextoomio-data-check.sh",
+            "nextoomio-data-init.sh",
+        ):
             script_path = DATA_RECIPE_FILES / script_name
             self.assertTrue(script_path.is_file(), f"Missing {script_name}")
             res = subprocess.run(["sh", "-n", str(script_path)], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, f"Syntax error in {script_name}: {res.stderr}")
 
-    def test_init_script_directory_structure_and_modes(self) -> None:
-        """Verify AC4: directories created with correct modes and secrets is not world-readable."""
+    def test_boot_mount_active_slot_resolution(self) -> None:
+        """Verify AC1: nextoomio-boot-mount.sh dynamically resolves active slot A or B."""
+        script_path = DATA_RECIPE_FILES / "nextoomio-boot-mount.sh"
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = pathlib.Path(tmpdir)
-            fake_root = tmp_path / "rootfs"
+            boot_dir = tmp_path / "boot"
+            cmdline_file = tmp_path / "cmdline"
+
+            # Case 1: Slot A active via cmdline
+            cmdline_file.write_text("console=serial0,115200 root=/dev/mmcblk0p5 rootfstype=ext4 root_a ro", encoding="utf-8")
+            env_a = {
+                "PATH": os.environ.get("PATH", "/bin:/usr/bin"),
+                "NEXTOOMIO_BOOT_DIR": str(boot_dir),
+                "NEXTOOMIO_CMDLINE_FILE": str(cmdline_file),
+                "NEXTOOMIO_MOCK_MOUNT": "1",
+            }
+            res_a = subprocess.run(["sh", str(script_path)], env=env_a, capture_output=True, text=True)
+            self.assertEqual(res_a.returncode, 0, f"boot-mount failed for slot A: {res_a.stderr}")
+            info_a = (boot_dir / ".mounted_info").read_text(encoding="utf-8")
+            self.assertIn("slot=a", info_a)
+            self.assertIn("boot_a", info_a)
+
+            # Case 2: Slot B active via cmdline
+            cmdline_file.write_text("console=serial0,115200 root=/dev/mmcblk0p6 rootfstype=ext4 root_b ro", encoding="utf-8")
+            env_b = {
+                "PATH": os.environ.get("PATH", "/bin:/usr/bin"),
+                "NEXTOOMIO_BOOT_DIR": str(boot_dir),
+                "NEXTOOMIO_CMDLINE_FILE": str(cmdline_file),
+                "NEXTOOMIO_MOCK_MOUNT": "1",
+            }
+            res_b = subprocess.run(["sh", str(script_path)], env=env_b, capture_output=True, text=True)
+            self.assertEqual(res_b.returncode, 0, f"boot-mount failed for slot B: {res_b.stderr}")
+            info_b = (boot_dir / ".mounted_info").read_text(encoding="utf-8")
+            self.assertIn("slot=b", info_b)
+            self.assertIn("boot_b", info_b)
+
+    def test_grow_script_idempotency(self) -> None:
+        """Verify AC2: nextoomio-data-grow.sh detects existing resize marker and exits without re-running."""
+        script_path = DATA_RECIPE_FILES / "nextoomio-data-grow.sh"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
             fake_data = tmp_path / "data"
-            fake_run = fake_root / "run" / "nextoomio"
-            fake_var = fake_root / "var" / "log"
+            fake_run = tmp_path / "run" / "nextoomio"
+            fake_data.mkdir(parents=True)
+            fake_run.mkdir(parents=True)
+            (fake_data / ".resized").touch()
+
+            env = {
+                "PATH": os.environ.get("PATH", "/bin:/usr/bin"),
+                "NEXTOOMIO_DATA_DIR": str(fake_data),
+                "NEXTOOMIO_RUN_DIR": str(fake_run),
+            }
+            res = subprocess.run(["sh", str(script_path)], env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"Grow script failed: {res.stderr}")
+            self.assertIn("resize marker found", res.stdout)
+
+    def test_check_script_e2fsck_exit_codes(self) -> None:
+        """Verify AC3 and AC5: nextoomio-data-check.sh handles clean, repaired, and corrupt file systems."""
+        script_path = DATA_RECIPE_FILES / "nextoomio-data-check.sh"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
+            fake_run = tmp_path / "run" / "nextoomio"
+            fake_dev = tmp_path / "mock_dev"
+            fake_dev.touch()
+
+            # Helper to create mock e2fsck script
+            mock_bin_dir = tmp_path / "bin"
+            mock_bin_dir.mkdir(parents=True)
+            mock_e2fsck = mock_bin_dir / "mock_e2fsck.sh"
+
+            # Sub-test 1: e2fsck returns 0 (clean) -> data_available
+            mock_e2fsck.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            mock_e2fsck.chmod(0o755)
+
+            env_clean = {
+                "PATH": os.environ.get("PATH", "/bin:/usr/bin"),
+                "NEXTOOMIO_DATA_DEV": str(fake_dev),
+                "NEXTOOMIO_RUN_DIR": str(fake_run),
+                "NEXTOOMIO_E2FSCK_CMD": str(mock_e2fsck),
+            }
+            res_clean = subprocess.run(["sh", str(script_path)], env=env_clean, capture_output=True, text=True)
+            self.assertEqual(res_clean.returncode, 0)
+            self.assertEqual((fake_run / "data_status").read_text().strip(), "data_available")
+            self.assertFalse((fake_run / "data_unavailable").exists())
+
+            # Sub-test 2: e2fsck returns 1 (repaired) -> data_available
+            mock_e2fsck.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            res_repaired = subprocess.run(["sh", str(script_path)], env=env_clean, capture_output=True, text=True)
+            self.assertEqual(res_repaired.returncode, 0)
+            self.assertEqual((fake_run / "data_status").read_text().strip(), "data_available")
+            self.assertFalse((fake_run / "data_unavailable").exists())
+
+            # Sub-test 3: e2fsck returns 4 (uncorrectable errors) -> data_unavailable, exit 0 (prevent emergency mode)
+            mock_e2fsck.write_text("#!/bin/sh\nexit 4\n", encoding="utf-8")
+            res_corrupt = subprocess.run(["sh", str(script_path)], env=env_clean, capture_output=True, text=True)
+            self.assertEqual(res_corrupt.returncode, 0, "Script must exit 0 to avoid systemd emergency mode")
+            self.assertEqual((fake_run / "data_status").read_text().strip(), "data_unavailable")
+            self.assertTrue((fake_run / "data_unavailable").exists())
+
+    def test_init_script_directory_structure_and_modes(self) -> None:
+        """Verify AC4: nextoomio-data-init.sh creates directories with correct modes and secrets is not world-readable."""
+        script_path = DATA_RECIPE_FILES / "nextoomio-data-init.sh"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
+            fake_data = tmp_path / "data"
+            fake_run = tmp_path / "run" / "nextoomio"
+            fake_var = tmp_path / "var" / "log"
             fake_data.mkdir(parents=True)
             fake_run.mkdir(parents=True)
             fake_var.mkdir(parents=True)
 
-            init_script = (DATA_RECIPE_FILES / "nextoomio-data-init.sh").read_text(encoding="utf-8")
-            # Create test version adapted to tmp paths
-            test_script_content = f"""#!/bin/sh
-set -eu
-mkdir -p {fake_data}/config
-chmod 0755 {fake_data}/config
-mkdir -p {fake_data}/secrets
-chmod 0700 {fake_data}/secrets
-mkdir -p {fake_data}/music
-chmod 0755 {fake_data}/music
-mkdir -p {fake_data}/update
-chmod 0755 {fake_data}/update
-# Preallocate sparse 1G staging file
-dd if=/dev/zero of={fake_data}/update/staging.swu bs=1M count=0 seek=1024 2>/dev/null
-dd if=/dev/zero of={fake_data}/update/journal.0 bs=1k count=0 seek=64 2>/dev/null
-dd if=/dev/zero of={fake_data}/update/journal.1 bs=1k count=0 seek=64 2>/dev/null
-mkdir -p {fake_data}/log/journal
-chmod 0755 {fake_data}/log
-chmod 0755 {fake_data}/log/journal
-touch {fake_data}/.initialized
-touch {fake_data}/.resized
-mkdir -p {fake_run}
-echo "data_available" > {fake_run}/data_status
-rm -f {fake_run}/data_unavailable
-"""
-            runner = tmp_path / "run_init.sh"
-            runner.write_text(test_script_content, encoding="utf-8")
-            res = subprocess.run(["sh", str(runner)], capture_output=True, text=True)
+            env = {
+                "PATH": os.environ.get("PATH", "/bin:/usr/bin"),
+                "NEXTOOMIO_DATA_DIR": str(fake_data),
+                "NEXTOOMIO_RUN_DIR": str(fake_run),
+                "NEXTOOMIO_VAR_LOG_DIR": str(fake_var),
+                "NEXTOOMIO_TEST_MOUNT": "1",
+            }
+            res = subprocess.run(["sh", str(script_path)], env=env, capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, f"Init script failed: {res.stderr}")
 
             # Verify directory modes
@@ -100,45 +188,35 @@ rm -f {fake_run}/data_unavailable
             self.assertEqual((fake_run / "data_status").read_text().strip(), "data_available")
             self.assertFalse((fake_run / "data_unavailable").exists())
 
-    def test_grow_script_idempotency_and_geometry(self) -> None:
-        """Verify AC2: grow script detects existing resize marker and exits without resizing."""
+    def test_init_script_recovery_mode(self) -> None:
+        """Verify AC5: nextoomio-data-init.sh in recovery mode provides volatile dirs and preserves flag."""
+        script_path = DATA_RECIPE_FILES / "nextoomio-data-init.sh"
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = pathlib.Path(tmpdir)
             fake_data = tmp_path / "data"
-            fake_data.mkdir()
-            (fake_data / ".resized").touch()
-
-            # Execute grow script with fake data directory
-            res = subprocess.run(
-                ["sh", "-c", f"if [ -f {fake_data}/.resized ]; then exit 0; else exit 1; fi"],
-                capture_output=True,
-            )
-            self.assertEqual(res.returncode, 0, "Grow script must exit 0 immediately when marker exists")
-
-    def test_recovery_mode_reporting(self) -> None:
-        """Verify AC5: data_unavailable is reported and no auto-reformat is executed."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = pathlib.Path(tmpdir)
             fake_run = tmp_path / "run" / "nextoomio"
+            fake_var = tmp_path / "var" / "log"
+            fake_data.mkdir(parents=True)
             fake_run.mkdir(parents=True)
+            fake_var.mkdir(parents=True)
 
-            # Simulated unrepairable corruption (e2fsck code 4)
-            test_check_content = f"""#!/bin/sh
-set -eu
-RC=4
-if [ "$RC" -gt 1 ]; then
-    mkdir -p {fake_run}
-    echo "data_unavailable" > {fake_run}/data_status
-    touch {fake_run}/data_unavailable
-    exit 0
-fi
-"""
-            runner = tmp_path / "run_check.sh"
-            runner.write_text(test_check_content, encoding="utf-8")
-            res = subprocess.run(["sh", str(runner)], capture_output=True, text=True)
-            self.assertEqual(res.returncode, 0, "Check script must return 0 to prevent emergency mode")
+            # Simulate recovery mode flag from pre-mount check
+            (fake_run / "data_unavailable").touch()
+
+            env = {
+                "PATH": os.environ.get("PATH", "/bin:/usr/bin"),
+                "NEXTOOMIO_DATA_DIR": str(fake_data),
+                "NEXTOOMIO_RUN_DIR": str(fake_run),
+                "NEXTOOMIO_VAR_LOG_DIR": str(fake_var),
+                "NEXTOOMIO_TEST_MOUNT": "1",
+            }
+            res = subprocess.run(["sh", str(script_path)], env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"Init script in recovery mode failed: {res.stderr}")
             self.assertTrue((fake_run / "data_unavailable").exists())
             self.assertEqual((fake_run / "data_status").read_text().strip(), "data_unavailable")
+            self.assertTrue((fake_data / "config").is_dir())
+            self.assertTrue((fake_data / "secrets").is_dir())
 
     def test_journald_bounds_configuration(self) -> None:
         """Verify AC6: journald.conf drop-in bounds volatile and persistent log storage."""

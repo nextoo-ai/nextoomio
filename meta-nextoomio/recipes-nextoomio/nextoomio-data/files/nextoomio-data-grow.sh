@@ -2,16 +2,20 @@
 # Expand data partition to remainder of card on first boot (AC2, D-006, ARCHITECTURE.md section 3.6)
 set -eu
 
+DATA_DIR="${NEXTOOMIO_DATA_DIR:-/data}"
+RUN_DIR="${NEXTOOMIO_RUN_DIR:-/run/nextoomio}"
+
 # If already resized marker exists on data filesystem or in run, do nothing
-if [ -f /data/.resized ] || [ -f /run/nextoomio/data-resized ]; then
+if [ -f "$DATA_DIR/.resized" ] || [ -f "$RUN_DIR/data-resized" ]; then
+    echo "nextoomio-data-grow: resize marker found, skipping expansion"
     exit 0
 fi
 
 # Determine block device for data partition
-DATA_DEV="/dev/disk/by-label/data"
+DATA_DEV="${NEXTOOMIO_DATA_DEV:-/dev/disk/by-label/data}"
 if [ -L "$DATA_DEV" ]; then
     DATA_DEV=$(readlink -f "$DATA_DEV")
-elif [ ! -b "$DATA_DEV" ]; then
+elif [ ! -b "$DATA_DEV" ] && [ -z "${NEXTOOMIO_DATA_DEV:-}" ]; then
     DATA_DEV="/dev/mmcblk0p7"
 fi
 
@@ -43,8 +47,8 @@ if [ -f "/sys/class/block/$DISK_NAME/size" ] && [ -f "/sys/class/block/$PART_NAM
     # If remaining unpartitioned space is 4 MiB (8192 sectors of 512 bytes) or less, partition already fills card
     if [ "$FREE_SECTORS" -le 8192 ]; then
         echo "nextoomio-data-grow: partition $PARTNUM already extends to end of disk ($FREE_SECTORS sectors free)"
-        mkdir -p /run/nextoomio
-        touch /run/nextoomio/data-resized
+        mkdir -p "$RUN_DIR"
+        touch "$RUN_DIR/data-resized"
         exit 0
     fi
 
@@ -76,6 +80,6 @@ if command -v resize2fs >/dev/null 2>&1; then
     resize2fs "$DATA_DEV" 2>/dev/null || true
 fi
 
-mkdir -p /run/nextoomio
-touch /run/nextoomio/data-resized
+mkdir -p "$RUN_DIR"
+touch "$RUN_DIR/data-resized"
 echo "nextoomio-data-grow: data partition expansion completed"

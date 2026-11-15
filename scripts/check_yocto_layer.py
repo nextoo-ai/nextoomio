@@ -83,7 +83,7 @@ def main() -> int:
     data_recipe_path = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb"
     if data_recipe_path.is_file():
         data_recipe_text = data_recipe_path.read_text(encoding="utf-8")
-        for unit in ("nextoomio-data-grow.service", "nextoomio-data-check.service", "nextoomio-data-init.service"):
+        for unit in ("nextoomio-boot-mount.service", "nextoomio-data-grow.service", "nextoomio-data-check.service", "nextoomio-data-init.service"):
             if unit not in data_recipe_text:
                 errors.append(f"nextoomio-data_0.0.1.bb missing systemd unit registration: {unit}")
 
