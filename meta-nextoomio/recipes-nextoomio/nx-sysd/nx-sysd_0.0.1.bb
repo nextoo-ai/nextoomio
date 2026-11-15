@@ -14,7 +14,7 @@ SRC_URI = " \
 
 require ${BPN}-crates.inc
 
-S = "${WORKDIR}/core"
+S = "${UNPACKDIR}/core"
 CARGO_SRC_DIR = ""
 
 CARGO_BUILD_FLAGS:append = " -p nx-sysd"
