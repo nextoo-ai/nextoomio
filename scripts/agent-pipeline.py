@@ -410,7 +410,8 @@ def wait_for_ci(number, required_checks=None, issue=None, timeout=3600):
         checks = state.get("statusCheckRollup") or []
         states = {c.get("name") or c.get("context"): c.get("conclusion") or c.get("status") or c.get("state")
                   for c in checks}
-        if any(s in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED") for s in states.values()):
+        if any(states.get(name) in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED")
+               for name in required_checks):
             return False
         if all(states.get(name) == "SUCCESS" for name in required_checks):
             return True
@@ -1588,6 +1589,137 @@ def run_self_tests():
         assert round_comment_ac2 == f"{raw_summary_ac2}\n\nRole: Developer · Model: {AUTHOR_MODEL}"
 
         print("test_d049_round_comment_clean_and_single_role: OK")
+
+        # Test 13: AC1 and AC2 verification of failure condition restricted to required checks (D-050)
+        old_pr_state_d050 = pr_state
+        old_time_sleep_d050 = time.sleep
+        old_time_time_d050 = time.time
+        try:
+            d050_checks = []
+            def mock_pr_state_d050(pr_num):
+                return {
+                    "headRefOid": "d050head",
+                    "mergeStateStatus": "CLEAN",
+                    "mergeable": "MERGEABLE",
+                    "statusCheckRollup": d050_checks,
+                    "body": "Refs #194",
+                }
+            pr_state = mock_pr_state_d050
+
+            sim_time_d050 = 1000.0
+            time.time = lambda: sim_time_d050
+            def mock_sleep_d050(s):
+                nonlocal sim_time_d050
+                sim_time_d050 += s
+            time.sleep = mock_sleep_d050
+
+            test_required = {"Required Gate 1", "Required Gate 2"}
+
+            # AC1: Every required check succeeded and an unrequired check failed
+            # -> reports checks as passed (True)
+            d050_checks = [
+                {"name": "Required Gate 1", "conclusion": "SUCCESS"},
+                {"name": "Required Gate 2", "conclusion": "SUCCESS"},
+                {"name": "Optional Advisory Check", "conclusion": "FAILURE"},
+            ]
+            sim_time_d050 = 1000.0
+            res_ac1 = wait_for_ci(194, required_checks=test_required, timeout=40)
+            assert res_ac1 is True, f"AC1 failed: wait_for_ci returned {res_ac1} instead of True when unrequired check failed"
+
+            # AC1 variant: Other failure states on unrequired check (CANCELLED, TIMED_OUT, ERROR, ACTION_REQUIRED)
+            for failure_state in ("CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED"):
+                d050_checks = [
+                    {"name": "Required Gate 1", "conclusion": "SUCCESS"},
+                    {"name": "Required Gate 2", "conclusion": "SUCCESS"},
+                    {"name": "Optional Advisory Check", "conclusion": failure_state},
+                ]
+                sim_time_d050 = 1000.0
+                res_variant = wait_for_ci(194, required_checks=test_required, timeout=40)
+                assert res_variant is True, f"AC1 failed for unrequired state {failure_state}: wait_for_ci returned {res_variant}"
+
+            # AC1 variant: Unrequired check fails while a required check is still pending;
+            # should keep waiting instead of immediately failing, then succeed when required check completes
+            poll_phase = 0
+            def mock_pr_state_progressive(pr_num):
+                nonlocal poll_phase
+                poll_phase += 1
+                if poll_phase == 1:
+                    return {
+                        "headRefOid": "d050head",
+                        "mergeStateStatus": "CLEAN",
+                        "mergeable": "MERGEABLE",
+                        "statusCheckRollup": [
+                            {"name": "Required Gate 1", "conclusion": "SUCCESS"},
+                            {"name": "Required Gate 2", "status": "IN_PROGRESS"},
+                            {"name": "Optional Advisory Check", "conclusion": "FAILURE"},
+                        ],
+                        "body": "Refs #194",
+                    }
+                return {
+                    "headRefOid": "d050head",
+                    "mergeStateStatus": "CLEAN",
+                    "mergeable": "MERGEABLE",
+                    "statusCheckRollup": [
+                        {"name": "Required Gate 1", "conclusion": "SUCCESS"},
+                        {"name": "Required Gate 2", "conclusion": "SUCCESS"},
+                        {"name": "Optional Advisory Check", "conclusion": "FAILURE"},
+                    ],
+                    "body": "Refs #194",
+                }
+            pr_state = mock_pr_state_progressive
+            sim_time_d050 = 1000.0
+            res_progressive = wait_for_ci(194, required_checks=test_required, timeout=40)
+            assert res_progressive is True, "AC1 failed: wait_for_ci did not wait for pending required check with failed unrequired check"
+            assert poll_phase == 2, f"Expected 2 polls, got {poll_phase}"
+            pr_state = mock_pr_state_d050
+
+            print("test_d050_ac1_unrequired_check_failure_passes: OK")
+
+            # AC2: A required check failed -> reports checks as failed (False), as before
+            d050_checks = [
+                {"name": "Required Gate 1", "conclusion": "SUCCESS"},
+                {"name": "Required Gate 2", "conclusion": "FAILURE"},
+                {"name": "Optional Advisory Check", "conclusion": "SUCCESS"},
+            ]
+            sim_time_d050 = 1000.0
+            res_ac2 = wait_for_ci(194, required_checks=test_required, timeout=40)
+            assert res_ac2 is False, f"AC2 failed: wait_for_ci returned {res_ac2} instead of False when required check failed"
+
+            # AC2 variant: Other failure states for required check
+            for failure_state in ("CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED"):
+                d050_checks = [
+                    {"name": "Required Gate 1", "conclusion": failure_state},
+                    {"name": "Required Gate 2", "conclusion": "SUCCESS"},
+                ]
+                sim_time_d050 = 1000.0
+                res_ac2_state = wait_for_ci(194, required_checks=test_required, timeout=40)
+                assert res_ac2_state is False, f"AC2 failed for required check in state {failure_state}"
+
+            # AC2 variant: Required check failed and unrequired check also failed
+            d050_checks = [
+                {"name": "Required Gate 1", "conclusion": "FAILURE"},
+                {"name": "Required Gate 2", "conclusion": "SUCCESS"},
+                {"name": "Optional Advisory Check", "conclusion": "FAILURE"},
+            ]
+            sim_time_d050 = 1000.0
+            res_ac2_both = wait_for_ci(194, required_checks=test_required, timeout=40)
+            assert res_ac2_both is False, "AC2 failed when both required and unrequired check failed"
+
+            # AC2 variant: Context-based check reporting
+            d050_checks = [
+                {"context": "Required Gate 1", "state": "SUCCESS"},
+                {"context": "Required Gate 2", "state": "FAILURE"},
+            ]
+            sim_time_d050 = 1000.0
+            res_ac2_context = wait_for_ci(194, required_checks=test_required, timeout=40)
+            assert res_ac2_context is False, "AC2 failed for context-based status failure"
+
+            print("test_d050_ac2_required_check_failure_fails: OK")
+
+        finally:
+            pr_state = old_pr_state_d050
+            time.sleep = old_time_sleep_d050
+            time.time = old_time_time_d050
 
     print("OK: all self-tests passed.")
     return 0
