@@ -280,6 +280,35 @@ def update_evidence_commit_markers(paths, change_commit, issue, env=None, root=R
     return updated
 
 
+def clean_author_summary(summary: str, issue: int) -> str:
+    """Remove from the summary every line that is only 'Refs #<issue>' and every line that starts with 'Role:' (D-049)."""
+    issue_pattern = re.compile(rf"^\s*Refs\s+#{issue}\s*$", re.IGNORECASE)
+    cleaned_lines = []
+    for line in summary.splitlines():
+        if issue_pattern.match(line):
+            continue
+        if line.strip().startswith("Role:"):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def build_pr_body(role: str, issue: int, summary: str) -> str:
+    """Build the pull-request description with clean summary, single Refs line, and single Role line (D-049)."""
+    clean = clean_author_summary(summary, issue)
+    role_name = "DevOps" if role == "devops" else "Developer"
+    return (f"Refs #{issue}\n\n{clean}\n\nThe branch, commit, and this pull request were made by the "
+            f"pipeline from the author's working tree, after checking the changed paths against the role.\n\n"
+            f"Role: {role_name} · Model: {AUTHOR_MODEL}")
+
+
+def build_round_comment(role: str, issue: int, summary: str) -> str:
+    """Build the round comment with clean summary and single Role line (D-049)."""
+    clean = clean_author_summary(summary, issue)
+    role_name = "DevOps" if role == "devops" else "Developer"
+    return f"{clean}\n\nRole: {role_name} · Model: {AUTHOR_MODEL}"
+
+
 def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
     """Commit and push the author's changes as the role; open the pull request if there is none.
 
@@ -313,11 +342,9 @@ def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
          "push", "-q", "-u", "origin", branch], env=dict(env, NEXTOOMIO_PUSH_TOKEN=token(role, cwd=cwd)), cwd=cwd)
     if number:
         gh(["pr", "comment", str(number), "--body",
-            f"{summary}\n\nRole: {role.capitalize()} · Model: {AUTHOR_MODEL}"], role=role)
+            build_round_comment(role, issue, summary)], role=role)
         return number
-    body = (f"Refs #{issue}\n\n{summary}\n\nThe branch, commit, and this pull request were made by the "
-            f"pipeline from the author's working tree, after checking the changed paths against the role.\n\n"
-            f"Role: {'DevOps' if role == 'devops' else 'Developer'} · Model: {AUTHOR_MODEL}")
+    body = build_pr_body(role, issue, summary)
     url = gh(["pr", "create", "--base", "main", "--head", branch, "--title", pr_title, "--body", body],
              role=role).strip().splitlines()[-1]
     return int(url.rstrip("/").rsplit("/", 1)[-1])
@@ -1454,6 +1481,113 @@ def run_self_tests():
             time.sleep = old_time_sleep_d048
             time.time = old_time_time_d048
             REQUIRED_CHECKS = old_required_checks_d048
+
+        # Test 12: AC1 and AC2 verification of deduplication of issue refs and role line in PR descriptions (D-049)
+        test_issue = 190
+
+        # AC1: Author summary with Refs #<issue> twice and a Role: line
+        raw_summary_ac1 = (
+            f"Refs #{test_issue}\n\n"
+            "Summary paragraph 1 explaining the change.\n\n"
+            "Summary paragraph 2 with details:\n"
+            "- Item A\n"
+            "- Item B\n\n"
+            f"Refs #{test_issue}\n\n"
+            f"Role: DevOps · Model: gemini-3.8-flash-high (Antigravity)"
+        )
+
+        body_ac1_devops = build_pr_body("devops", test_issue, raw_summary_ac1)
+        # AC1 post-conditions:
+        # - Contains Refs #<issue> exactly once
+        assert body_ac1_devops.count(f"Refs #{test_issue}") == 1, (
+            f"Expected Refs #{test_issue} exactly once, found {body_ac1_devops.count(f'Refs #{test_issue}')} times:\n{body_ac1_devops}"
+        )
+        assert body_ac1_devops.startswith(f"Refs #{test_issue}\n\n"), "PR body must start with Refs #<issue>"
+        # - Contains exactly one line starting with Role:
+        role_lines_ac1 = [line for line in body_ac1_devops.splitlines() if line.lstrip().startswith("Role:")]
+        assert len(role_lines_ac1) == 1, (
+            f"Expected exactly 1 line starting with Role:, found {len(role_lines_ac1)}: {role_lines_ac1}"
+        )
+        assert role_lines_ac1[0] == f"Role: DevOps · Model: {AUTHOR_MODEL}"
+        assert body_ac1_devops.endswith(f"Role: DevOps · Model: {AUTHOR_MODEL}")
+        # - Body content is preserved
+        assert "Summary paragraph 1 explaining the change." in body_ac1_devops
+        assert "- Item A" in body_ac1_devops
+
+        # Also verify developer role
+        body_ac1_dev = build_pr_body("developer", test_issue, raw_summary_ac1)
+        assert body_ac1_dev.count(f"Refs #{test_issue}") == 1
+        dev_role_lines = [line for line in body_ac1_dev.splitlines() if line.lstrip().startswith("Role:")]
+        assert len(dev_role_lines) == 1
+        assert dev_role_lines[0] == f"Role: Developer · Model: {AUTHOR_MODEL}"
+
+        print("test_d049_ac1_pr_description_single_refs_and_role: OK")
+
+        # AC2: Author summary with neither Refs #<issue> nor Role: line
+        raw_summary_ac2 = (
+            "Clean author summary without refs or role.\n\n"
+            "Paragraph two with bullet points:\n"
+            "- Step 1\n"
+            "- Step 2\n\n"
+            "Did not check:\n"
+            "Nothing."
+        )
+
+        # Before the change, the body was constructed as:
+        expected_body_before = (
+            f"Refs #{test_issue}\n\n{raw_summary_ac2}\n\n"
+            "The branch, commit, and this pull request were made by the "
+            "pipeline from the author's working tree, after checking the changed paths against the role.\n\n"
+            f"Role: DevOps · Model: {AUTHOR_MODEL}"
+        )
+
+        body_ac2 = build_pr_body("devops", test_issue, raw_summary_ac2)
+        assert body_ac2 == expected_body_before, f"AC2 failed: description differs from before the change:\n{body_ac2}"
+
+        # Single-line summary with neither
+        single_summary = "Single line summary."
+        expected_single = (
+            f"Refs #{test_issue}\n\n{single_summary}\n\n"
+            "The branch, commit, and this pull request were made by the "
+            "pipeline from the author's working tree, after checking the changed paths against the role.\n\n"
+            f"Role: Developer · Model: {AUTHOR_MODEL}"
+        )
+        assert build_pr_body("developer", test_issue, single_summary) == expected_single
+
+        # Summary mentioning another issue is preserved
+        other_summary = "Refs #999\n\nFix related to other issue."
+        expected_other = (
+            f"Refs #{test_issue}\n\n{other_summary}\n\n"
+            "The branch, commit, and this pull request were made by the "
+            "pipeline from the author's working tree, after checking the changed paths against the role.\n\n"
+            f"Role: DevOps · Model: {AUTHOR_MODEL}"
+        )
+        assert build_pr_body("devops", test_issue, other_summary) == expected_other
+
+        # Summary mentioning this issue in prose is preserved
+        prose_summary = f"This commit resolves the issue described in Refs #{test_issue}."
+        expected_prose = (
+            f"Refs #{test_issue}\n\n{prose_summary}\n\n"
+            "The branch, commit, and this pull request were made by the "
+            "pipeline from the author's working tree, after checking the changed paths against the role.\n\n"
+            f"Role: DevOps · Model: {AUTHOR_MODEL}"
+        )
+        assert build_pr_body("devops", test_issue, prose_summary) == expected_prose
+
+        print("test_d049_ac2_pr_description_unchanged_when_neither_present: OK")
+
+        # Round comment check (clean summary and single Role: line)
+        round_comment_ac1 = build_round_comment("devops", test_issue, raw_summary_ac1)
+        assert f"Refs #{test_issue}" not in round_comment_ac1
+        comment_roles = [line for line in round_comment_ac1.splitlines() if line.lstrip().startswith("Role:")]
+        assert len(comment_roles) == 1
+        assert comment_roles[0] == f"Role: DevOps · Model: {AUTHOR_MODEL}"
+        assert round_comment_ac1.endswith(f"Role: DevOps · Model: {AUTHOR_MODEL}")
+
+        round_comment_ac2 = build_round_comment("developer", test_issue, raw_summary_ac2)
+        assert round_comment_ac2 == f"{raw_summary_ac2}\n\nRole: Developer · Model: {AUTHOR_MODEL}"
+
+        print("test_d049_round_comment_clean_and_single_role: OK")
 
     print("OK: all self-tests passed.")
     return 0
