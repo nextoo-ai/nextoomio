@@ -14,7 +14,7 @@ repos:
 
   bitbake:
     url: https://git.openembedded.org/bitbake
-    branch: 2.18
+    branch: "2.18"
     commit: 51fd94a67fa17650a9ff623492005972bbc7d26f
     layers:
       bitbake: disabled

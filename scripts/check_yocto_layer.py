@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -29,6 +30,17 @@ def main() -> int:
     for path in required_files:
         if not path.is_file():
             errors.append(f"Missing required Yocto/kas file: {path.relative_to(ROOT)}")
+
+    kas_dir = ROOT / "kas"
+    if kas_dir.is_dir():
+        for kas_file in sorted(kas_dir.glob("*.yml")):
+            for line_idx, line in enumerate(kas_file.read_text(encoding="utf-8").splitlines(), start=1):
+                m = re.match(r"^\s*branch:\s*([0-9]+(?:\.[0-9]+)*)\s*(?:#.*)?$", line)
+                if m:
+                    errors.append(
+                        f"{kas_file.relative_to(ROOT)} line {line_idx}: branch value '{m.group(1)}' "
+                        f"must be quoted as a string to avoid YAML float parsing"
+                    )
 
     profile_path = ROOT / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
     if profile_path.is_file():
