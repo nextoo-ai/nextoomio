@@ -13,6 +13,6 @@ part /boot        --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --la
 part              --ondisk mmcblk0 --fstype=vfat --label boot_b --align 4096 --fixed-size 256M
 part /            --source rootfs            --ondisk mmcblk0 --fstype=ext4 --label root_a --align 4096 --fixed-size 3072M
 part              --ondisk mmcblk0 --fstype=ext4 --label root_b --align 4096 --fixed-size 3072M
-part /data        --ondisk mmcblk0 --fstype=ext4 --label data   --align 4096 --fixed-size 1536M
+part /data        --ondisk mmcblk0 --fstype=ext4 --label data   --align 4096 --size 1536M
 
 bootloader --ptable msdos

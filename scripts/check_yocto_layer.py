@@ -24,6 +24,11 @@ def main() -> int:
         ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
         ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
         ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
+        ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb",
+        ROOT / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
+        ROOT / "meta-nextoomio/recipes-core/base-files/files/fstab",
+        ROOT / "meta-nextoomio/recipes-core/systemd/systemd-conf_%.bbappend",
+        ROOT / "meta-nextoomio/recipes-core/systemd/files/10-nextoomio-journald.conf",
         ROOT / "kas/base.yml",
         ROOT / "kas/rpi4-64.yml",
         ROOT / "kas/ci-hosted.yml",
@@ -66,6 +71,21 @@ def main() -> int:
         for label in ("select", "boot_a", "boot_b", "root_a", "root_b", "data"):
             if f"--label {label}" not in wks_text:
                 errors.append(f"Wic layout missing partition label '{label}'")
+        if re.search(r"part\s+/data\s+.*--fixed-size", wks_text):
+            errors.append("Wic layout /data partition must not use --fixed-size (D-006: grown on first boot)")
+
+    image_path = ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+    if image_path.is_file():
+        image_text = image_path.read_text(encoding="utf-8")
+        if "nextoomio-data" not in image_text:
+            errors.append("nextoomio-image.bb must install nextoomio-data package")
+
+    data_recipe_path = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb"
+    if data_recipe_path.is_file():
+        data_recipe_text = data_recipe_path.read_text(encoding="utf-8")
+        for unit in ("nextoomio-data-grow.service", "nextoomio-data-check.service", "nextoomio-data-init.service"):
+            if unit not in data_recipe_text:
+                errors.append(f"nextoomio-data_0.0.1.bb missing systemd unit registration: {unit}")
 
     if errors:
         for err in errors:
