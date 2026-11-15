@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.11 (autonomous operation)**  
+Document version: **0.12 (autonomous operation)**  
 Date: **2026-11-15**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -24,6 +24,8 @@ Version 0.9 records the pipeline run on D-038 and the correction to the Reviewer
 Version 0.10 records the pipeline runs on D-039 and D-040, the defects triaged from them, and where defect evidence is recorded (sections 9.3 and 11).
 
 Version 0.11 records the pipeline runs on D-041 to D-050 and what remains for the pipeline (sections 9.3 and 11).
+
+Version 0.12 records who closes a defect that is assigned to a story (section 5, step 5): the first product story, P0-F1.1 (#8), met every criterion and still could not close, because its defects were open and no rule named who closes them.
 
 ## 1. Goal
 
@@ -132,7 +134,7 @@ SPECIFICATION ─► Architect ─► story (state:ready) ─► pipeline
 2. The pipeline enables auto-merge on the pull request as the author's App. GitHub merges it when the rule set on `main` is satisfied, not before.
 3. CI runs; the pipeline waits until all required checks have reported. The Reviewer reviews the head commit and states `Completes-Story: yes` or `Completes-Story: no` in the review; the line refers to the issue the pull request was made for, including a defect worked on directly. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
 4. After the merge, if the review said `Completes-Story: yes`, the pipeline sets `state:implemented` and starts QM. If it said `no`, the pipeline stops and leaves the issue ready for the next pull request, which a further run delivers.
-5. QM ends its verdict with `QM-Verdict: PASS` or `QM-Verdict: FAIL`. On PASS the pipeline ticks the acceptance criteria and closes the issue as completed. Otherwise the issue stays open with the verdict, for the Architect.
+5. QM ends its verdict with `QM-Verdict: PASS` or `QM-Verdict: FAIL`. On PASS the pipeline ticks the acceptance criteria and closes the issue as completed. Otherwise the issue stays open with the verdict, for the Architect. Where the only obstacle is an open defect assigned to the story, and the verdict states that the criteria are met and the evidence demonstrates the defect's fix, the Architect closes that defect as completed with a link to the verdict and starts QM again ([backlog conventions](../backlog/README.md), section "Status").
 6. Any role that finds a problem outside its task reports a finding; the Architect files the defect.
 
 The pipeline makes no judgment of its own: it starts roles and acts on the review state, the CI result, the merge state, and the verdict line that GitHub and the roles report. Its log is kept outside the repository.
