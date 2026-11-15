@@ -1,5 +1,5 @@
 SUMMARY = "nextoomio read-only release image (v0.0.1 baseline)"
-DESCRIPTION = "Production-style read-only image with PipeWire, MPD, SWUpdate, NetworkManager, Avahi, nftables, and nextoomio daemons. Excludes SSH server and debug tooling per ARCHITECTURE.md section 3.7."
+DESCRIPTION = "Production-style read-only image with PipeWire, MPD, SWUpdate, NetworkManager, Avahi, nftables, and nx-sysd privileged helper daemon. Excludes SSH server and debug tooling per ARCHITECTURE.md section 3.7."
 LICENSE = "MIT"
 
 inherit core-image
@@ -28,4 +28,5 @@ IMAGE_INSTALL:append = " \
     networkmanager \
     avahi-daemon \
     nftables \
+    nx-sysd \
 "

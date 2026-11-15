@@ -561,6 +561,7 @@ CTL-03, and full delivery of SYS-01, SYS-02, SYS-06, CTL-01, CTL-02, CTL-04, I18
 | meta-nextoomio layer metadata | v0.0.1 | MIT | build |
 | openembedded-core, meta-yocto, meta-raspberrypi, meta-openembedded, meta-swupdate | v0.0.1 | MIT (metadata) | build |
 | BitBake | v0.0.1 | GPL-2.0-only | build |
+| Rust toolchain (rustc, cargo) 1.94.1 | v0.0.1 | Apache-2.0 OR MIT | build |
 | Raspberry Pi boot firmware | v0.0.1 | Proprietary, redistributable | binary |
 | Linux kernel (linux-raspberrypi) | v0.0.1 | GPL-2.0-only WITH Linux-syscall-note | process |
 | glibc | v0.0.1 | LGPL-2.1-or-later | dynamic |

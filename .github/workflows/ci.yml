@@ -43,9 +43,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (pinned to 1.94.1, matching OE-core wrynose)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: '1.94.1'
           components: rustfmt, clippy
 
       - name: Cache Cargo registry and build
@@ -59,10 +60,10 @@ jobs:
         run: cargo fmt --manifest-path core/Cargo.toml --all -- --check
 
       - name: Run Clippy lints
-        run: cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path core/Cargo.toml --all-targets -- -D warnings
 
       - name: Run unit tests (session manager, volume, mute, update state machine)
-        run: cargo test --manifest-path core/Cargo.toml --all-targets
+        run: cargo test --locked --manifest-path core/Cargo.toml --all-targets
 
       - name: Check nx-matter workspace
         run: cargo check --manifest-path matter/Cargo.toml --all-targets
@@ -71,6 +72,7 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans sources
+          arguments: --locked
           manifest-path: core/Cargo.toml
 
   webui:

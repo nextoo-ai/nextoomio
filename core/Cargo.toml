@@ -12,7 +12,7 @@ version = "0.0.1-dev"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/nextoo-ai/nextoomio"
-rust-version = "1.78"
+rust-version = "1.94.1"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

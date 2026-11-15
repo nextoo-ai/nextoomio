@@ -18,11 +18,11 @@ check-i18n:
 	node scripts/check_i18n.mjs
 
 check-core:
-	cargo check --manifest-path core/Cargo.toml --all-targets
-	cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings
+	cargo check --locked --manifest-path core/Cargo.toml --all-targets
+	cargo clippy --locked --manifest-path core/Cargo.toml --all-targets -- -D warnings
 
 test-core:
-	cargo test --manifest-path core/Cargo.toml
+	cargo test --locked --manifest-path core/Cargo.toml
 
 build-webui:
 	npm --prefix webui run build
