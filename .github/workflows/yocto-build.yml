@@ -33,17 +33,21 @@ on:
       - 'meta-nextoomio/**'
       - '.github/workflows/yocto-build.yml'
 
+concurrency:
+  group: yocto-build-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   yocto:
-    name: Yocto (${{ inputs.mode || 'parse-only' }} on ${{ inputs.runner || 'ubuntu-24.04' }})
+    name: Yocto (${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')) && 'full-image' || 'parse-only' }} on ${{ inputs.runner || 'ubuntu-24.04' }})
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 360
     steps:
       - name: Maximize runner disk space (GitHub-hosted full-image builds only)
-        if: (inputs.runner || 'ubuntu-24.04') != 'self-hosted' && inputs.mode == 'full-image'
+        if: (inputs.runner || 'ubuntu-24.04') != 'self-hosted' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image'))
         run: |
           df -h
           sudo rm -rf /usr/share/dotnet \
@@ -78,7 +82,7 @@ jobs:
             yocto-${{ inputs.runner || 'ubuntu-24.04' }}-wrynose-
 
       - name: Run BitBake layer & recipe parse verification (parse-only)
-        if: (inputs.mode || 'parse-only') == 'parse-only'
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.mode || 'parse-only') == 'parse-only')
         run: |
           docker run --rm \
             --user=root \
@@ -94,7 +98,7 @@ jobs:
             kas shell /work/kas/ci-hosted.yml -c "bitbake-layers show-layers && bitbake -p nextoomio-image"
 
       - name: Build full nextoomio Yocto image (full-image)
-        if: inputs.mode == 'full-image'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')
         run: |
           docker run --rm \
             --user=root \
@@ -110,13 +114,13 @@ jobs:
             kas build /work/kas/ci-hosted.yml
 
       - name: Upload Yocto image, SPDX SBOM, and license manifest
-        if: inputs.mode == 'full-image'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')
         uses: actions/upload-artifact@v4
         with:
           name: nextoomio-rpi4-64-${{ github.sha }}
           path: |
-            build/build/tmp*/deploy/images/raspberrypi4-64/*.wic.bz2
-            build/build/tmp*/deploy/images/raspberrypi4-64/*.wic.bmap
-            build/build/tmp*/deploy/images/raspberrypi4-64/*.spdx.tar.zst
-            build/build/tmp*/deploy/licenses/**/license.manifest
+            build/**/deploy/images/raspberrypi4-64/*.wic.bz2
+            build/**/deploy/images/raspberrypi4-64/*.wic.bmap
+            build/**/deploy/images/raspberrypi4-64/*.spdx.tar.zst
+            build/**/deploy/licenses/**/license.manifest
           retention-days: 14
