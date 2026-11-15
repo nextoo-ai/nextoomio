@@ -12,7 +12,7 @@ Features, stories, and defects are tracked as [GitHub issues](https://github.com
 | Defects | [Label `type:defect`](https://github.com/nextoo-ai/nextoomio/issues?q=is%3Aissue+label%3Atype%3Adefect), with `severity:*` and `area:*` labels |
 | v0.0.1 features and stories | [Milestone "v0.0.1"](https://github.com/nextoo-ai/nextoomio/milestone/2). The update stories (`P1-F9`) are revised if spike `P0-F4.1` selects a different boot mechanism |
 | Later phases | Milestones `v0.0.2` to `v0.0.5`; their stories are written when the v0.0.1 spikes (`P1-F11`) have produced the results they depend on |
-| Verification evidence | `docs/evidence/<phase>/<story-id>.md` in the repository, linked from the issue |
+| Verification evidence | `docs/evidence/<phase>/<story-id>.md` in the repository, linked from the issue; for a defect, `docs/evidence/<phase>/D-<nnn>.md`, in the phase in which it was fixed |
 
 ## Identifiers
 
@@ -77,7 +77,7 @@ A story gets `state:implemented` when the pull request that the review states co
 A story is closed as completed when, in addition:
 
 6. Every acceptance criterion has been demonstrated on the hardware named in the story and ticked in the issue.
-7. Evidence is recorded under `docs/evidence/<phase>/<story-id>.md`: date, image version and commit, hardware model and revision, the commands or procedure used, and the observed result. A missed target is recorded as missed.
+7. Evidence is recorded under `docs/evidence/<phase>/<story-id>.md`, or `docs/evidence/<phase>/D-<nnn>.md` for a defect: date, image version and commit, hardware model and revision, the commands or procedure used, and the observed result. A missed target is recorded as missed.
 8. Anything that needed physical access to the device is stated explicitly.
 
 ## Bench hardware for Phase 0
