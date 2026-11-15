@@ -29,6 +29,17 @@ def main() -> int:
         ROOT / "kas/base.yml",
         ROOT / "kas/rpi4-64.yml",
         ROOT / "kas/ci-hosted.yml",
+        ROOT / "meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend",
+        ROOT / "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf",
+        ROOT / "meta-nextoomio/recipes-connectivity/nftables/files/00-default.nft",
+        ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/networkmanager_%.bbappend",
+        ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection",
+        ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset",
+        ROOT / "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend",
+        ROOT / "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
+        ROOT / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
+        ROOT / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
+        ROOT / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
     ]
 
     for path in required_files:
@@ -228,6 +239,46 @@ def main() -> int:
             elif "--label data" in line_str:
                 if "--fixed-size 1536M" not in line_str:
                     errors.append("Wic data partition must be fixed size 1536M initial size")
+
+    # P0-F2.4: Validate network baseline, firewall rules, and hostname configuration
+    if distro_conf.is_file():
+        conf_text = distro_conf.read_text(encoding="utf-8")
+        if not re.search(r'^\s*hostname\s*=\s*["\']nextoomio["\']', conf_text, re.MULTILINE):
+            errors.append("meta-nextoomio/conf/distro/nextoomio.conf must set hostname = 'nextoomio' (AC2)")
+        if not re.search(r'^\s*VIRTUAL-RUNTIME_net_manager\s*=\s*["\']networkmanager["\']', conf_text, re.MULTILINE):
+            errors.append("meta-nextoomio/conf/distro/nextoomio.conf must set VIRTUAL-RUNTIME_net_manager = 'networkmanager'")
+        if "timesyncd" not in conf_text:
+            errors.append("meta-nextoomio/conf/distro/nextoomio.conf must enable systemd timesyncd (AD-21, AC5)")
+
+    nft_conf = ROOT / "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf"
+    if nft_conf.is_file():
+        nft_text = nft_conf.read_text(encoding="utf-8")
+        if not re.search(r"type\s+filter\s+hook\s+input\s+priority\s+filter\s*;\s*policy\s+drop\s*;", nft_text):
+            errors.append("nftables.conf must configure input chain with 'policy drop;' for default-deny inbound firewall (AC3)")
+        if "udp dport 5353 accept" not in nft_text:
+            errors.append("nftables.conf must allow mDNS (udp dport 5353 accept) for name resolution (AC2)")
+        if 'include "/etc/nftables.d/*.nft"' not in nft_text:
+            errors.append("nftables.conf must include '/etc/nftables.d/*.nft' for modular recipe extensions (P0-F2.4)")
+
+    nm_conn = ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection"
+    if nm_conn.is_file():
+        conn_text = nm_conn.read_text(encoding="utf-8")
+        if "type=ethernet" not in conn_text:
+            errors.append("10-default-wired.nmconnection must configure type=ethernet")
+        if "method=auto" not in conn_text:
+            errors.append("10-default-wired.nmconnection must configure method=auto for DHCP (AC1)")
+
+    nm_preset = ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset"
+    if nm_preset.is_file():
+        preset_text = nm_preset.read_text(encoding="utf-8")
+        if "disable NetworkManager-wait-online.service" not in preset_text:
+            errors.append("NetworkManager preset must disable NetworkManager-wait-online.service (AD-21, AC4)")
+
+    ts_preset = ROOT / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset"
+    if ts_preset.is_file():
+        ts_text = ts_preset.read_text(encoding="utf-8")
+        if "disable systemd-time-wait-sync.service" not in ts_text:
+            errors.append("systemd preset must disable systemd-time-wait-sync.service (AD-21, AC5)")
 
     if errors:
         for err in errors:
