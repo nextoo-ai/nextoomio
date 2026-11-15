@@ -5,7 +5,7 @@ Template for verification evidence (docs/evidence/TEMPLATE.md).
 See docs/backlog/README.md (Definition of Done, items 6–8) and docs/engineering/code-quality.md (CQ-D8).
 
 Every story or defect closed as completed must have a corresponding evidence file recorded at
-docs/evidence/<phase>/<story-id>.md (e.g. docs/evidence/p0/P0-F8.5.md) or docs/evidence/defects/D-<nnn>.md.
+docs/evidence/<phase>/<story-id>.md (e.g. docs/evidence/p0/P0-F8.5.md) for stories or docs/evidence/<phase>/D-<nnn>.md for defects.
 
 Rules:
 - Never record secrets, private keys, credentials, tokens, passwords, or addresses of private networks.
