@@ -1,8 +1,6 @@
 mod identity;
 
-use identity::{
-    get_or_create_device_id, query_device_identity, HardwareIdentity, VersionInfo,
-};
+use identity::{get_or_create_device_id, query_device_identity, HardwareIdentity, VersionInfo};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

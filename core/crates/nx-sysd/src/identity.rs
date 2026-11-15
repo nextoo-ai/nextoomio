@@ -120,7 +120,11 @@ pub fn load_release_info() -> ReleaseInfo {
         }
     }
 
-    for path in &["/etc/nextoomio-release", "/etc/os-release", "/usr/lib/os-release"] {
+    for path in &[
+        "/etc/nextoomio-release",
+        "/etc/os-release",
+        "/usr/lib/os-release",
+    ] {
         if let Ok(content) = fs::read_to_string(path) {
             return parse_release_file(&content);
         }
@@ -225,7 +229,10 @@ pub fn detect_board_model(release_override: Option<&str>) -> String {
         }
     }
 
-    for path in &["/proc/device-tree/model", "/sys/firmware/devicetree/base/model"] {
+    for path in &[
+        "/proc/device-tree/model",
+        "/sys/firmware/devicetree/base/model",
+    ] {
         if let Ok(bytes) = fs::read(path) {
             let s = String::from_utf8_lossy(&bytes);
             let cleaned = s.trim_matches('\0').trim();
@@ -342,7 +349,10 @@ NEXTOOMIO_HARDWARE_COMPAT="raspberrypi4-64"
 "#;
         let release = parse_release_file(content);
         assert_eq!(release.image_version, "0.0.1-dev");
-        assert_eq!(release.source_commit, "80903cb41d775175a82c3470a402ef9a4b2de01f");
+        assert_eq!(
+            release.source_commit,
+            "80903cb41d775175a82c3470a402ef9a4b2de01f"
+        );
         assert_eq!(release.build_id, "20261116001200");
         assert_eq!(release.hardware_compatibility, "raspberrypi4-64");
     }
@@ -357,7 +367,10 @@ HARDWARE_COMPATIBILITY="raspberrypi4-64"
 "#;
         let release = parse_release_file(content);
         assert_eq!(release.image_version, "0.0.1-dev");
-        assert_eq!(release.source_commit, "cb616e6b8f4ff55142bda9be103942613611e00f");
+        assert_eq!(
+            release.source_commit,
+            "cb616e6b8f4ff55142bda9be103942613611e00f"
+        );
         assert_eq!(release.build_id, "20261116120000");
         assert_eq!(release.hardware_compatibility, "raspberrypi4-64");
     }
@@ -365,19 +378,27 @@ HARDWARE_COMPATIBILITY="raspberrypi4-64"
     #[test]
     fn test_parse_slot_from_cmdline() {
         assert_eq!(
-            parse_slot_from_cmdline("coherent_pool=1M 8250.nr_uarts=1 root=PARTUUID=4e58544d-05 rootwait ro"),
+            parse_slot_from_cmdline(
+                "coherent_pool=1M 8250.nr_uarts=1 root=PARTUUID=4e58544d-05 rootwait ro"
+            ),
             Some("a".to_string())
         );
         assert_eq!(
-            parse_slot_from_cmdline("coherent_pool=1M 8250.nr_uarts=1 root=/dev/mmcblk0p5 rootwait ro"),
+            parse_slot_from_cmdline(
+                "coherent_pool=1M 8250.nr_uarts=1 root=/dev/mmcblk0p5 rootwait ro"
+            ),
             Some("a".to_string())
         );
         assert_eq!(
-            parse_slot_from_cmdline("coherent_pool=1M 8250.nr_uarts=1 root=PARTUUID=4e58544d-06 rootwait ro"),
+            parse_slot_from_cmdline(
+                "coherent_pool=1M 8250.nr_uarts=1 root=PARTUUID=4e58544d-06 rootwait ro"
+            ),
             Some("b".to_string())
         );
         assert_eq!(
-            parse_slot_from_cmdline("coherent_pool=1M 8250.nr_uarts=1 root=/dev/mmcblk0p6 rootwait ro"),
+            parse_slot_from_cmdline(
+                "coherent_pool=1M 8250.nr_uarts=1 root=/dev/mmcblk0p6 rootwait ro"
+            ),
             Some("b".to_string())
         );
         assert_eq!(parse_slot_from_cmdline("console=serial0,115200"), None);
@@ -465,7 +486,10 @@ devtmpfs /dev devtmpfs rw,relatime 0 0
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(parsed["image_version"], "0.0.1-dev");
-        assert_eq!(parsed["source_commit"], "80903cb41d775175a82c3470a402ef9a4b2de01f");
+        assert_eq!(
+            parsed["source_commit"],
+            "80903cb41d775175a82c3470a402ef9a4b2de01f"
+        );
         assert_eq!(parsed["build_id"], "20261116001200");
         assert_eq!(parsed["running_slot"], "a");
         assert_eq!(parsed["board_model"], "Raspberry Pi 4 Model B Rev 1.4");
