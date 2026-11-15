@@ -350,8 +350,15 @@ def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
     return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
+# Upper bound for PR search queries (D-052). gh pr list defaults to 30; an explicit
+# high limit ensures that pull requests merely mentioning the issue do not push
+# the target pull request past the default limit.
+PR_SEARCH_LIMIT = 300
+
+
 def find_pr(issue, role):
     prs = gh_json(["pr", "list", "--state", "open", "--search", f"Refs #{issue}",
+                   "--limit", str(PR_SEARCH_LIMIT),
                    "--json", "number,body,author,headRefName,headRefOid"])
     pattern = re.compile(rf"\bRefs\s+#{issue}\b")
     for pr in prs:
@@ -362,6 +369,7 @@ def find_pr(issue, role):
 
 def find_merged_pr(issue, role):
     prs = gh_json(["pr", "list", "--state", "merged", "--search", f"Refs #{issue}",
+                   "--limit", str(PR_SEARCH_LIMIT),
                    "--json", "number,body,author,headRefName,headRefOid"])
     pattern = re.compile(rf"\bRefs\s+#{issue}\b")
     for pr in prs:
@@ -2182,62 +2190,98 @@ sys.exit(0)
                 state = "open"
                 if "--state" in args:
                     state = args[args.index("--state") + 1]
-                return json.dumps(mock_responses.get(state, []))
+                limit = 30
+                if "--limit" in args:
+                    limit = int(args[args.index("--limit") + 1])
+                return json.dumps(mock_responses.get(state, [])[:limit])
             return "[]"
 
         try:
             gh = mock_gh_d052
 
-            # --- AC1: find_merged_pr and find_pr query GitHub with --search and no --limit ---
+            # --- AC1: find_merged_pr and find_pr query GitHub with --search and an explicit high --limit ---
+            # Verified with >30 pull requests where matching PR is at the end (index 34)
             recorded_calls.clear()
-            mock_responses["merged"] = [
+            mock_merged_noise = [
                 {
-                    "number": 100,
-                    "author": {"login": "nextoomio-devops[bot]"},
-                    "body": "Refs #77\nMerged PR body",
-                    "headRefName": "ops/D-052-merged",
-                    "headRefOid": "abc1234",
+                    "number": 1000 + i,
+                    "author": {"login": "unrelated-user"},
+                    "body": f"Noise PR mentioning Refs #77 in a comment {i}",
+                    "headRefName": f"noise-branch-{i}",
+                    "headRefOid": f"noise_oid_{i}",
                 }
+                for i in range(34)
             ]
+            mock_merged_target = {
+                "number": 100,
+                "author": {"login": "nextoomio-devops[bot]"},
+                "body": "Refs #77\nMerged PR body",
+                "headRefName": "ops/D-052-merged",
+                "headRefOid": "abc1234",
+            }
+            mock_responses["merged"] = mock_merged_noise + [mock_merged_target]
+            assert len(mock_responses["merged"]) == 35
+
             res_merged = find_merged_pr(77, "devops")
             assert res_merged is not None and res_merged["number"] == 100, \
-                f"AC1 failed: find_merged_pr did not return matching PR: {res_merged}"
+                f"AC1 failed: find_merged_pr did not return matching PR (match past default 30 items): {res_merged}"
             assert len(recorded_calls) == 1, f"AC1 failed: expected 1 gh call, got {len(recorded_calls)}"
             args_merged = recorded_calls[0]
             assert "--search" in args_merged, f"AC1 failed: --search flag missing in args: {args_merged}"
             search_idx = args_merged.index("--search")
             assert args_merged[search_idx + 1] == "Refs #77", \
                 f"AC1 failed: unexpected --search value: {args_merged[search_idx + 1]}"
-            assert "--limit" not in args_merged, \
-                f"AC1 failed: --limit present in args (must not depend on fixed number of recent PRs): {args_merged}"
+            assert "--limit" in args_merged, \
+                f"AC1 failed: --limit missing in args (must pass explicit high limit): {args_merged}"
+            limit_val_merged = int(args_merged[args_merged.index("--limit") + 1])
+            assert limit_val_merged >= len(mock_responses["merged"]), \
+                f"AC1 failed: limit ({limit_val_merged}) is smaller than number of results needed ({len(mock_responses['merged'])})"
+            assert limit_val_merged >= PR_SEARCH_LIMIT, \
+                f"AC1 failed: limit ({limit_val_merged}) is less than PR_SEARCH_LIMIT ({PR_SEARCH_LIMIT})"
             assert "--state" in args_merged and args_merged[args_merged.index("--state") + 1] == "merged", \
                 f"AC1 failed: expected --state merged: {args_merged}"
 
             recorded_calls.clear()
-            mock_responses["open"] = [
+            mock_open_noise = [
                 {
-                    "number": 101,
-                    "author": {"login": "nextoomio-developer[bot]"},
-                    "body": "Refs #88\nOpen PR body",
-                    "headRefName": "dev/D-052-open",
-                    "headRefOid": "def5678",
+                    "number": 2000 + i,
+                    "author": {"login": "unrelated-user"},
+                    "body": f"Noise PR mentioning Refs #88 in discussion {i}",
+                    "headRefName": f"noise-open-{i}",
+                    "headRefOid": f"noise_oid_{i}",
                 }
+                for i in range(34)
             ]
+            mock_open_target = {
+                "number": 101,
+                "author": {"login": "nextoomio-developer[bot]"},
+                "body": "Refs #88\nOpen PR body",
+                "headRefName": "dev/D-052-open",
+                "headRefOid": "def5678",
+            }
+            mock_responses["open"] = mock_open_noise + [mock_open_target]
+            assert len(mock_responses["open"]) == 35
+
             res_open = find_pr(88, "developer")
             assert res_open is not None and res_open["number"] == 101, \
-                f"AC1 failed: find_pr did not return matching PR: {res_open}"
+                f"AC1 failed: find_pr did not return matching PR (match past default 30 items): {res_open}"
             assert len(recorded_calls) == 1, f"AC1 failed: expected 1 gh call, got {len(recorded_calls)}"
             args_open = recorded_calls[0]
             assert "--search" in args_open, f"AC1 failed: --search flag missing in open PR args: {args_open}"
             search_idx_open = args_open.index("--search")
             assert args_open[search_idx_open + 1] == "Refs #88", \
                 f"AC1 failed: unexpected --search value: {args_open[search_idx_open + 1]}"
-            assert "--limit" not in args_open, \
-                f"AC1 failed: --limit present in open PR args: {args_open}"
+            assert "--limit" in args_open, \
+                f"AC1 failed: --limit missing in open PR args: {args_open}"
+            limit_val_open = int(args_open[args_open.index("--limit") + 1])
+            assert limit_val_open >= len(mock_responses["open"]), \
+                f"AC1 failed: limit ({limit_val_open}) smaller than number of results needed ({len(mock_responses['open'])})"
+            assert limit_val_open >= PR_SEARCH_LIMIT, \
+                f"AC1 failed: limit ({limit_val_open}) is less than PR_SEARCH_LIMIT ({PR_SEARCH_LIMIT})"
             assert "--state" in args_open and args_open[args_open.index("--state") + 1] == "open", \
                 f"AC1 failed: expected --state open: {args_open}"
 
-            print("test_d052_ac1_lookup_searches_issue_ref_without_fixed_limit: OK")
+            print("test_d052_ac1_lookup_searches_issue_ref_with_high_limit: OK")
 
             # --- AC2: Search result with Refs #<n> and Refs #<n>0 picks only Refs #<n> ---
             # Test case A: order is [PR for <n>, PR for <n>0]
