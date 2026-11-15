@@ -1,0 +1,2 @@
+# Do not wait for clock synchronization during boot (AD-21, AC5)
+disable systemd-time-wait-sync.service
