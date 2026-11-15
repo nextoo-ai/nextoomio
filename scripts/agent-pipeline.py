@@ -311,6 +311,23 @@ def find_pr(issue, author_role):
     return None
 
 
+def choose_branch(branch, pr=None, cwd=None):
+    """Choose and set up the branch for working on an issue (D-042).
+
+    Runs git fetch --prune origin before inspecting or setting refs.
+    With no open pull request for the issue, creates or resets the local branch
+    from origin/main. With an open pull request, sets the local branch to the
+    pull request's head on origin.
+    """
+    run(["git", "fetch", "--prune", "origin"], cwd=cwd)
+    if pr:
+        target_branch = pr.get("headRefName") or branch
+        run(["git", "switch", "-C", target_branch, f"origin/{target_branch}"], cwd=cwd)
+        return target_branch
+    run(["git", "switch", "-C", branch, "origin/main"], cwd=cwd)
+    return branch
+
+
 def pr_state(number):
     return gh_json(["pr", "view", str(number), "--json",
                     "state,headRefOid,reviewDecision,mergeStateStatus,reviews,statusCheckRollup"])
@@ -596,6 +613,106 @@ def run_self_tests():
 
         print("test_d039_commit_marker_replacement: OK")
 
+        # Test 5: AC1 verification of choose_branch with no open PR, stale branch, and pruned ref (D-042)
+        d042_origin = os.path.join(tmpdir, "d042_origin")
+        d042_local = os.path.join(tmpdir, "d042_local")
+        os.makedirs(d042_origin)
+        subprocess.run(["git", "init", "-q", "-b", "main", d042_origin], check=True)
+        subprocess.run(["git", "-C", d042_origin, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", d042_origin, "config", "user.email", "pipeline-test@example.com"], check=True)
+        subprocess.run(["git", "-C", d042_origin, "commit", "-q", "--allow-empty", "-m", "Initial main commit"], check=True)
+        c_main1 = subprocess.run(["git", "-C", d042_origin, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+
+        # Create branch on origin with a commit
+        subprocess.run(["git", "-C", d042_origin, "switch", "-q", "-c", "ops/D-042-stale"], check=True)
+        subprocess.run(["git", "-C", d042_origin, "commit", "-q", "--allow-empty", "-m", "Stale branch commit"], check=True)
+        c_stale = subprocess.run(["git", "-C", d042_origin, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+        subprocess.run(["git", "-C", d042_origin, "switch", "-q", "main"], check=True)
+
+        # Clone origin into local
+        subprocess.run(["git", "clone", "-q", d042_origin, d042_local], check=True)
+        subprocess.run(["git", "-C", d042_local, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", d042_local, "config", "user.email", "pipeline-test@example.com"], check=True)
+
+        # In local, checkout the branch so local branch exists tracking origin/ops/D-042-stale
+        subprocess.run(["git", "-C", d042_local, "switch", "-q", "-c", "ops/D-042-stale", "origin/ops/D-042-stale"], check=True)
+        subprocess.run(["git", "-C", d042_local, "switch", "-q", "main"], check=True)
+
+        # Advance main on origin and delete the remote branch
+        subprocess.run(["git", "-C", d042_origin, "commit", "-q", "--allow-empty", "-m", "Second main commit"], check=True)
+        c_main2 = subprocess.run(["git", "-C", d042_origin, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+        subprocess.run(["git", "-C", d042_origin, "branch", "-D", "ops/D-042-stale"], capture_output=True, check=True)
+
+        # Pre-conditions check for AC1:
+        # 1. Local branch exists and points to c_stale
+        assert subprocess.run(["git", "-C", d042_local, "rev-parse", "ops/D-042-stale"],
+                              capture_output=True, text=True, check=True).stdout.strip() == c_stale
+        # 2. Stale remote-tracking ref still exists in local before fetch --prune
+        assert subprocess.run(["git", "-C", d042_local, "rev-parse", "--verify", "-q", "origin/ops/D-042-stale"],
+                              capture_output=True, text=True).returncode == 0
+
+        # Execute choose_branch with no open PR
+        chosen_ac1 = choose_branch("ops/D-042-stale", pr=None, cwd=d042_local)
+        assert chosen_ac1 == "ops/D-042-stale"
+
+        # Post-conditions check for AC1:
+        # 1. Author starts on the branch
+        curr_branch = subprocess.run(["git", "-C", d042_local, "branch", "--show-current"],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+        assert curr_branch == "ops/D-042-stale"
+        # 2. Branch commit is the remote's current main (c_main2)
+        curr_head = subprocess.run(["git", "-C", d042_local, "rev-parse", "HEAD"],
+                                   capture_output=True, text=True, check=True).stdout.strip()
+        assert curr_head == c_main2, f"Expected {c_main2}, got {curr_head}"
+        assert curr_head != c_stale
+        # 3. Stale remote-tracking ref was pruned
+        assert subprocess.run(["git", "-C", d042_local, "rev-parse", "--verify", "-q", "origin/ops/D-042-stale"],
+                              capture_output=True, text=True).returncode != 0
+        print("test_d042_ac1_stale_branch_reset_to_origin_main: OK")
+
+        # Test 6: AC2 verification of choose_branch with open PR ahead of local branch (D-042)
+        subprocess.run(["git", "-C", d042_local, "switch", "-q", "main"], check=True)
+
+        # Create PR branch on origin at c_main2
+        subprocess.run(["git", "-C", d042_origin, "switch", "-q", "-c", "ops/D-042-pr"], check=True)
+        subprocess.run(["git", "-C", d042_origin, "commit", "-q", "--allow-empty", "-m", "PR commit 1"], check=True)
+        c_pr1 = subprocess.run(["git", "-C", d042_origin, "rev-parse", "HEAD"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+
+        # In local, track the branch at c_pr1
+        subprocess.run(["git", "-C", d042_local, "fetch", "-q", "origin"], check=True)
+        subprocess.run(["git", "-C", d042_local, "switch", "-q", "-c", "ops/D-042-pr", "origin/ops/D-042-pr"], check=True)
+        subprocess.run(["git", "-C", d042_local, "switch", "-q", "main"], check=True)
+
+        # Advance PR branch on origin
+        subprocess.run(["git", "-C", d042_origin, "commit", "-q", "--allow-empty", "-m", "PR commit 2 (ahead)"], check=True)
+        c_pr2 = subprocess.run(["git", "-C", d042_origin, "rev-parse", "HEAD"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+        assert c_pr1 != c_pr2
+
+        # Pre-condition check for AC2: local branch is behind remote
+        assert subprocess.run(["git", "-C", d042_local, "rev-parse", "ops/D-042-pr"],
+                              capture_output=True, text=True, check=True).stdout.strip() == c_pr1
+
+        # Execute choose_branch with open PR (also verifying headRefName override if branch differs)
+        mock_pr = {"number": 173, "headRefName": "ops/D-042-pr"}
+        chosen_ac2 = choose_branch("ops/D-042-fallback", pr=mock_pr, cwd=d042_local)
+        assert chosen_ac2 == "ops/D-042-pr"
+
+        # Post-conditions check for AC2:
+        # 1. Local branch is switched to ops/D-042-pr
+        curr_branch_pr = subprocess.run(["git", "-C", d042_local, "branch", "--show-current"],
+                                        capture_output=True, text=True, check=True).stdout.strip()
+        assert curr_branch_pr == "ops/D-042-pr"
+        # 2. Local branch commit is at remote branch commit (c_pr2)
+        curr_head_pr = subprocess.run(["git", "-C", d042_local, "rev-parse", "HEAD"],
+                                      capture_output=True, text=True, check=True).stdout.strip()
+        assert curr_head_pr == c_pr2, f"Expected {c_pr2}, got {curr_head_pr}"
+        print("test_d042_ac2_open_pr_updates_local_to_remote_commit: OK")
+
     print("OK: all self-tests passed.")
     return 0
 
@@ -623,6 +740,7 @@ def main(argv=None):
 
     if run(["git", "status", "--porcelain"]).stdout.strip():
         raise Stop(1, "the working tree is not clean")
+    run(["git", "fetch", "--prune", "origin"])
     run(["git", "switch", "main"])
     run(["git", "pull", "--ff-only"])
 
@@ -644,12 +762,7 @@ def main(argv=None):
     branch = f"{'ops' if role == 'devops' else 'dev'}/{ident}-{slug}"
     existing = find_pr(issue, role)
     number = existing["number"] if existing else None
-    if run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"], check=False).returncode == 0:
-        if run(["git", "switch", branch], check=False).returncode != 0:
-            run(["git", "switch", "-c", branch, f"origin/{branch}"])
-        run(["git", "pull", "--ff-only"], check=False)
-    else:
-        run(["git", "switch", "-c", branch])
+    branch = choose_branch(branch, pr=existing)
 
     task = (f"Work on issue {issue} ({info['title']}) in repository {REPO}. Follow your role definition.")
     rounds = 0
