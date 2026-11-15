@@ -1,0 +1,15 @@
+[Unit]
+Description=nextoomio SSH key file validator and manager
+Documentation=https://github.com/nextoo-ai/nextoomio/issues/15
+RequiresMountsFor=/boot/select /data
+After=local-fs.target
+Before=sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nextoomio-ssh-keys-setup
+ExecStop=/usr/sbin/nextoomio-ssh-keys-stop
+
+[Install]
+WantedBy=multi-user.target

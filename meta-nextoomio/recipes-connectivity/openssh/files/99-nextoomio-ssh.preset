@@ -1,0 +1,6 @@
+# nextoomio OpenSSH systemd preset (AD-23, AC1)
+# Keep SSH daemon disabled by default; nextoomio-ssh-keys validates keys and starts sshd on boot.
+
+disable sshd.service
+disable sshd.socket
+disable sshd@.service
