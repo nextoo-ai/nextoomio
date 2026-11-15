@@ -38,11 +38,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 MAX_ROUNDS = 2
 DEVOPS_AREAS = {"area:ci", "area:build", "area:image", "area:tooling", "area:hardware"}
-REQUIRED_CHECKS = {
-    "Traceability, Docs & Yocto Layer Check",
-    "Rust Core & License Gate",
-    "WebUI & i18n Catalog Gate",
-}
+REQUIRED_CHECKS = None
+
+
+def get_required_checks(repo=REPO, role=None):
+    """Read the required check names for main from the rules API (D-048)."""
+    try:
+        rules = gh_json(["api", f"repos/{repo}/rules/branches/main"], role=role)
+    except Exception as exc:
+        raise Stop(1, f"cannot read the rules on main: {exc}")
+    if not isinstance(rules, list):
+        raise Stop(1, "cannot read the rules on main: unexpected response format")
+    checks = set()
+    has_rule = False
+    for rule in rules:
+        if isinstance(rule, dict) and rule.get("type") == "required_status_checks":
+            has_rule = True
+            params = rule.get("parameters") or {}
+            for item in params.get("required_status_checks") or []:
+                name = item.get("context") or item.get("name")
+                if name:
+                    checks.add(name)
+    if not has_rule or not checks:
+        raise Stop(1, "the rules on main name no required status checks")
+    return checks
 AUTHOR_MODEL = os.environ.get("NEXTOOMIO_AGY_MODEL", "gemini-3.8-flash-high") + " (Antigravity)"
 AGENT_TIMEOUT = int(os.environ.get("NEXTOOMIO_AGENT_TIMEOUT_SECONDS", "3600"))
 
@@ -344,8 +363,10 @@ def pr_state(number):
                     "state,headRefOid,reviewDecision,mergeStateStatus,mergeable,reviews,statusCheckRollup,body"])
 
 
-def wait_for_ci(number, issue=None, timeout=3600):
+def wait_for_ci(number, required_checks=None, issue=None, timeout=3600):
     """Wait until every required check has reported on the head commit. True if all passed."""
+    if required_checks is None:
+        required_checks = REQUIRED_CHECKS if REQUIRED_CHECKS is not None else get_required_checks()
     deadline = time.time() + timeout
     while time.time() < deadline:
         state = pr_state(number)
@@ -364,7 +385,7 @@ def wait_for_ci(number, issue=None, timeout=3600):
                   for c in checks}
         if any(s in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED") for s in states.values()):
             return False
-        if all(states.get(name) == "SUCCESS" for name in REQUIRED_CHECKS):
+        if all(states.get(name) == "SUCCESS" for name in required_checks):
             return True
         time.sleep(20)
     raise Stop(1, f"the required checks on pull request #{number} did not finish within {timeout // 60} minutes")
@@ -419,7 +440,7 @@ def cleanup_checkout(cwd=None):
 
 def run_self_tests():
     """Run self-tests verifying that pinned tooling runs instead of branch tooling (D-040, AC2)."""
-    global TOOLING, gh, pr_state, say
+    global TOOLING, gh, pr_state, say, REQUIRED_CHECKS
     print("Running agent-pipeline self-tests...")
     with tempfile.TemporaryDirectory() as tmpdir:
         # Test 1: pin_tooling copies all required files and marks them executable (AC1)
@@ -881,6 +902,12 @@ def run_self_tests():
             real_gh = gh
             real_sleep = time.sleep
             real_time = time.time
+            old_required_checks_d045 = REQUIRED_CHECKS
+            REQUIRED_CHECKS = {
+                "Traceability, Docs & Yocto Layer Check",
+                "Rust Core & License Gate",
+                "WebUI & i18n Catalog Gate",
+            }
 
             try:
                 # AC1: Conflicting PR with no checks stops on first poll and blocks issue naming conflict and PR
@@ -1053,6 +1080,7 @@ def run_self_tests():
                 print("test_d045_ac2_timeout_raises_stop1_without_blocking: OK")
 
             finally:
+                REQUIRED_CHECKS = old_required_checks_d045
                 pr_state = real_pr_state
                 gh = real_gh
                 time.sleep = real_sleep
@@ -1176,6 +1204,11 @@ def run_self_tests():
         )
 
         def mock_gh_d047(args, role=None, check=True):
+            if len(args) >= 2 and args[0] == "api" and "rules/branches/main" in args[1]:
+                return json.dumps([{
+                    "type": "required_status_checks",
+                    "parameters": {"required_status_checks": [{"context": "test-ci-check"}]}
+                }])
             if len(args) >= 2 and args[0] == "issue" and args[1] == "view":
                 return json.dumps({
                     "title": "D-047 Pipeline test",
@@ -1263,6 +1296,165 @@ def run_self_tests():
             gh = real_gh_d047
             say = real_say_d047
 
+        # Test 11: AC1, AC2, and AC4 verification of required status checks from rules API (D-048)
+        old_gh_d048 = gh
+        old_pr_state_d048 = pr_state
+        old_say_d048 = say
+        old_time_sleep_d048 = time.sleep
+        old_time_time_d048 = time.time
+        old_required_checks_d048 = REQUIRED_CHECKS
+        d048_messages = []
+        def recording_say_d048(msg):
+            d048_messages.append(msg)
+            old_say_d048(msg)
+        say = recording_say_d048
+
+        try:
+            # --- AC1 Scenario: Rules response names two required checks ---
+            # 1. get_required_checks() reads exactly those two names
+            two_checks_rules = [
+                {
+                    "type": "deletion",
+                    "ruleset_id": 1,
+                },
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": False,
+                        "required_status_checks": [
+                            {"context": "Check Alpha"},
+                            {"context": "Check Beta"},
+                        ],
+                    },
+                },
+            ]
+            gh = lambda args, role=None, check=True: json.dumps(two_checks_rules)
+            checks_ac1 = get_required_checks()
+            assert checks_ac1 == {"Check Alpha", "Check Beta"}, f"Expected exactly two checks, got {checks_ac1}"
+
+            # 2. wait_for_ci() waits for exactly those two names:
+            # - Check Alpha SUCCESS alone does not finish (times out / keeps waiting)
+            # - Check Alpha SUCCESS and Check Extra SUCCESS does not finish
+            # - Check Alpha SUCCESS and Check Beta SUCCESS finishes immediately
+            # - Check Alpha SUCCESS, Check Beta SUCCESS, and Check Extra PENDING finishes immediately
+            poll_count_d048 = 0
+            pr_state_checks = []
+            def mock_pr_state_ac1(pr_num):
+                nonlocal poll_count_d048
+                poll_count_d048 += 1
+                return {
+                    "headRefOid": "d048head",
+                    "mergeStateStatus": "CLEAN",
+                    "mergeable": "MERGEABLE",
+                    "statusCheckRollup": pr_state_checks,
+                    "body": "Refs #189",
+                }
+            pr_state = mock_pr_state_ac1
+
+            sim_time = 1000.0
+            time.time = lambda: sim_time
+            def mock_sleep_d048(s):
+                nonlocal sim_time
+                sim_time += s
+            time.sleep = mock_sleep_d048
+
+            # Sub-scenario 1: Only Check Alpha reports SUCCESS -> times out without completing
+            pr_state_checks = [{"name": "Check Alpha", "conclusion": "SUCCESS"}]
+            sim_time = 1000.0
+            timeout_raised_ac1 = False
+            try:
+                wait_for_ci(189, required_checks=checks_ac1, timeout=40)
+            except Stop as exc:
+                timeout_raised_ac1 = True
+                assert exc.status == 1
+            assert timeout_raised_ac1, "wait_for_ci did not wait for Check Beta when only Check Alpha reported SUCCESS"
+
+            # Sub-scenario 2: Check Alpha and unrequired Check Extra report SUCCESS -> times out without completing
+            pr_state_checks = [
+                {"name": "Check Alpha", "conclusion": "SUCCESS"},
+                {"name": "Check Extra", "conclusion": "SUCCESS"},
+            ]
+            sim_time = 1000.0
+            timeout_raised_extra = False
+            try:
+                wait_for_ci(189, required_checks=checks_ac1, timeout=40)
+            except Stop as exc:
+                timeout_raised_extra = True
+                assert exc.status == 1
+            assert timeout_raised_extra, "wait_for_ci did not wait for Check Beta when extra unrequired check reported SUCCESS"
+
+            # Sub-scenario 3: Exactly Check Alpha and Check Beta report SUCCESS -> succeeds immediately
+            pr_state_checks = [
+                {"name": "Check Alpha", "conclusion": "SUCCESS"},
+                {"name": "Check Beta", "conclusion": "SUCCESS"},
+            ]
+            sim_time = 1000.0
+            res_ac1 = wait_for_ci(189, required_checks=checks_ac1, timeout=40)
+            assert res_ac1 is True, "wait_for_ci did not succeed when both required checks reported SUCCESS"
+
+            # Sub-scenario 4: Check Alpha and Check Beta report SUCCESS while Check Extra is PENDING -> succeeds immediately without waiting for Check Extra
+            pr_state_checks = [
+                {"name": "Check Alpha", "conclusion": "SUCCESS"},
+                {"name": "Check Beta", "conclusion": "SUCCESS"},
+                {"name": "Check Extra", "conclusion": "PENDING"},
+            ]
+            sim_time = 1000.0
+            res_ac1_extra = wait_for_ci(189, required_checks=checks_ac1, timeout=40)
+            assert res_ac1_extra is True, "wait_for_ci waited for unrequired Check Extra"
+
+            print("test_d048_ac1_waits_for_exact_rule_check_names: OK")
+
+            # --- AC2 Scenario: Response without required_status_checks rule, or failed request ---
+            # Create a clean local repo for testing main() invocations
+            d048_origin = os.path.join(tmpdir, "d048_origin")
+            d048_local = os.path.join(tmpdir, "d048_local")
+            os.makedirs(d048_origin)
+            subprocess.run(["git", "init", "-q", "-b", "main", d048_origin], check=True)
+            subprocess.run(["git", "-C", d048_origin, "config", "user.name", "Pipeline Test"], check=True)
+            subprocess.run(["git", "-C", d048_origin, "config", "user.email", "pipeline-test@example.com"], check=True)
+            subprocess.run(["git", "-C", d048_origin, "commit", "-q", "--allow-empty", "-m", "Initial commit"], check=True)
+            subprocess.run(["git", "clone", "-q", d048_origin, d048_local], check=True)
+            subprocess.run(["git", "-C", d048_local, "config", "user.name", "Pipeline Test"], check=True)
+            subprocess.run(["git", "-C", d048_local, "config", "user.email", "pipeline-test@example.com"], check=True)
+
+            # Sub-case 2a: Rules response without a required_status_checks rule
+            d048_messages.clear()
+            no_rule_response = [{"type": "deletion"}, {"type": "pull_request"}]
+            gh = lambda args, role=None, check=True: json.dumps(no_rule_response)
+            exit_code_no_rule = main(["189", "--role", "devops"], cwd=d048_local,
+                                     run_dir=os.path.join(tmpdir, "d048_run_no_rule"))
+            assert exit_code_no_rule == 1, f"Expected exit status 1 on missing rule, got {exit_code_no_rule}"
+            assert any("rules on main" in m for m in d048_messages), f"Message did not name rules on main: {d048_messages}"
+
+            # Sub-case 2b: Rules response with required_status_checks rule naming no checks
+            d048_messages.clear()
+            empty_checks_response = [{"type": "required_status_checks", "parameters": {"required_status_checks": []}}]
+            gh = lambda args, role=None, check=True: json.dumps(empty_checks_response)
+            exit_code_empty = main(["189", "--role", "devops"], cwd=d048_local,
+                                   run_dir=os.path.join(tmpdir, "d048_run_empty"))
+            assert exit_code_empty == 1, f"Expected exit status 1 on empty checks, got {exit_code_empty}"
+            assert any("rules on main" in m for m in d048_messages), f"Message did not name rules on main: {d048_messages}"
+
+            # Sub-case 2c: Failed request (gh raises exception / Stop(1))
+            d048_messages.clear()
+            def failing_gh(args, role=None, check=True):
+                raise Stop(1, "command failed (1): gh api repos/... (HTTP 500)")
+            gh = failing_gh
+            exit_code_failed = main(["189", "--role", "devops"], cwd=d048_local,
+                                    run_dir=os.path.join(tmpdir, "d048_run_failed"))
+            assert exit_code_failed == 1, f"Expected exit status 1 on failed request, got {exit_code_failed}"
+            assert any("rules on main" in m for m in d048_messages), f"Message did not name rules on main: {d048_messages}"
+
+            print("test_d048_ac2_stops_exit_1_on_missing_or_failed_rules: OK")
+
+        finally:
+            gh = old_gh_d048
+            pr_state = old_pr_state_d048
+            say = old_say_d048
+            time.sleep = old_time_sleep_d048
+            time.time = old_time_time_d048
+            REQUIRED_CHECKS = old_required_checks_d048
+
     print("OK: all self-tests passed.")
     return 0
 
@@ -1284,6 +1476,9 @@ def main(argv=None, cwd=None, run_dir=None):
     log = None
 
     try:
+        global REQUIRED_CHECKS
+        REQUIRED_CHECKS = get_required_checks()
+        required_checks = REQUIRED_CHECKS
         info = gh_json(["issue", "view", str(issue), "--json", "title,state,labels,body"])
         labels = {l["name"] for l in info["labels"]}
         if info["state"] != "OPEN" or "state:ready" not in labels:
@@ -1337,7 +1532,7 @@ def main(argv=None, cwd=None, run_dir=None):
             say(f"pull request #{number} at {head[:7]}")
             gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
 
-            if not wait_for_ci(number, issue=issue):
+            if not wait_for_ci(number, required_checks=required_checks, issue=issue):
                 verdict, why, review_body = "CHANGES_REQUESTED", "CI failed on the head commit", ""
             else:
                 agent("reviewer", f"Review pull request {number} (issue {issue}) at its current head commit. "
