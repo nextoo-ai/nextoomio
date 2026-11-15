@@ -22,6 +22,8 @@ def main() -> int:
         ROOT / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json",
         ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb",
         ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
+        ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
+        ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
         ROOT / "kas/base.yml",
         ROOT / "kas/rpi4-64.yml",
         ROOT / "kas/ci-hosted.yml",
