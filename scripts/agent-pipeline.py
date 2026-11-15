@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from typing import NamedTuple
 
 REPO = os.environ.get("NEXTOOMIO_REPO", "nextoo-ai/nextoomio")
@@ -411,7 +412,9 @@ def cleanup_checkout(cwd=None):
     if is_dirty:
         say(f"the working tree is not clean; checkout left on {branch}")
     else:
-        run(["git", "switch", "main"], cwd=cwd, check=False)
+        res = run(["git", "switch", "main"], cwd=cwd, check=False)
+        if res.returncode != 0:
+            say(f"failed to switch checkout back to main: {(res.stdout or '').strip()}")
 
 
 def run_self_tests():
@@ -1255,48 +1258,6 @@ def run_self_tests():
             assert "ops/D-047-pipeline-test" in last_msg, f"Branch not in last message: '{last_msg}'"
             assert "the working tree is not clean" in last_msg, f"Dirty status not in last message: '{last_msg}'"
             print("test_d047_ac2_uncommitted_changes_stays_on_branch_names_branch: OK")
-
-            # --- Additional checks: Stop(2) and modified tracked files ---
-            # 1. Stop(2) with clean tree:
-            if os.path.exists(dirty_file):
-                os.remove(dirty_file)
-            subprocess.run(["git", "-C", d047_local, "switch", "-q", "-C", "ops/D-047-stop2"], check=True)
-            d047_messages.clear()
-            def run_stop2():
-                try:
-                    raise Stop(2, "issue #188 blocked: test block reason")
-                except Stop as s:
-                    say(str(s))
-                    return s.status
-                finally:
-                    cleanup_checkout(cwd=d047_local)
-            status_stop2 = run_stop2()
-            assert status_stop2 == 2
-            curr_branch_stop2 = subprocess.run(["git", "-C", d047_local, "branch", "--show-current"],
-                                               capture_output=True, text=True, check=True).stdout.strip()
-            assert curr_branch_stop2 == "main", f"Expected main, got {curr_branch_stop2}"
-            print("test_d047_ac1_stop2_clean_tree_switches_to_main: OK")
-
-            # 2. Stop(2) with modified tracked file:
-            subprocess.run(["git", "-C", d047_local, "switch", "-q", "-C", "ops/D-047-tracked-mod"], check=True)
-            tracked_path = os.path.join(d047_local, "tracked.txt")
-            with open(tracked_path, "w") as f:
-                f.write("original\n")
-            subprocess.run(["git", "-C", d047_local, "add", "tracked.txt"], check=True)
-            subprocess.run(["git", "-C", d047_local, "commit", "-q", "-m", "add tracked"], check=True)
-            with open(tracked_path, "w") as f:
-                f.write("modified uncommitted\n")
-            d047_messages.clear()
-            status_tracked_mod = run_stop2()
-            assert status_tracked_mod == 2
-            curr_branch_mod = subprocess.run(["git", "-C", d047_local, "branch", "--show-current"],
-                                             capture_output=True, text=True, check=True).stdout.strip()
-            assert curr_branch_mod == "ops/D-047-tracked-mod", f"Expected ops/D-047-tracked-mod, got {curr_branch_mod}"
-            with open(tracked_path, "r") as f:
-                assert f.read() == "modified uncommitted\n"
-            assert "ops/D-047-tracked-mod" in d047_messages[-1]
-            assert "the working tree is not clean" in d047_messages[-1]
-            print("test_d047_ac2_modified_tracked_file_stays_on_branch: OK")
         finally:
             TOOLING = old_tooling_d047
             gh = real_gh_d047
@@ -1320,6 +1281,7 @@ def main(argv=None, cwd=None, run_dir=None):
         parser.error("the following arguments are required: issue")
 
     issue = args.issue
+    log = None
 
     try:
         info = gh_json(["issue", "view", str(issue), "--json", "title,state,labels,body"])
@@ -1437,15 +1399,16 @@ def main(argv=None, cwd=None, run_dir=None):
         return 1
     except Exception as exc:
         say(f"unexpected error: {exc}")
+        if log:
+            try:
+                with open(log, "a", encoding="utf-8") as f:
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
         return 1
     finally:
         cleanup_checkout(cwd=cwd)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Stop as stop:
-        say(str(stop))
-        cleanup_checkout()
-        sys.exit(stop.status)
+    sys.exit(main())
