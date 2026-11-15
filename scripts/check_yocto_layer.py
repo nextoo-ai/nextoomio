@@ -46,6 +46,15 @@ def main() -> int:
                         f"must be quoted as a string to avoid YAML float parsing"
                     )
 
+    rpi4_kas = ROOT / "kas/rpi4-64.yml"
+    if rpi4_kas.is_file():
+        rpi4_text = rpi4_kas.read_text(encoding="utf-8")
+        if "tryboot_a_b" in rpi4_text:
+            errors.append(
+                "kas/rpi4-64.yml: tryboot_a_b must not be set in RPI_EXTRA_CONFIG/config.txt; "
+                "tryboot_a_b is a property of autoboot.txt (CQ-R2)"
+            )
+
     profile_path = ROOT / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
     if profile_path.is_file():
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -63,40 +72,60 @@ def main() -> int:
         )
 
     # D-004: Validate kernel command line root partition specification
-    # Fails if fixed device nodes (e.g. /dev/mmcblk0p2) are used or if not pointing by label/UUID
+    # Fails if fixed device nodes (e.g. /dev/mmcblk0p2) are used, if unusable partition/fs labels
+    # (PARTLABEL=/LABEL=) are used on MBR layout, or if not pointing by PARTUUID to slot A (partition 5).
     distro_conf = ROOT / "meta-nextoomio/conf/distro/nextoomio.conf"
     cmdline_bbappend = ROOT / "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend"
 
-    cmdline_sources = []
     if distro_conf.is_file():
-        cmdline_sources.append((distro_conf, distro_conf.read_text(encoding="utf-8")))
-    if cmdline_bbappend.is_file():
-        cmdline_sources.append((cmdline_bbappend, cmdline_bbappend.read_text(encoding="utf-8")))
+        conf_text = distro_conf.read_text(encoding="utf-8")
+        if re.search(r"^\s*CMDLINE_ROOT_PARTITION\b", conf_text, re.MULTILINE):
+            errors.append(
+                "meta-nextoomio/conf/distro/nextoomio.conf: CMDLINE_ROOT_PARTITION must not be defined "
+                "in distro conf; define it unconditionally in recipes-bsp/bootfiles/rpi-cmdline.bbappend "
+                "to avoid dead duplication (CQ-R14)"
+            )
 
     has_cmdline_root = False
-    for path, content in cmdline_sources:
-        for line in content.splitlines():
+    expected_partuuid = None
+    if cmdline_bbappend.is_file():
+        bbappend_text = cmdline_bbappend.read_text(encoding="utf-8")
+        for line in bbappend_text.splitlines():
             line_clean = line.strip()
             if line_clean.startswith("#") or not line_clean:
                 continue
-            m = re.match(r"^\s*CMDLINE_ROOT_PARTITION\s*[\?\:]?=\s*[\"']?([^\"'\s]+)[\"']?", line_clean)
+            if re.match(r"^\s*CMDLINE_ROOT_PARTITION\s*\?=", line_clean):
+                errors.append(
+                    "rpi-cmdline.bbappend: CMDLINE_ROOT_PARTITION must use '=' instead of '?=' "
+                    "because bbappend is parsed after recipe defaults (CQ-R14)"
+                )
+            m = re.match(r"^\s*CMDLINE_ROOT_PARTITION\s*=\s*[\"']?([^\"'\s]+)[\"']?", line_clean)
             if m:
                 has_cmdline_root = True
                 val = m.group(1)
                 if re.search(r"/dev/mmcblk|/dev/sd", val):
                     errors.append(
-                        f"{path.relative_to(ROOT)}: CMDLINE_ROOT_PARTITION '{val}' uses a fixed root device "
-                        f"node; must name root partition by label or UUID (never /dev/mmcblk0p2, D-004)"
+                        f"rpi-cmdline.bbappend: CMDLINE_ROOT_PARTITION '{val}' uses a fixed root device "
+                        f"node; must name root partition by PARTUUID (never /dev/mmcblk0p2, D-004)"
                     )
-                if not re.match(r"^(?:PARTLABEL|LABEL|PARTUUID)=", val):
+                if re.match(r"^(?:PARTLABEL|LABEL)=", val):
                     errors.append(
-                        f"{path.relative_to(ROOT)}: CMDLINE_ROOT_PARTITION '{val}' must specify root partition "
-                        f"by label or UUID (e.g. PARTLABEL=root_a or LABEL=root_a)"
+                        f"rpi-cmdline.bbappend: CMDLINE_ROOT_PARTITION '{val}' uses PARTLABEL or LABEL; "
+                        f"MBR partition tables have no partition names, and kernel cannot resolve LABEL without initramfs. "
+                        f"Must use PARTUUID=<disk-signature>-05 (D-004, CQ-R1)"
                     )
+                m_partuuid = re.match(r"^PARTUUID=([0-9a-fA-F]{8})-05$", val)
+                if not m_partuuid:
+                    errors.append(
+                        f"rpi-cmdline.bbappend: CMDLINE_ROOT_PARTITION '{val}' must be in format "
+                        f"PARTUUID=<disk-signature>-05 pointing to slot A root partition 5 on MBR layout"
+                    )
+                else:
+                    expected_partuuid = m_partuuid.group(1).lower()
 
     if not has_cmdline_root:
         errors.append(
-            "CMDLINE_ROOT_PARTITION must be configured in meta-nextoomio (distro conf or rpi-cmdline.bbappend) "
+            "CMDLINE_ROOT_PARTITION must be configured in meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend "
             "to prevent upstream meta-raspberrypi defaulting to /dev/mmcblk0p2 (D-004)"
         )
 
@@ -156,6 +185,15 @@ def main() -> int:
 
         if "--ptable msdos" not in wks_text:
             errors.append("Wic layout must use MBR partition table (--ptable msdos) per ARCHITECTURE.md section 3.6")
+
+        m_diskid = re.search(r"--diskid\s+(?:0x)?([0-9a-fA-F]{8})", wks_text)
+        if not m_diskid:
+            errors.append("Wic layout bootloader must specify fixed MBR disk signature via '--diskid 0x<id>'")
+        elif expected_partuuid and m_diskid.group(1).lower() != expected_partuuid:
+            errors.append(
+                f"Wic bootloader diskid '0x{m_diskid.group(1)}' does not match CMDLINE_ROOT_PARTITION "
+                f"disk signature '{expected_partuuid}' in rpi-cmdline.bbappend"
+            )
 
         # Verify sizes and slot B emptiness on fresh card (AC5)
         for line in wks_text.splitlines():

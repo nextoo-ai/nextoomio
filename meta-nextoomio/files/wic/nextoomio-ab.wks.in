@@ -15,4 +15,4 @@ part /            --source rootfs            --ondisk mmcblk0 --fstype=ext4 --la
 part              --ondisk mmcblk0 --fstype=ext4 --label root_b --align 4096 --fixed-size 3072M
 part /data        --ondisk mmcblk0 --fstype=ext4 --label data   --align 4096 --fixed-size 1536M
 
-bootloader --ptable msdos
+bootloader --ptable msdos --diskid 0x4e58544d
