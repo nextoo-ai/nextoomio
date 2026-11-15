@@ -120,6 +120,10 @@ checks your changed paths against your role, commits and pushes them under
 your identity, and opens or updates the pull request. You may read issues,
 pull requests, and reviews with gh, and comment on your issue.
 
+When writing verification evidence in the change's own pull request, write
+the literal marker {{COMMIT}} in the 'Image version and commit' field instead
+of a commit hash; the pipeline replaces it with the change commit upon delivery.
+
 This program runs without anyone to ask. A shell command outside its allow
 list ends your whole run with no output, and your work is lost. Use only:
 git (reading only), gh, make, python3, node, npm, cargo, and the utilities
