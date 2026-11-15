@@ -332,14 +332,25 @@ def choose_branch(branch, pr=None, cwd=None):
 
 def pr_state(number):
     return gh_json(["pr", "view", str(number), "--json",
-                    "state,headRefOid,reviewDecision,mergeStateStatus,reviews,statusCheckRollup"])
+                    "state,headRefOid,reviewDecision,mergeStateStatus,mergeable,reviews,statusCheckRollup,body"])
 
 
-def wait_for_ci(number, timeout=3600):
+def wait_for_ci(number, issue=None, timeout=3600):
     """Wait until every required check has reported on the head commit. True if all passed."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        checks = pr_state(number)["statusCheckRollup"] or []
+        state = pr_state(number)
+        if (str(state.get("mergeStateStatus") or "").upper() == "DIRTY"
+                or str(state.get("mergeable") or "").upper() == "CONFLICTING"):
+            target_issue = issue
+            if target_issue is None:
+                m = re.search(r"\bRefs\s+#(\d+)\b", state.get("body") or "")
+                if m:
+                    target_issue = int(m.group(1))
+            if target_issue is not None:
+                block(target_issue, f"pull request #{number} conflicts with main.")
+            raise Stop(2, f"pull request #{number} conflicts with main")
+        checks = state.get("statusCheckRollup") or []
         states = {c.get("name") or c.get("context"): c.get("conclusion") or c.get("status") or c.get("state")
                   for c in checks}
         if any(s in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED") for s in states.values()):
@@ -834,6 +845,189 @@ def run_self_tests():
                 gh = real_gh
 
             print("test_d044_ac2_no_issue_label_changes_or_comments_on_failure: OK")
+
+            # Test 8: AC1, AC2, and AC3 verification of conflicting pull request handling (D-045)
+            global pr_state
+            real_pr_state = pr_state
+            real_gh = gh
+            real_sleep = time.sleep
+            real_time = time.time
+
+            try:
+                # AC1: Conflicting PR with no checks stops on first poll and blocks issue naming conflict and PR
+                gh_mutations = []
+                def tracking_gh_d045(args, role=None, check=True):
+                    if len(args) >= 2 and args[0] == "issue" and args[1] in ("edit", "comment", "close"):
+                        gh_mutations.append(args)
+                    return "{}"
+                gh = tracking_gh_d045
+
+                # 1. PR with mergeStateStatus: DIRTY and mergeable: CONFLICTING, no checks
+                poll_count_ac1 = 0
+                sleep_calls_ac1 = []
+                time.sleep = lambda s: sleep_calls_ac1.append(s)
+
+                def mock_pr_state_dirty(pr_num):
+                    nonlocal poll_count_ac1
+                    poll_count_ac1 += 1
+                    return {
+                        "headRefOid": "668123af",
+                        "mergeStateStatus": "DIRTY",
+                        "mergeable": "CONFLICTING",
+                        "statusCheckRollup": [],
+                        "body": "Refs #179\n\nConflicting PR",
+                    }
+                pr_state = mock_pr_state_dirty
+
+                ac1_blocked = False
+                try:
+                    wait_for_ci(172, issue=179)
+                except Stop as exc:
+                    ac1_blocked = True
+                    assert exc.status == 2, f"Expected Stop status 2, got {exc.status}"
+                    assert "issue #179 blocked" in str(exc), f"Issue number missing from Stop error: {exc}"
+                    assert "pull request #172 conflicts with main" in str(exc), f"Conflict or PR missing from Stop error: {exc}"
+
+                assert ac1_blocked, "wait_for_ci did not raise Stop on conflicting PR"
+                assert poll_count_ac1 == 1, f"Expected exactly 1 poll on conflict, got {poll_count_ac1}"
+                assert sleep_calls_ac1 == [], f"Expected 0 sleep calls on immediate conflict detection, got {sleep_calls_ac1}"
+                assert len(gh_mutations) == 2, f"Expected 2 issue mutations (edit and comment), got {len(gh_mutations)}"
+                assert gh_mutations[0][:4] == ["issue", "edit", "179", "--remove-label"]
+                assert "--add-label" in gh_mutations[0] and "state:blocked" in gh_mutations[0]
+                assert gh_mutations[1][:3] == ["issue", "comment", "179"]
+                assert "pull request #172 conflicts with main" in gh_mutations[1][4]
+                print("test_d045_ac1_conflicting_pr_blocks_on_first_poll: OK")
+
+                # 2. PR with inferred issue from body when issue parameter is None
+                gh_mutations.clear()
+                poll_count_inferred = 0
+                def mock_pr_state_inferred(pr_num):
+                    nonlocal poll_count_inferred
+                    poll_count_inferred += 1
+                    return {
+                        "headRefOid": "668123af",
+                        "mergeStateStatus": "DIRTY",
+                        "mergeable": "CONFLICTING",
+                        "statusCheckRollup": [],
+                        "body": "Refs #168\n\nPR body with issue ref",
+                    }
+                pr_state = mock_pr_state_inferred
+
+                inferred_blocked = False
+                try:
+                    wait_for_ci(172)
+                except Stop as exc:
+                    inferred_blocked = True
+                    assert exc.status == 2
+                    assert "issue #168 blocked" in str(exc)
+                    assert "pull request #172 conflicts with main" in str(exc)
+                assert inferred_blocked, "wait_for_ci did not infer issue and block"
+                assert poll_count_inferred == 1
+                assert len(gh_mutations) == 2
+                assert gh_mutations[0][2] == "168"
+                assert gh_mutations[1][2] == "168"
+                print("test_d045_ac1_inferred_issue_from_pr_body: OK")
+
+                # 3. Test conflict detection with mergeStateStatus == DIRTY alone or mergeable == CONFLICTING alone
+                gh_mutations.clear()
+                pr_state = lambda pr_num: {
+                    "mergeStateStatus": "DIRTY",
+                    "mergeable": "UNKNOWN",
+                    "statusCheckRollup": [],
+                    "body": "Refs #179",
+                }
+                try:
+                    wait_for_ci(172, issue=179)
+                    assert False, "Expected Stop on DIRTY alone"
+                except Stop as exc:
+                    assert exc.status == 2
+                    assert "pull request #172 conflicts with main" in str(exc)
+
+                gh_mutations.clear()
+                pr_state = lambda pr_num: {
+                    "mergeStateStatus": "BLOCKED",
+                    "mergeable": "CONFLICTING",
+                    "statusCheckRollup": [],
+                    "body": "Refs #179",
+                }
+                try:
+                    wait_for_ci(172, issue=179)
+                    assert False, "Expected Stop on CONFLICTING alone"
+                except Stop as exc:
+                    assert exc.status == 2
+                    assert "pull request #172 conflicts with main" in str(exc)
+                print("test_d045_ac1_conflict_detection_variants: OK")
+
+                # AC2: Non-conflicting PR with pending checks keeps waiting as before
+                gh_mutations.clear()
+                sleep_calls_ac2 = []
+                time.sleep = lambda s: sleep_calls_ac2.append(s)
+
+                # Scenario 2a: Checks not reported yet initially, then report SUCCESS on 3rd poll
+                poll_count_ac2 = 0
+                def mock_pr_state_pending_then_success(pr_num):
+                    nonlocal poll_count_ac2
+                    poll_count_ac2 += 1
+                    if poll_count_ac2 < 3:
+                        return {
+                            "headRefOid": "abc1234",
+                            "mergeStateStatus": "BLOCKED",
+                            "mergeable": "MERGEABLE",
+                            "statusCheckRollup": [],
+                            "body": "Refs #179",
+                        }
+                    return {
+                        "headRefOid": "abc1234",
+                        "mergeStateStatus": "CLEAN",
+                        "mergeable": "MERGEABLE",
+                        "statusCheckRollup": [{"name": name, "conclusion": "SUCCESS"} for name in REQUIRED_CHECKS],
+                        "body": "Refs #179",
+                    }
+                pr_state = mock_pr_state_pending_then_success
+
+                res = wait_for_ci(173, issue=179)
+                assert res is True, "wait_for_ci did not return True after pending checks passed"
+                assert poll_count_ac2 == 3, f"Expected 3 polls, got {poll_count_ac2}"
+                assert sleep_calls_ac2 == [20, 20], f"Expected 2 sleep calls of 20s, got {sleep_calls_ac2}"
+                assert gh_mutations == [], f"AC2 violated: issue mutations occurred during normal wait: {gh_mutations}"
+                print("test_d045_ac2_pending_checks_keeps_waiting_then_succeeds: OK")
+
+                # Scenario 2b: Checks not reported yet and timeout reached raises Stop(1) without blocking issue
+                gh_mutations.clear()
+                sleep_calls_timeout = []
+                simulated_clock = 1000.0
+                def mock_advancing_sleep(s):
+                    nonlocal simulated_clock
+                    sleep_calls_timeout.append(s)
+                    simulated_clock += s
+                time.sleep = mock_advancing_sleep
+                time.time = lambda: simulated_clock
+
+                pr_state = lambda pr_num: {
+                    "headRefOid": "abc1234",
+                    "mergeStateStatus": "BLOCKED",
+                    "mergeable": "MERGEABLE",
+                    "statusCheckRollup": [],
+                    "body": "Refs #179",
+                }
+
+                timeout_raised = False
+                try:
+                    wait_for_ci(173, issue=179, timeout=60)
+                except Stop as exc:
+                    timeout_raised = True
+                    assert exc.status == 1, f"Expected Stop status 1 on timeout, got {exc.status}"
+                    assert "the required checks on pull request #173 did not finish within 1 minutes" in str(exc)
+                assert timeout_raised, "wait_for_ci did not time out as before"
+                assert len(sleep_calls_timeout) > 0, "Expected sleep calls before timeout"
+                assert gh_mutations == [], f"AC2 violated: issue mutations occurred on check timeout: {gh_mutations}"
+                print("test_d045_ac2_timeout_raises_stop1_without_blocking: OK")
+
+            finally:
+                pr_state = real_pr_state
+                gh = real_gh
+                time.sleep = real_sleep
+                time.time = real_time
         finally:
             TOOLING = old_tooling
 
@@ -907,7 +1101,7 @@ def main(argv=None):
         say(f"pull request #{number} at {head[:7]}")
         gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
 
-        if not wait_for_ci(number):
+        if not wait_for_ci(number, issue=issue):
             verdict, why, review_body = "CHANGES_REQUESTED", "CI failed on the head commit", ""
         else:
             agent("reviewer", f"Review pull request {number} (issue {issue}) at its current head commit. "
