@@ -74,6 +74,9 @@ def main() -> int:
                 errors.append(f"Wic layout missing partition label '{label}'")
         if re.search(r"part\s+/data\s+.*--fixed-size", wks_text):
             errors.append("Wic layout /data partition must not use --fixed-size (D-006: grown on first boot)")
+        for mpoint in ("/boot/select", "/boot", "/data"):
+            if not re.search(rf"part\s+{re.escape(mpoint)}\s+.*--no-fstab-update", wks_text):
+                errors.append(f"Wic layout partition {mpoint} must specify --no-fstab-update")
 
     image_path = ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
     if image_path.is_file():

@@ -32,6 +32,7 @@ SYSTEMD_AUTO_ENABLE = "enable"
 RDEPENDS:${PN} = " \
     e2fsprogs-e2fsck \
     e2fsprogs-resize2fs \
+    e2fsprogs-tune2fs \
     parted \
     util-linux-partx \
     util-linux-blockdev \

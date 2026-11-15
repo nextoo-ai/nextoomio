@@ -161,10 +161,17 @@ class TestDataPartition(unittest.TestCase):
             bin_dir = tmp_path / "bin"
             bin_dir.mkdir()
             parted_log = tmp_path / "parted.log"
+            resize2fs_log = tmp_path / "resize2fs.log"
 
             make_stub(bin_dir, "parted", f'echo "$@" >> "{parted_log}"\nexit 0')
-            make_stub(bin_dir, "resize2fs", "exit 0")
+            make_stub(bin_dir, "resize2fs", f'echo "$@" >> "{resize2fs_log}"\nexit 0')
             make_stub(bin_dir, "partx", "exit 0")
+            # Filesystem block count matches partition capacity (23250000 sectors * 512 / 4096 = 2906250 blocks)
+            make_stub(
+                bin_dir,
+                "dumpe2fs",
+                'echo "Block count: 2906250"; echo "Block size: 4096"',
+            )
 
             fake_run = tmp_path / "run" / "nextoomio"
             fake_sys = tmp_path / "sys" / "class" / "block"
@@ -193,11 +200,72 @@ class TestDataPartition(unittest.TestCase):
             }
             res = subprocess.run(["sh", str(script_path)], env=env, capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, f"Grow script failed: {res.stderr}")
-            self.assertIn("already extends to end of disk", res.stdout)
+            self.assertIn("already extend to end of disk", res.stdout)
             self.assertIn("skipping expansion", res.stdout)
 
             # Neither parted nor resize2fs should be called
             self.assertFalse(parted_log.exists(), "parted must not be called when partition already extends to disk end")
+            self.assertFalse(resize2fs_log.exists(), "resize2fs must not be called when filesystem already fills partition")
+            self.assertTrue((fake_run / "data-resized").exists())
+
+    def test_grow_script_partition_already_grown_filesystem_not(self) -> None:
+        """Verify AC2 & CQ-R1: nextoomio-data-grow.sh resizes ext4 when partition is already grown but fs is not."""
+        script_path = DATA_RECIPE_FILES / "nextoomio-data-grow.sh"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            parted_log = tmp_path / "parted.log"
+            resize2fs_log = tmp_path / "resize2fs.log"
+
+            make_stub(bin_dir, "parted", f'echo "$@" >> "{parted_log}"\nexit 0')
+            make_stub(bin_dir, "resize2fs", f'echo "$@" >> "{resize2fs_log}"\nexit 0')
+            make_stub(bin_dir, "partx", "exit 0")
+            # Filesystem size reports initial wic size (1.5 GiB = 393216 blocks of 4096)
+            make_stub(
+                bin_dir,
+                "dumpe2fs",
+                'echo "Block count: 393216"; echo "Block size: 4096"',
+            )
+
+            fake_run = tmp_path / "run" / "nextoomio"
+            fake_sys = tmp_path / "sys" / "class" / "block"
+
+            # Setup sysfs geometry: partition already fills disk (free sectors = 0 <= 8192)
+            disk_dir = fake_sys / "mmcblk0"
+            part_dir = fake_sys / "mmcblk0p7"
+            disk_dir.mkdir(parents=True)
+            part_dir.mkdir(parents=True)
+
+            (disk_dir / "size").write_text("31250000\n", encoding="utf-8")
+            (part_dir / "start").write_text("8000000\n", encoding="utf-8")
+            (part_dir / "size").write_text("23250000\n", encoding="utf-8")  # 11.9 GiB partition
+
+            fake_dev = tmp_path / "dev" / "mmcblk0p7"
+            fake_disk = tmp_path / "dev" / "mmcblk0"
+            fake_dev.parent.mkdir(parents=True)
+            fake_dev.touch()
+            fake_disk.touch()
+
+            env = {
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '/bin:/usr/bin')}",
+                "NEXTOOMIO_DATA_DEV": str(fake_dev),
+                "NEXTOOMIO_RUN_DIR": str(fake_run),
+                "NEXTOOMIO_SYS_BLOCK_DIR": str(fake_sys),
+            }
+            res = subprocess.run(["sh", str(script_path)], env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"Grow script failed: {res.stderr}")
+            self.assertIn("does not fill partition", res.stdout)
+            self.assertIn("Resizing filesystem", res.stdout)
+
+            # parted must NOT be called since partition geometry already spans to end
+            self.assertFalse(parted_log.exists(), "parted must not be called when partition is already expanded")
+
+            # resize2fs MUST be called because filesystem is smaller than partition
+            self.assertTrue(resize2fs_log.exists(), "resize2fs must be called when filesystem does not fill partition")
+            resize_calls = resize2fs_log.read_text(encoding="utf-8")
+            self.assertIn(str(fake_dev), resize_calls)
             self.assertTrue((fake_run / "data-resized").exists())
 
     def test_grow_script_surfaces_failures(self) -> None:
@@ -238,6 +306,13 @@ class TestDataPartition(unittest.TestCase):
             res = subprocess.run(["sh", str(script_path)], env=env, capture_output=True, text=True)
             self.assertNotEqual(res.returncode, 0, "Grow script must exit non-zero when parted fails")
             self.assertIn("ERROR", res.stderr)
+
+            # Sub-test 2: resize2fs fails with code 1
+            make_stub(bin_dir, "parted", "exit 0")
+            make_stub(bin_dir, "resize2fs", 'echo "resize2fs simulated error" >&2\nexit 1')
+            res2 = subprocess.run(["sh", str(script_path)], env=env, capture_output=True, text=True)
+            self.assertNotEqual(res2.returncode, 0, "Grow script must exit non-zero when resize2fs fails")
+            self.assertIn("ERROR", res2.stderr)
 
     def test_check_script_e2fsck_exit_codes(self) -> None:
         """Verify AC3 and AC5: nextoomio-data-check.sh handles clean, repaired, and corrupt file systems."""
