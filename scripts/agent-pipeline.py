@@ -197,6 +197,67 @@ def outside_role_paths(role, paths, extra_paths, cwd=None):
     return refused
 
 
+def replace_commit_marker_in_text(text: str, commit_hash: str) -> tuple[str, int]:
+    """Replace {{COMMIT}} only in the 'Image version and commit' field line (D-039).
+
+    Preserves occurrences of {{COMMIT}} in prose (e.g. in Procedure or Observed result).
+    Returns (new_text, replacement_count).
+    """
+    field_prefix_re = re.compile(
+        r"^(\s*(?:[-*]\s+)?(?:\*\*)?(?:Image(?:\s+version)?(?:\s+and\s+commit)?|(?:Check\s+)?Commit)(?::\*\*|\*\*:|:)\s*)(.*?)(\r?\n)?$",
+        re.IGNORECASE,
+    )
+    lines = text.splitlines(keepends=True)
+    new_lines = []
+    count = 0
+    for line in lines:
+        m = field_prefix_re.match(line)
+        if m and "{{COMMIT}}" in m.group(2):
+            new_value = m.group(2).replace("{{COMMIT}}", commit_hash)
+            count += m.group(2).count("{{COMMIT}}")
+            trailing_nl = m.group(3) or ""
+            new_lines.append(f"{m.group(1)}{new_value}{trailing_nl}")
+        else:
+            new_lines.append(line)
+    return "".join(new_lines), count
+
+
+def replace_commit_markers(paths, commit_hash, root=ROOT):
+    """Replace {{COMMIT}} only in 'Image version and commit' field of changed evidence files (D-039).
+
+    Preserves occurrences of {{COMMIT}} in prose.
+    Returns the list of relative file paths that were updated.
+    """
+    updated_files = []
+    for p in paths:
+        if (p.startswith("docs/evidence/") and p.endswith(".md")
+                and p not in ("docs/evidence/TEMPLATE.md", "docs/evidence/README.md")):
+            full_path = os.path.join(root, p)
+            if os.path.isfile(full_path):
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                new_content, count = replace_commit_marker_in_text(content, commit_hash)
+                if count > 0:
+                    with open(full_path, "w", encoding="utf-8") as f:
+                        f.write(new_content)
+                    updated_files.append(p)
+    return updated_files
+
+
+def update_evidence_commit_markers(paths, change_commit, issue, env=None, root=ROOT):
+    """Replace {{COMMIT}} in changed evidence files and record in a follow-up commit (D-039).
+
+    Returns the list of updated evidence file paths, or [] if none contained the marker.
+    """
+    updated = replace_commit_markers(paths, change_commit, root=root)
+    if updated:
+        for p in updated:
+            run(["git", "add", p], env=env, cwd=root)
+        run(["git", "commit", "-q", "-m", f"Record change commit in evidence\n\nRefs #{issue}"],
+            env=env, cwd=root)
+    return updated
+
+
 def deliver(role, issue, title, branch, output, extra_paths, number):
     """Commit and push the author's changes as the role; open the pull request if there is none.
 
@@ -220,6 +281,11 @@ def deliver(role, issue, title, branch, output, extra_paths, number):
                GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_EMAIL=email)
     run(["git", "add", "-A"], env=env)
     run(["git", "commit", "-q", "-m", f"{pr_title}\n\nRefs #{issue}"], env=env)
+
+    # D-039: Replace {{COMMIT}} marker in changed evidence files with the full change commit hash.
+    change_commit = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    update_evidence_commit_markers(paths, change_commit, issue, env=env)
+
     helper = "!f() { echo username=x-access-token; echo \"password=$NEXTOOMIO_PUSH_TOKEN\"; }; f"
     run(["git", "-c", "credential.helper=", "-c", f"credential.helper={helper}",
          "push", "-q", "-u", "origin", branch], env=dict(env, NEXTOOMIO_PUSH_TOKEN=token(role)))
@@ -441,7 +507,94 @@ def run_self_tests():
         assert res_custom.returncode == 0, f"agent-run.sh with NEXTOOMIO_AGENTS_DIR failed: {res_custom.stderr}"
         assert "CUSTOM_AGENT_BRIEF_CONTENT" in res_custom.stdout, f"Custom brief not found: {res_custom.stdout}"
         assert "custom task" in res_custom.stdout, f"Custom task not found: {res_custom.stdout}"
+        assert "{{COMMIT}}" in res_custom.stdout, f"Marker instruction missing from agent prompt: {res_custom.stdout}"
+        assert "'Image version and commit'" in res_custom.stdout, f"Field instruction missing from agent prompt: {res_custom.stdout}"
         print("test_agent_run_pinned_agents: OK")
+
+        # Test 4: AC1 verification of replace_commit_markers and update_evidence_commit_markers (D-039)
+        test_text = (
+            "# Evidence: P0-F9.9 Test\n"
+            "- **Date:** 2026-11-14\n"
+            "- **Image version and commit:** none (repository only); commit {{COMMIT}}\n"
+            "- **Hardware model and revision:** none\n"
+            "- **Physical access needed:** none\n\n"
+            "## Procedure\n"
+            "Verify that {{COMMIT}} in prose is preserved and not replaced.\n\n"
+            "## Observed result\n"
+            "The {{COMMIT}} marker in prose remains.\n\n"
+            "## Missed targets\nNone.\n"
+        )
+        fake_sha = "0123456789abcdef0123456789abcdef01234567"
+        replaced_text, rep_count = replace_commit_marker_in_text(test_text, fake_sha)
+        assert rep_count == 1, f"Expected exactly 1 replacement, got {rep_count}"
+        assert f"commit {fake_sha}" in replaced_text, f"Field not updated: {replaced_text}"
+        assert "Verify that {{COMMIT}} in prose is preserved" in replaced_text, "Prose marker in procedure was rewritten!"
+        assert "The {{COMMIT}} marker in prose remains" in replaced_text, "Prose marker in observed result rewritten!"
+
+        # In-repo git workflow test for update_evidence_commit_markers
+        d039_repo = os.path.join(tmpdir, "d039_repo")
+        os.makedirs(d039_repo)
+        subprocess.run(["git", "init", "-q", "-b", "main", d039_repo], check=True)
+        subprocess.run(["git", "-C", d039_repo, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", d039_repo, "config", "user.email", "pipeline-test@example.com"], check=True)
+
+        readme_d039 = os.path.join(d039_repo, "README.md")
+        with open(readme_d039, "w") as f:
+            f.write("# Test\n")
+        subprocess.run(["git", "-C", d039_repo, "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", d039_repo, "commit", "-q", "-m", "Initial commit"], check=True)
+
+        subprocess.run(["git", "-C", d039_repo, "switch", "-q", "-c", "ops/P0-F9.9-test"], check=True)
+
+        code_file = os.path.join(d039_repo, "feature.py")
+        with open(code_file, "w") as f:
+            f.write("def run():\n    return 42\n")
+
+        ev_dir = os.path.join(d039_repo, "docs", "evidence", "p0")
+        os.makedirs(ev_dir)
+        ev_file = os.path.join(ev_dir, "P0-F9.9.md")
+        ev_rel = "docs/evidence/p0/P0-F9.9.md"
+        with open(ev_file, "w") as f:
+            f.write(test_text)
+
+        paths = ["feature.py", ev_rel]
+        subprocess.run(["git", "-C", d039_repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", d039_repo, "commit", "-q", "-m", "Implement feature and add evidence\n\nRefs #99"], check=True)
+
+        change_commit = subprocess.run(["git", "-C", d039_repo, "rev-parse", "HEAD"],
+                                       capture_output=True, text=True, check=True).stdout.strip()
+        assert len(change_commit) == 40, f"Expected 40-character sha, got: {change_commit}"
+
+        # Verify change commit contains the feature code
+        show_code = subprocess.run(["git", "-C", d039_repo, "show", f"{change_commit}:feature.py"],
+                                   capture_output=True, text=True, check=True).stdout
+        assert "def run():" in show_code
+
+        # Run update_evidence_commit_markers (the exact function deliver() calls)
+        updated = update_evidence_commit_markers(paths, change_commit, 99, root=d039_repo)
+        assert updated == [ev_rel], f"Expected [{ev_rel}], got: {updated}"
+
+        follow_up_commit = subprocess.run(["git", "-C", d039_repo, "rev-parse", "HEAD"],
+                                          capture_output=True, text=True, check=True).stdout.strip()
+        assert follow_up_commit != change_commit
+
+        # Verify follow-up commit message and touched files
+        commit_msg = subprocess.run(["git", "-C", d039_repo, "log", "-1", "--format=%B", follow_up_commit],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+        assert commit_msg == "Record change commit in evidence\n\nRefs #99"
+
+        diff_files = subprocess.run(["git", "-C", d039_repo, "diff-tree", "--no-commit-id", "--name-only", "-r", follow_up_commit],
+                                    capture_output=True, text=True, check=True).stdout.strip().splitlines()
+        assert diff_files == [ev_rel], f"Follow-up commit changed unexpected files: {diff_files}"
+
+        # Verify file content at follow_up_commit
+        ev_after = subprocess.run(["git", "-C", d039_repo, "show", f"{follow_up_commit}:{ev_rel}"],
+                                  capture_output=True, text=True, check=True).stdout
+        assert f"- **Image version and commit:** none (repository only); commit {change_commit}" in ev_after
+        assert "Verify that {{COMMIT}} in prose is preserved" in ev_after
+        assert "The {{COMMIT}} marker in prose remains" in ev_after
+
+        print("test_d039_commit_marker_replacement: OK")
 
     print("OK: all self-tests passed.")
     return 0
