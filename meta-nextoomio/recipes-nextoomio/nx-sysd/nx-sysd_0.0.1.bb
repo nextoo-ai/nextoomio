@@ -29,13 +29,7 @@ do_install:append() {
 
     if ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'true', 'false', d)}; then
         install -d ${D}${systemd_system_unitdir}
-        if [ -f "${WORKDIR}/sources-unpack/nextoomio-device-id.service" ]; then
-            install -m 0644 "${WORKDIR}/sources-unpack/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
-        elif [ -f "${UNPACKDIR}/nextoomio-device-id.service" ]; then
-            install -m 0644 "${UNPACKDIR}/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
-        else
-            install -m 0644 "${WORKDIR}/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
-        fi
+        install -m 0644 "${UNPACKDIR}/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
     fi
 }
 

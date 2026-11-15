@@ -290,8 +290,12 @@ def main() -> int:
         for field in ("BUILD_ID", "IMAGE_VERSION", "NEXTOOMIO_SOURCE_COMMIT", "NEXTOOMIO_BUILD_ID", "NEXTOOMIO_IMAGE_VERSION", "NEXTOOMIO_HARDWARE_COMPAT"):
             if field not in osr_text:
                 errors.append(f"os-release.bbappend must include '{field}' in OS_RELEASE_FIELDS (AC1, AC2, P0-F2.3)")
-        if "nextoomio-release" not in osr_text:
-            errors.append("os-release.bbappend must install /etc/nextoomio-release convenience release file (AC1, P0-F2.3)")
+
+    distro_conf = ROOT / "meta-nextoomio/conf/distro/nextoomio.conf"
+    if distro_conf.is_file():
+        dist_text = distro_conf.read_text(encoding="utf-8")
+        if "nextoomio_derive_source_commit" not in dist_text or "NEXTOOMIO_SOURCE_COMMIT" not in dist_text:
+            errors.append("nextoomio.conf must derive NEXTOOMIO_SOURCE_COMMIT dynamically at build time (AC1, AC4, P0-F2.3)")
 
     image_version_class = ROOT / "meta-nextoomio/classes/nextoomio-image-version.bbclass"
     if image_version_class.is_file():

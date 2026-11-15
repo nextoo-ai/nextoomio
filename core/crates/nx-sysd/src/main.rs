@@ -1,6 +1,10 @@
 mod identity;
 
-use identity::{get_or_create_device_id, query_device_identity, HardwareIdentity, VersionInfo};
+use identity::{
+    get_or_create_device_id_with_path, query_device_identity, HardwareIdentity, VersionInfo,
+    DEFAULT_DEVICE_ID_PATH,
+};
+use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -11,56 +15,103 @@ fn main() {
 
     let subcmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
-    // Default or identity subcommand prints complete device identity as JSON (AC1, AC2, AC3)
+    // nx-identity symlink or 'nx-sysd identity' subcommand prints complete device identity as JSON (AC1, AC2, AC3)
     if is_nx_identity || subcmd == "identity" || subcmd == "--identity" || subcmd.is_empty() {
-        let identity = query_device_identity();
-        println!("{}", serde_json::to_string_pretty(&identity).unwrap());
+        match query_device_identity() {
+            Ok(identity) => match serde_json::to_string_pretty(&identity) {
+                Ok(json) => println!("{json}"),
+                Err(e) => {
+                    eprintln!("Error serializing device identity: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("Error querying device identity: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
     match subcmd {
         "version" | "--version" | "-V" => {
             let want_json = args.iter().any(|a| a == "--json");
-            let identity = query_device_identity();
-            if want_json {
-                let v = VersionInfo {
-                    image_version: identity.image_version,
-                    source_commit: identity.source_commit,
-                    build_id: identity.build_id,
-                    running_slot: identity.running_slot,
-                };
-                println!("{}", serde_json::to_string_pretty(&v).unwrap());
-            } else {
-                println!(
-                    "nextoomio {} ({}, build {}, slot {})",
-                    identity.image_version,
-                    identity.source_commit,
-                    identity.build_id,
-                    identity.running_slot
-                );
+            match query_device_identity() {
+                Ok(identity) => {
+                    if want_json {
+                        let v = VersionInfo {
+                            image_version: identity.image_version,
+                            source_commit: identity.source_commit,
+                            build_id: identity.build_id,
+                            running_slot: identity.running_slot,
+                        };
+                        match serde_json::to_string_pretty(&v) {
+                            Ok(json) => println!("{json}"),
+                            Err(e) => {
+                                eprintln!("Error serializing version info: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        println!(
+                            "nextoomio {} ({}, build {}, slot {})",
+                            identity.image_version,
+                            identity.source_commit,
+                            identity.build_id,
+                            identity.running_slot
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error querying version: {e}");
+                    std::process::exit(1);
+                }
             }
         }
-        "hardware" | "--hardware" => {
-            let identity = query_device_identity();
-            let hw = HardwareIdentity {
-                board_model: identity.board_model,
-                hardware_compatibility: identity.hardware_compatibility,
-            };
-            println!("{}", serde_json::to_string_pretty(&hw).unwrap());
-        }
+        "hardware" | "--hardware" => match query_device_identity() {
+            Ok(identity) => {
+                let hw = HardwareIdentity {
+                    board_model: identity.board_model,
+                    hardware_compatibility: identity.hardware_compatibility,
+                };
+                match serde_json::to_string_pretty(&hw) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => {
+                        eprintln!("Error serializing hardware identity: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error querying hardware identity: {e}");
+                std::process::exit(1);
+            }
+        },
         "device-id" | "--device-id" => {
             let want_json = args.iter().any(|a| a == "--json");
-            let dev_id = get_or_create_device_id();
-            if want_json {
-                println!("{{\"device_id\": \"{dev_id}\"}}");
-            } else {
-                println!("{dev_id}");
+            match get_or_create_device_id_with_path(Path::new(DEFAULT_DEVICE_ID_PATH)) {
+                Ok(dev_id) => {
+                    if want_json {
+                        println!("{{\"device_id\": \"{dev_id}\"}}");
+                    } else {
+                        println!("{dev_id}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error obtaining device ID: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         "init-device-id" => {
             // One-shot initialization at boot (AC3)
-            let id = get_or_create_device_id();
-            eprintln!("nextoomio device-id initialized: {id}");
+            match get_or_create_device_id_with_path(Path::new(DEFAULT_DEVICE_ID_PATH)) {
+                Ok(id) => eprintln!("nextoomio device-id initialized: {id}"),
+                Err(e) => {
+                    eprintln!("Failed to initialize device ID: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         "help" | "--help" | "-h" => {
             println!("Usage: nx-sysd [COMMAND] [OPTIONS]");
@@ -71,11 +122,11 @@ fn main() {
             println!("  hardware          Print board model and hardware compatibility JSON");
             println!("  device-id         Print random persistent device ID");
             println!("  init-device-id    Initialize persistent device ID on data partition");
-            println!("  daemon            Run background privileged operations daemon");
+            println!("  daemon            Run privileged operations helper (stub)");
         }
         "daemon" | "--daemon" => {
             let initial_state = nx_protocol::UpdateTransactionState::Idle;
-            println!("nx-sysd v0.0.1-dev daemon running (update_state={initial_state:?})");
+            println!("nx-sysd v0.0.1-dev stub (daemon mode not yet implemented, update_state={initial_state:?})");
         }
         other => {
             eprintln!("Unknown command: '{other}'. Run 'nx-sysd --help' for usage.");
