@@ -165,8 +165,10 @@ def agent(role, task, log, extra_paths=None, cwd=None):
             f.write(f"\n===== {role}: timed out =====\n{expired.stdout or ''}\n")
         raise Stop(1, f"{role} did not finish within {AGENT_TIMEOUT // 60} minutes")
     with open(log, "a") as f:
-        f.write(f"\n===== {role} @ {datetime.datetime.now().isoformat()} =====\n{out.stdout}\n")
+        f.write(f"\n===== {role} @ {datetime.datetime.now().isoformat()} =====\n{out.stdout or ''}\n")
     say(f"{role}: finished (exit {out.returncode})")
+    if out.returncode != 0:
+        raise Stop(1, f"{role} session failed with exit status {out.returncode}; see log {log}")
     return out.stdout or ""
 
 
@@ -712,6 +714,128 @@ def run_self_tests():
                                       capture_output=True, text=True, check=True).stdout.strip()
         assert curr_head_pr == c_pr2, f"Expected {c_pr2}, got {curr_head_pr}"
         print("test_d042_ac2_open_pr_updates_local_to_remote_commit: OK")
+
+        # Test 7: AC1 and AC2 verification of role session failure handling (D-044)
+        failing_run_sh = os.path.join(tmpdir, "failing-agent-run.sh")
+        with open(failing_run_sh, "w") as f:
+            f.write("#!/bin/sh\necho \"Error: session failed with usage limit or token error\" >&2\nexit 1\n")
+        os.chmod(failing_run_sh, 0o755)
+
+        d044_log = os.path.join(tmpdir, "agents-d044.log")
+        fail_tooling = Tooling(
+            run_dir=tmpdir,
+            tooling_dir=tmpdir,
+            agent_run=failing_run_sh,
+            agent_token=tooling_root.agent_token,
+            role_guard=tooling_root.role_guard,
+            agents_dir=tooling_root.agents_dir,
+        )
+
+        old_tooling = TOOLING
+        try:
+            TOOLING = fail_tooling
+
+            # AC1: agent() raises Stop(1) naming the role, exit status, and run log
+            role_failed = False
+            try:
+                agent("reviewer", "Review pull request #168", log=d044_log)
+            except Stop as exc:
+                role_failed = True
+                assert exc.status == 1, f"Expected Stop status 1, got {exc.status}"
+                assert "reviewer" in str(exc), f"Role name not in error message: {exc}"
+                assert "1" in str(exc), f"Status not in error message: {exc}"
+                assert d044_log in str(exc), f"Log path not in error message: {exc}"
+            assert role_failed, "agent() did not raise Stop on non-zero exit status"
+
+            # Check that log file recorded the failure output
+            with open(d044_log, "r") as f:
+                log_content = f.read()
+            assert "Error: session failed with usage limit or token error" in log_content
+            print("test_d044_ac1_session_exit_status_stops_with_exit_1: OK")
+
+            # AC1 check with another exit code (e.g. 127) and developer role
+            with open(failing_run_sh, "w") as f:
+                f.write("#!/bin/sh\necho \"Command not found: agy\" >&2\nexit 127\n")
+            dev_failed = False
+            try:
+                agent("developer", "Implement task #178", log=d044_log)
+            except Stop as exc:
+                dev_failed = True
+                assert exc.status == 1, f"Expected Stop status 1, got {exc.status}"
+                assert "developer" in str(exc), f"Role name not in error message: {exc}"
+                assert "127" in str(exc), f"Status 127 not in error message: {exc}"
+                assert d044_log in str(exc), f"Log path not in error message: {exc}"
+            assert dev_failed, "agent() did not raise Stop for developer on exit 127"
+            print("test_d044_ac1_session_exit_127_stops_with_exit_1: OK")
+
+            # AC2: Given the failure, verify no calls modify issue labels or comment on issue
+            gh_issue_mutations = []
+            def tracking_gh(args, role=None, check=True):
+                # Detect any command that edits, comments on, or closes an issue
+                if len(args) >= 2 and args[0] == "issue" and args[1] in ("edit", "comment", "close"):
+                    gh_issue_mutations.append(args)
+                return "{}"
+
+            # Monkeypatch gh during pipeline caller simulation
+            global gh
+            real_gh = gh
+            gh = tracking_gh
+            try:
+                # Reviewer failure scenario (D-044 / #168):
+                # Pipeline starts reviewer; on failure, execution must abort without calling block()
+                # or modifying the issue.
+                reviewer_aborted = False
+                try:
+                    agent("reviewer", "Review pull request #168", log=d044_log)
+                    verdict, head = None, "head123"
+                    if verdict is None:
+                        block(168, f"the Reviewer submitted no verdict on pull request #42 at {head}.")
+                except Stop as stop_exc:
+                    reviewer_aborted = True
+                    assert stop_exc.status == 1
+
+                assert reviewer_aborted, "Reviewer failure did not abort pipeline execution"
+                assert gh_issue_mutations == [], f"AC2 violated: issue mutation calls made on reviewer failure: {gh_issue_mutations}"
+
+                # Author failure scenario:
+                author_aborted = False
+                try:
+                    output = agent("devops", "Implement task", log=d044_log)
+                    delivered = deliver("devops", 178, "Title", "ops/test", output, [], None)
+                    if not delivered:
+                        block(178, "the devops finished without changing anything.")
+                except Stop as stop_exc:
+                    author_aborted = True
+                    assert stop_exc.status == 1
+
+                assert author_aborted, "Author failure did not abort pipeline execution"
+                assert gh_issue_mutations == [], f"AC2 violated: issue mutation calls made on author failure: {gh_issue_mutations}"
+
+                # QM failure scenario:
+                qm_aborted = False
+                try:
+                    agent("qm", "Verify task", log=d044_log)
+                except Stop as stop_exc:
+                    qm_aborted = True
+                    assert stop_exc.status == 1
+
+                assert qm_aborted, "QM failure did not abort pipeline execution"
+                assert gh_issue_mutations == [], f"AC2 violated: issue mutation calls made on QM failure: {gh_issue_mutations}"
+
+                # Contrast check: verify that block() DOES call gh to edit and comment
+                try:
+                    block(999, "test block reason")
+                except Stop:
+                    pass
+                assert len(gh_issue_mutations) == 2, f"Expected 2 issue mutations from block(), got {len(gh_issue_mutations)}"
+                assert gh_issue_mutations[0][:4] == ["issue", "edit", "999", "--remove-label"]
+                assert gh_issue_mutations[1][:3] == ["issue", "comment", "999"]
+            finally:
+                gh = real_gh
+
+            print("test_d044_ac2_no_issue_label_changes_or_comments_on_failure: OK")
+        finally:
+            TOOLING = old_tooling
 
     print("OK: all self-tests passed.")
     return 0
