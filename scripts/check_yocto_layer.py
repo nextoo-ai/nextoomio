@@ -25,6 +25,7 @@ def main() -> int:
         ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
         ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
         ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb",
+        ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/data.mount.d/10-condition.conf",
         ROOT / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
         ROOT / "meta-nextoomio/recipes-core/base-files/files/fstab",
         ROOT / "meta-nextoomio/recipes-core/systemd/systemd-conf_%.bbappend",
@@ -86,6 +87,10 @@ def main() -> int:
         for unit in ("nextoomio-boot-mount.service", "nextoomio-data-grow.service", "nextoomio-data-check.service", "nextoomio-data-init.service"):
             if unit not in data_recipe_text:
                 errors.append(f"nextoomio-data_0.0.1.bb missing systemd unit registration: {unit}")
+        if 'S = "${WORKDIR}"' in data_recipe_text:
+            errors.append('nextoomio-data_0.0.1.bb must not use S = "${WORKDIR}" (unsupported in modern BitBake)')
+        if "data.mount.d/10-condition.conf" not in data_recipe_text:
+            errors.append("nextoomio-data_0.0.1.bb missing data.mount condition drop-in installation")
 
     if errors:
         for err in errors:

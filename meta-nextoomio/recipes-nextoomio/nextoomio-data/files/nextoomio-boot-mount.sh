@@ -41,24 +41,24 @@ else
     esac
 fi
 
-BOOT_DEV="/dev/disk/by-label/boot_${SLOT}"
-if [ ! -b "$BOOT_DEV" ]; then
-    if [ "$SLOT" = "b" ]; then
-        BOOT_DEV="/dev/mmcblk0p3"
-    else
-        BOOT_DEV="/dev/mmcblk0p2"
-    fi
+BOOT_DEV_A="${NEXTOOMIO_BOOT_DEV_A:-/dev/disk/by-label/boot_a}"
+BOOT_DEV_B="${NEXTOOMIO_BOOT_DEV_B:-/dev/disk/by-label/boot_b}"
+
+if [ "$SLOT" = "b" ]; then
+    BOOT_DEV="$BOOT_DEV_B"
+    FALLBACK_DEV="/dev/mmcblk0p3"
+else
+    BOOT_DEV="$BOOT_DEV_A"
+    FALLBACK_DEV="/dev/mmcblk0p2"
+fi
+
+if [ ! -e "$BOOT_DEV" ] && [ -b "$FALLBACK_DEV" ]; then
+    BOOT_DEV="$FALLBACK_DEV"
 fi
 
 mkdir -p "$BOOT_DIR"
 
-if [ -n "${NEXTOOMIO_MOCK_MOUNT:-}" ]; then
-    echo "nextoomio-boot-mount: [mock] mounting $BOOT_DEV on $BOOT_DIR read-only (slot $SLOT)"
-    echo "slot=$SLOT label=boot_$SLOT device=$BOOT_DEV target=$BOOT_DIR options=ro,defaults,nofail" > "$BOOT_DIR/.mounted_info"
-    exit 0
-fi
-
-if [ -b "$BOOT_DEV" ]; then
+if [ -e "$BOOT_DEV" ]; then
     echo "nextoomio-boot-mount: mounting active boot slot $SLOT ($BOOT_DEV) on $BOOT_DIR read-only"
     mount -t vfat -o ro,defaults,nofail "$BOOT_DEV" "$BOOT_DIR"
 else

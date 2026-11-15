@@ -5,6 +5,7 @@ DefaultDependencies=no
 Conflicts=shutdown.target
 Before=nextoomio-data-check.service systemd-fsck@dev-disk-by\x2dlabel-data.service data.mount local-fs-pre.target
 After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
 
 [Service]
 Type=oneshot

@@ -6,8 +6,48 @@ DATA_DIR="${NEXTOOMIO_DATA_DIR:-/data}"
 RUN_DIR="${NEXTOOMIO_RUN_DIR:-/run/nextoomio}"
 VAR_LOG_DIR="${NEXTOOMIO_VAR_LOG_DIR:-/var/log}"
 
+# Helper for preallocating fixed-capacity files with real disk blocks (AC4, ARCHITECTURE.md section 3.5 & 3.6)
+preallocate_file() {
+    target_file="$1"
+    size_bytes="$2"
+
+    if [ -f "$target_file" ]; then
+        current_size=$(wc -c < "$target_file" 2>/dev/null | tr -d ' ' || echo 0)
+        if [ "$current_size" -ne "$size_bytes" ]; then
+            echo "nextoomio-data-init: $target_file size mismatch ($current_size != $size_bytes), re-allocating..."
+            rm -f "$target_file"
+        fi
+    fi
+
+    if [ ! -f "$target_file" ]; then
+        echo "nextoomio-data-init: preallocating $target_file ($size_bytes bytes)..."
+        if command -v fallocate >/dev/null 2>&1; then
+            if ! fallocate -l "$size_bytes" "$target_file"; then
+                echo "nextoomio-data-init: ERROR fallocate failed for $target_file" >&2
+                rm -f "$target_file"
+                return 1
+            fi
+        elif command -v dd >/dev/null 2>&1; then
+            bs=1048576
+            count=$((size_bytes / bs))
+            if [ "$count" -eq 0 ]; then
+                bs=1024
+                count=$((size_bytes / bs))
+            fi
+            if ! dd if=/dev/zero of="$target_file" bs="$bs" count="$count" status=none; then
+                echo "nextoomio-data-init: ERROR dd allocation failed for $target_file" >&2
+                rm -f "$target_file"
+                return 1
+            fi
+        else
+            echo "nextoomio-data-init: ERROR neither fallocate nor dd found" >&2
+            return 1
+        fi
+    fi
+}
+
 # Handle data_unavailable recovery mode (AC5)
-if [ -f "$RUN_DIR/data_unavailable" ] || { [ -z "${NEXTOOMIO_TEST_MOUNT:-}" ] && ! mountpoint -q "$DATA_DIR"; }; then
+if [ -f "$RUN_DIR/data_unavailable" ] || ! mountpoint -q "$DATA_DIR"; then
     echo "nextoomio-data-init: persistent data partition is unavailable (AC5 recovery mode)" >&2
     mkdir -p "$RUN_DIR"
     touch "$RUN_DIR/data_unavailable"
@@ -16,7 +56,10 @@ if [ -f "$RUN_DIR/data_unavailable" ] || { [ -z "${NEXTOOMIO_TEST_MOUNT:-}" ] &&
     # Mount in-memory volatile tmpfs on /data for recovery state without touching raw disk
     if ! mountpoint -q "$DATA_DIR"; then
         echo "nextoomio-data-init: providing default volatile storage in memory at $DATA_DIR"
-        mount -t tmpfs -o size=32M,mode=0755 tmpfs "$DATA_DIR" 2>/dev/null || true
+        if ! mount -t tmpfs -o size=32M,mode=0755 tmpfs "$DATA_DIR"; then
+            echo "nextoomio-data-init: ERROR failed to mount recovery tmpfs at $DATA_DIR" >&2
+            exit 1
+        fi
     fi
 
     mkdir -p "$DATA_DIR/config" "$DATA_DIR/secrets" "$DATA_DIR/music" "$DATA_DIR/update" "$DATA_DIR/log"
@@ -47,36 +90,12 @@ mkdir -p "$DATA_DIR/update"
 chmod 0755 "$DATA_DIR/update"
 chown root:root "$DATA_DIR/update" 2>/dev/null || true
 
-# Preallocate fixed-capacity staging file (1 GiB) if not present (ARCHITECTURE.md section 3.5 & 3.6)
-if [ ! -f "$DATA_DIR/update/staging.swu" ]; then
-    echo "nextoomio-data-init: preallocating fixed-capacity $DATA_DIR/update/staging.swu (1 GiB)..."
-    if command -v fallocate >/dev/null 2>&1; then
-        fallocate -l 1G "$DATA_DIR/update/staging.swu" 2>/dev/null || true
-    fi
-    if [ ! -f "$DATA_DIR/update/staging.swu" ] && command -v dd >/dev/null 2>&1; then
-        dd if=/dev/zero of="$DATA_DIR/update/staging.swu" bs=1048576 count=0 seek=1024 2>/dev/null || true
-    fi
-fi
+# Preallocate fixed-capacity staging file (1 GiB = 1073741824 bytes) (ARCHITECTURE.md section 3.5 & 3.6)
+preallocate_file "$DATA_DIR/update/staging.swu" 1073741824
 
-# Preallocate bounded dual-record update journal (ARCHITECTURE.md section 3.5 & 3.6)
-if [ ! -f "$DATA_DIR/update/journal.0" ]; then
-    echo "nextoomio-data-init: preallocating $DATA_DIR/update/journal.0..."
-    if command -v fallocate >/dev/null 2>&1; then
-        fallocate -l 64K "$DATA_DIR/update/journal.0" 2>/dev/null || true
-    fi
-    if [ ! -f "$DATA_DIR/update/journal.0" ] && command -v dd >/dev/null 2>&1; then
-        dd if=/dev/zero of="$DATA_DIR/update/journal.0" bs=1024 count=0 seek=64 2>/dev/null || true
-    fi
-fi
-if [ ! -f "$DATA_DIR/update/journal.1" ]; then
-    echo "nextoomio-data-init: preallocating $DATA_DIR/update/journal.1..."
-    if command -v fallocate >/dev/null 2>&1; then
-        fallocate -l 64K "$DATA_DIR/update/journal.1" 2>/dev/null || true
-    fi
-    if [ ! -f "$DATA_DIR/update/journal.1" ] && command -v dd >/dev/null 2>&1; then
-        dd if=/dev/zero of="$DATA_DIR/update/journal.1" bs=1024 count=0 seek=64 2>/dev/null || true
-    fi
-fi
+# Preallocate bounded dual-record update journal (64 KiB = 65536 bytes each) (ARCHITECTURE.md section 3.5 & 3.6)
+preallocate_file "$DATA_DIR/update/journal.0" 65536
+preallocate_file "$DATA_DIR/update/journal.1" 65536
 
 # 5. Persistent log ring: /data/log (mode 0755, root:root - section 3.5)
 mkdir -p "$DATA_DIR/log"
@@ -88,20 +107,23 @@ chmod 0755 "$DATA_DIR/log/journal"
 
 # Connect persistent log ring to /var/log/journal
 mkdir -p "$VAR_LOG_DIR/journal"
-if ! mountpoint -q "$VAR_LOG_DIR/journal" 2>/dev/null; then
-    mount --bind "$DATA_DIR/log/journal" "$VAR_LOG_DIR/journal" 2>/dev/null || true
+if ! mountpoint -q "$VAR_LOG_DIR/journal"; then
+    echo "nextoomio-data-init: bind-mounting $DATA_DIR/log/journal to $VAR_LOG_DIR/journal..."
+    if ! mount --bind "$DATA_DIR/log/journal" "$VAR_LOG_DIR/journal"; then
+        echo "nextoomio-data-init: ERROR failed to bind-mount persistent log ring to $VAR_LOG_DIR/journal" >&2
+        exit 1
+    fi
 fi
 
 # Request journald to flush in-memory buffers to persistent storage
-if command -v killall >/dev/null 2>&1; then
-    killall -USR1 systemd-journald 2>/dev/null || true
-elif command -v systemctl >/dev/null 2>&1; then
+if command -v systemctl >/dev/null 2>&1; then
     systemctl kill --signal=SIGUSR1 systemd-journald.service 2>/dev/null || true
+elif command -v killall >/dev/null 2>&1; then
+    killall -USR1 systemd-journald 2>/dev/null || true
 fi
 
-# Create markers for completion and resize idempotency
+# Create marker for initialization completion
 touch "$DATA_DIR/.initialized"
-touch "$DATA_DIR/.resized"
 rm -f "$RUN_DIR/data_unavailable"
 mkdir -p "$RUN_DIR"
 echo "data_available" > "$RUN_DIR/data_status"
