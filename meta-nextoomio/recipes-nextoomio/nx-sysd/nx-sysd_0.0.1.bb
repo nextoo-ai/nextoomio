@@ -6,7 +6,7 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7ca
 
 inherit cargo cargo-update-recipe-crates
 
-FILESEXTRAPATHS:prepend := "${LAYERDIR}/..:"
+FILESEXTRAPATHS:prepend := "${THISDIR}/../../..:"
 
 SRC_URI = " \
     file://core \
