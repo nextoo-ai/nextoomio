@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from typing import NamedTuple
 
 REPO = os.environ.get("NEXTOOMIO_REPO", "nextoo-ai/nextoomio")
@@ -178,8 +179,8 @@ def bot_identity(role):
     return bot, f"{bot_id}+{bot}@users.noreply.github.com"
 
 
-def changed_paths():
-    out = run(["git", "status", "--porcelain", "-uall"]).stdout
+def changed_paths(cwd=None):
+    out = run(["git", "status", "--porcelain", "-uall"], cwd=cwd).stdout
     return [line[3:].split(" -> ")[-1].strip('"') for line in out.splitlines() if line.strip()]
 
 
@@ -260,18 +261,18 @@ def update_evidence_commit_markers(paths, change_commit, issue, env=None, root=R
     return updated
 
 
-def deliver(role, issue, title, branch, output, extra_paths, number):
+def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
     """Commit and push the author's changes as the role; open the pull request if there is none.
 
     Returns the pull request number, or None when the author changed nothing.
     """
-    paths = changed_paths()
+    paths = changed_paths(cwd=cwd)
     if not paths:
         return None
-    refused = outside_role_paths(role, paths, extra_paths)
+    refused = outside_role_paths(role, paths, extra_paths, cwd=cwd)
     if refused:
-        run(["git", "stash", "push", "-u", "-m", f"pipeline: refused changes for issue {issue}"])
-        run(["git", "switch", "main"])
+        run(["git", "stash", "push", "-u", "-m", f"pipeline: refused changes for issue {issue}"], cwd=cwd)
+        run(["git", "switch", "main"], cwd=cwd)
         block(issue, f"the {role} changed paths outside its role, so nothing was committed: "
                      + ", ".join(f"`{p}`" for p in refused) + ". The changes are kept in a local stash.")
     found = re.search(r"^PR-Title:\s*(.+)$", output, re.M)
@@ -281,16 +282,16 @@ def deliver(role, issue, title, branch, output, extra_paths, number):
     bot, email = bot_identity(role)
     env = dict(os.environ, GIT_AUTHOR_NAME=bot, GIT_COMMITTER_NAME=bot,
                GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_EMAIL=email)
-    run(["git", "add", "-A"], env=env)
-    run(["git", "commit", "-q", "-m", f"{pr_title}\n\nRefs #{issue}"], env=env)
+    run(["git", "add", "-A"], env=env, cwd=cwd)
+    run(["git", "commit", "-q", "-m", f"{pr_title}\n\nRefs #{issue}"], env=env, cwd=cwd)
 
     # D-039: Replace {{COMMIT}} marker in changed evidence files with the full change commit hash.
-    change_commit = run(["git", "rev-parse", "HEAD"]).stdout.strip()
-    update_evidence_commit_markers(paths, change_commit, issue, env=env)
+    change_commit = run(["git", "rev-parse", "HEAD"], cwd=cwd).stdout.strip()
+    update_evidence_commit_markers(paths, change_commit, issue, env=env, root=cwd or ROOT)
 
     helper = "!f() { echo username=x-access-token; echo \"password=$NEXTOOMIO_PUSH_TOKEN\"; }; f"
     run(["git", "-c", "credential.helper=", "-c", f"credential.helper={helper}",
-         "push", "-q", "-u", "origin", branch], env=dict(env, NEXTOOMIO_PUSH_TOKEN=token(role)))
+         "push", "-q", "-u", "origin", branch], env=dict(env, NEXTOOMIO_PUSH_TOKEN=token(role, cwd=cwd)), cwd=cwd)
     if number:
         gh(["pr", "comment", str(number), "--body",
             f"{summary}\n\nRole: {role.capitalize()} · Model: {AUTHOR_MODEL}"], role=role)
@@ -394,8 +395,31 @@ def block(issue, reason):
     raise Stop(2, f"issue #{issue} blocked: {reason}")
 
 
+def cleanup_checkout(cwd=None):
+    """Switch checkout back to main when the working tree is clean (D-047).
+
+    When the checkout is on a change branch and the tree is not clean,
+    leaves it as it is and says so in its last message, naming the branch.
+    """
+    branch = run(["git", "branch", "--show-current"], cwd=cwd, check=False).stdout.strip()
+    if not branch or branch == "HEAD":
+        branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd, check=False).stdout.strip()
+        if branch == "HEAD":
+            branch = run(["git", "rev-parse", "--short", "HEAD"], cwd=cwd, check=False).stdout.strip()
+    if branch == "main" or not branch:
+        return
+    is_dirty = bool(run(["git", "status", "--porcelain"], cwd=cwd, check=False).stdout.strip())
+    if is_dirty:
+        say(f"the working tree is not clean; checkout left on {branch}")
+    else:
+        res = run(["git", "switch", "main"], cwd=cwd, check=False)
+        if res.returncode != 0:
+            say(f"failed to switch checkout back to main: {(res.stdout or '').strip()}")
+
+
 def run_self_tests():
     """Run self-tests verifying that pinned tooling runs instead of branch tooling (D-040, AC2)."""
+    global TOOLING, gh, pr_state, say
     print("Running agent-pipeline self-tests...")
     with tempfile.TemporaryDirectory() as tmpdir:
         # Test 1: pin_tooling copies all required files and marks them executable (AC1)
@@ -481,7 +505,6 @@ def run_self_tests():
         print(f"test_ac2: direct branch agent-run.sh exit {branch_run_res.returncode}")
 
         # Test that pipeline functions use the pinned copies, NOT the branch's
-        global TOOLING
         old_tooling = TOOLING
         try:
             TOOLING = tooling
@@ -796,7 +819,6 @@ def run_self_tests():
                 return "{}"
 
             # Monkeypatch gh during pipeline caller simulation
-            global gh
             real_gh = gh
             gh = tracking_gh
             try:
@@ -855,7 +877,6 @@ def run_self_tests():
             print("test_d044_ac2_no_issue_label_changes_or_comments_on_failure: OK")
 
             # Test 8: AC1, AC2, and AC3 verification of conflicting pull request handling (D-045)
-            global pr_state
             real_pr_state = pr_state
             real_gh = gh
             real_sleep = time.sleep
@@ -1126,11 +1147,127 @@ def run_self_tests():
                               capture_output=True, text=True, check=True).stdout.strip() == c_remote2
         print("test_d046_ac2_existing_remote_branches_uses_suffix_3: OK")
 
+        # Test 10: AC1 and AC2 verification of checkout restoration to main on run completion or stop (D-047)
+        d047_origin = os.path.join(tmpdir, "d047_origin")
+        d047_local = os.path.join(tmpdir, "d047_local")
+        os.makedirs(d047_origin)
+        subprocess.run(["git", "init", "-q", "-b", "main", d047_origin], check=True)
+        subprocess.run(["git", "-C", d047_origin, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", d047_origin, "config", "user.email", "pipeline-test@example.com"], check=True)
+        subprocess.run(["git", "-C", d047_origin, "commit", "-q", "--allow-empty", "-m", "Initial main commit"], check=True)
+
+        subprocess.run(["git", "clone", "-q", d047_origin, d047_local], check=True)
+        subprocess.run(["git", "-C", d047_local, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", d047_local, "config", "user.email", "pipeline-test@example.com"], check=True)
+
+        # 1. Failing author agent script (exits 1) without modifying working tree
+        d047_fail_agent = os.path.join(tmpdir, "d047_agent_fail.sh")
+        with open(d047_fail_agent, "w") as f:
+            f.write("#!/bin/sh\necho 'Simulated author failure' >&2\nexit 1\n")
+        os.chmod(d047_fail_agent, 0o755)
+
+        d047_tooling_clean = Tooling(
+            run_dir=tmpdir,
+            tooling_dir=tmpdir,
+            agent_run=d047_fail_agent,
+            agent_token=tooling_root.agent_token,
+            role_guard=tooling_root.role_guard,
+            agents_dir=tooling_root.agents_dir,
+        )
+
+        def mock_gh_d047(args, role=None, check=True):
+            if len(args) >= 2 and args[0] == "issue" and args[1] == "view":
+                return json.dumps({
+                    "title": "D-047 Pipeline test",
+                    "state": "OPEN",
+                    "labels": [{"name": "state:ready"}, {"name": "area:tooling"}],
+                    "body": "### Touches\n- `scripts/agent-pipeline.py`\n",
+                })
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "list":
+                return "[]"
+            return "{}"
+
+        d047_messages = []
+        real_say_d047 = say
+        def recording_say_d047(msg):
+            d047_messages.append(msg)
+            real_say_d047(msg)
+
+        old_tooling_d047 = TOOLING
+        real_gh_d047 = gh
+        try:
+            TOOLING = d047_tooling_clean
+            gh = mock_gh_d047
+            say = recording_say_d047
+
+            # --- AC1 Scenario: Run stops on change branch with clean working tree ---
+            d047_messages.clear()
+            exit_code_ac1 = main(["188", "--role", "devops"], cwd=d047_local,
+                                 run_dir=os.path.join(tmpdir, "d047_run1"))
+
+            # AC1 Post-conditions:
+            # - Exit status is that of the stop (1)
+            assert exit_code_ac1 == 1, f"Expected exit status 1, got {exit_code_ac1}"
+            # - Checkout is restored to main
+            curr_branch_ac1 = subprocess.run(["git", "-C", d047_local, "branch", "--show-current"],
+                                             capture_output=True, text=True, check=True).stdout.strip()
+            assert curr_branch_ac1 == "main", f"Expected checkout on main, got {curr_branch_ac1}"
+            # - Working tree is clean
+            clean_status = subprocess.run(["git", "-C", d047_local, "status", "--porcelain"],
+                                          capture_output=True, text=True, check=True).stdout.strip()
+            assert clean_status == "", f"Expected clean working tree, got {clean_status}"
+            print("test_d047_ac1_clean_tree_checkout_ends_on_main: OK")
+
+            # --- AC2 Scenario: Run stops on change branch with uncommitted changes ---
+            # Author agent leaves uncommitted file and exits 1
+            d047_dirty_agent = os.path.join(tmpdir, "d047_agent_dirty.sh")
+            dirty_file = os.path.join(d047_local, "uncommitted_work.txt")
+            with open(d047_dirty_agent, "w") as f:
+                f.write(f"#!/bin/sh\necho 'uncommitted work in progress' > '{dirty_file}'\nexit 1\n")
+            os.chmod(d047_dirty_agent, 0o755)
+
+            d047_tooling_dirty = Tooling(
+                run_dir=tmpdir,
+                tooling_dir=tmpdir,
+                agent_run=d047_dirty_agent,
+                agent_token=tooling_root.agent_token,
+                role_guard=tooling_root.role_guard,
+                agents_dir=tooling_root.agents_dir,
+            )
+            TOOLING = d047_tooling_dirty
+            d047_messages.clear()
+
+            exit_code_ac2 = main(["188", "--role", "devops"], cwd=d047_local,
+                                 run_dir=os.path.join(tmpdir, "d047_run2"))
+
+            # AC2 Post-conditions:
+            # - Exit status is that of the stop (1)
+            assert exit_code_ac2 == 1, f"Expected exit status 1, got {exit_code_ac2}"
+            # - Checkout stays on the change branch
+            curr_branch_ac2 = subprocess.run(["git", "-C", d047_local, "branch", "--show-current"],
+                                             capture_output=True, text=True, check=True).stdout.strip()
+            assert curr_branch_ac2 == "ops/D-047-pipeline-test", f"Expected checkout on ops/D-047-pipeline-test, got {curr_branch_ac2}"
+            # - Changes are untouched
+            assert os.path.isfile(dirty_file), f"Uncommitted file was deleted: {dirty_file}"
+            with open(dirty_file, "r") as f:
+                content = f.read()
+            assert content == "uncommitted work in progress\n", f"Unexpected content: {content}"
+            # - Last message names the branch
+            assert len(d047_messages) > 0, "No messages logged"
+            last_msg = d047_messages[-1]
+            assert "ops/D-047-pipeline-test" in last_msg, f"Branch not in last message: '{last_msg}'"
+            assert "the working tree is not clean" in last_msg, f"Dirty status not in last message: '{last_msg}'"
+            print("test_d047_ac2_uncommitted_changes_stays_on_branch_names_branch: OK")
+        finally:
+            TOOLING = old_tooling_d047
+            gh = real_gh_d047
+            say = real_say_d047
+
     print("OK: all self-tests passed.")
     return 0
 
 
-def main(argv=None):
+def main(argv=None, cwd=None, run_dir=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("issue", type=int, nargs="?", help="issue number to run through the pipeline")
     parser.add_argument("--role", choices=["developer", "devops"], help="author role for the issue")
@@ -1144,116 +1281,134 @@ def main(argv=None):
         parser.error("the following arguments are required: issue")
 
     issue = args.issue
+    log = None
 
-    info = gh_json(["issue", "view", str(issue), "--json", "title,state,labels,body"])
-    labels = {l["name"] for l in info["labels"]}
-    if info["state"] != "OPEN" or "state:ready" not in labels:
-        raise Stop(1, f"issue #{issue} is not open with state:ready")
-    role = args.role or ("devops" if labels & DEVOPS_AREAS or "type:enabler" in labels else "developer")
+    try:
+        info = gh_json(["issue", "view", str(issue), "--json", "title,state,labels,body"])
+        labels = {l["name"] for l in info["labels"]}
+        if info["state"] != "OPEN" or "state:ready" not in labels:
+            raise Stop(1, f"issue #{issue} is not open with state:ready")
+        role = args.role or ("devops" if labels & DEVOPS_AREAS or "type:enabler" in labels else "developer")
 
-    if run(["git", "status", "--porcelain"]).stdout.strip():
-        raise Stop(1, "the working tree is not clean")
-    run(["git", "fetch", "--prune", "origin"])
-    run(["git", "switch", "main"])
-    run(["git", "pull", "--ff-only"])
+        if run(["git", "status", "--porcelain"], cwd=cwd).stdout.strip():
+            raise Stop(1, "the working tree is not clean")
+        run(["git", "fetch", "--prune", "origin"], cwd=cwd)
+        run(["git", "switch", "main"], cwd=cwd)
+        run(["git", "pull", "--ff-only"], cwd=cwd)
 
-    run_dir = os.path.expanduser(
-        f"~/.config/nextoomio/runs/{issue}-{datetime.datetime.now():%Y%m%d-%H%M%S}")
-    os.makedirs(run_dir, mode=0o700)
-    log = os.path.join(run_dir, "agents.log")
-    say(f"issue #{issue} \"{info['title']}\" -> {role}; log {log}")
+        if run_dir is None:
+            run_dir = os.path.expanduser(
+                f"~/.config/nextoomio/runs/{issue}-{datetime.datetime.now():%Y%m%d-%H%M%S}")
+        os.makedirs(run_dir, mode=0o700, exist_ok=True)
+        log = os.path.join(run_dir, "agents.log")
+        say(f"issue #{issue} \"{info['title']}\" -> {role}; log {log}")
 
-    global TOOLING
-    TOOLING = pin_tooling(run_dir)
-    say(f"tooling pinned to {TOOLING.tooling_dir}")
+        global TOOLING
+        if TOOLING is None:
+            TOOLING = pin_tooling(run_dir, root=cwd or ROOT)
+            say(f"tooling pinned to {TOOLING.tooling_dir}")
 
-    # "Touches" entries outside the role's default paths, for the guard where it runs.
-    touches = re.findall(r"^- `([^`]+)`", (info["body"].split("### Touches", 1) + [""])[1].split("###", 1)[0], re.M)
+        # "Touches" entries outside the role's default paths, for the guard where it runs.
+        touches = re.findall(r"^- `([^`]+)`", (info["body"].split("### Touches", 1) + [""])[1].split("###", 1)[0], re.M)
 
-    ident = re.match(r"[A-Za-z0-9.-]+", info["title"]).group(0)
-    slug = re.sub(r"[^a-z0-9]+", "-", info["title"][len(ident):].lower()).strip("-")[:32].strip("-")
-    branch = f"{'ops' if role == 'devops' else 'dev'}/{ident}-{slug}"
-    existing = find_pr(issue, role)
-    number = existing["number"] if existing else None
-    branch = choose_branch(branch, pr=existing)
+        ident = re.match(r"[A-Za-z0-9.-]+", info["title"]).group(0)
+        slug = re.sub(r"[^a-z0-9]+", "-", info["title"][len(ident):].lower()).strip("-")[:32].strip("-")
+        branch = f"{'ops' if role == 'devops' else 'dev'}/{ident}-{slug}"
+        existing = find_pr(issue, role)
+        number = existing["number"] if existing else None
+        branch = choose_branch(branch, pr=existing, cwd=cwd)
 
-    task = (f"Work on issue {issue} ({info['title']}) in repository {REPO}. Follow your role definition.")
-    rounds = 0
-    while True:
-        output = agent(role, task, log, extra_paths=touches)
-        delivered = deliver(role, issue, info["title"], branch, output, touches, number)
-        number = delivered or number
-        run(["git", "switch", "main"], check=False)
-        if not delivered and number:
-            block(issue, f"the {role} changed nothing in response to the review or CI result on "
-                         f"pull request #{number}.")
-        if not number:
-            current = gh_json(["issue", "view", str(issue), "--json", "labels"])
-            if "state:blocked" in {l["name"] for l in current["labels"]}:
-                raise Stop(2, f"issue #{issue} was blocked by the {role}; see its comment")
-            block(issue, f"the {role} finished without changing anything.")
-        head = pr_state(number)["headRefOid"]
-        say(f"pull request #{number} at {head[:7]}")
-        gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
-
-        if not wait_for_ci(number, issue=issue):
-            verdict, why, review_body = "CHANGES_REQUESTED", "CI failed on the head commit", ""
-        else:
-            agent("reviewer", f"Review pull request {number} (issue {issue}) at its current head commit. "
-                              "Follow your role definition.", log)
+        task = (f"Work on issue {issue} ({info['title']}) in repository {REPO}. Follow your role definition.")
+        rounds = 0
+        while True:
+            output = agent(role, task, log, extra_paths=touches, cwd=cwd)
+            delivered = deliver(role, issue, info["title"], branch, output, touches, number, cwd=cwd)
+            number = delivered or number
+            run(["git", "switch", "main"], cwd=cwd, check=False)
+            if not delivered and number:
+                block(issue, f"the {role} changed nothing in response to the review or CI result on "
+                             f"pull request #{number}.")
+            if not number:
+                current = gh_json(["issue", "view", str(issue), "--json", "labels"])
+                if "state:blocked" in {l["name"] for l in current["labels"]}:
+                    raise Stop(2, f"issue #{issue} was blocked by the {role}; see its comment")
+                block(issue, f"the {role} finished without changing anything.")
             head = pr_state(number)["headRefOid"]
-            (verdict, review_body), why = latest_review(number, head), "the review requested changes"
-            if verdict is None:
-                block(issue, f"the Reviewer submitted no verdict on pull request #{number} at {head[:7]}.")
-        say(f"pull request #{number}: {verdict}")
-        if verdict == "APPROVED":
-            break
-        rounds += 1
-        if rounds > MAX_ROUNDS:
-            block(issue, f"pull request #{number} was not approved after {MAX_ROUNDS} rounds of changes; "
-                         "the Architect decides whether the story or the approach is wrong.")
-        task = (f"Pull request {number} for issue {issue} needs changes: {why}. Read the review and the CI "
-                f"result with `gh pr view {number} --comments` and `gh pr checks {number}`, and address them. "
-                "Follow your role definition.")
-        run(["git", "switch", branch])
+            say(f"pull request #{number} at {head[:7]}")
+            gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
 
-    # Auto-merge enabled before the approval did not fire on its own in the
-    # first runs; asking again merges at once when the rules are met, and
-    # only then.
-    gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
-    if not wait_for_merge(number):
-        raise Stop(2, f"pull request #{number} is approved but GitHub has not merged it; check the rules on main")
-    say(f"pull request #{number} merged")
-    run(["git", "pull", "--ff-only"])
-    if not re.search(r"^Completes-Story:\s*yes\s*$", review_body, re.M | re.I):
-        raise Stop(2, f"pull request #{number} merged, but the review did not state 'Completes-Story: yes'; "
-                      f"issue #{issue} stays ready for a further pull request")
-    gh(["issue", "edit", str(issue), "--remove-label", "state:ready", "--add-label", "state:implemented"],
-       role="architect")
+            if not wait_for_ci(number, issue=issue):
+                verdict, why, review_body = "CHANGES_REQUESTED", "CI failed on the head commit", ""
+            else:
+                agent("reviewer", f"Review pull request {number} (issue {issue}) at its current head commit. "
+                                  "Follow your role definition.", log, cwd=cwd)
+                head = pr_state(number)["headRefOid"]
+                (verdict, review_body), why = latest_review(number, head), "the review requested changes"
+                if verdict is None:
+                    block(issue, f"the Reviewer submitted no verdict on pull request #{number} at {head[:7]}.")
+            say(f"pull request #{number}: {verdict}")
+            if verdict == "APPROVED":
+                break
+            rounds += 1
+            if rounds > MAX_ROUNDS:
+                block(issue, f"pull request #{number} was not approved after {MAX_ROUNDS} rounds of changes; "
+                             "the Architect decides whether the story or the approach is wrong.")
+            task = (f"Pull request {number} for issue {issue} needs changes: {why}. Read the review and the CI "
+                    f"result with `gh pr view {number} --comments` and `gh pr checks {number}`, and address them. "
+                    "Follow your role definition.")
+            run(["git", "switch", branch], cwd=cwd)
 
-    agent("qm", f"Verify issue {issue}, which now has state:implemented; its pull request {number} is merged. "
-                "Follow your role definition.", log)
-    comments = gh_json(["issue", "view", str(issue), "--json", "comments"])["comments"]
-    verdicts = [c["body"] for c in comments if is_app(c["author"]["login"], "qm")]
-    passed = bool(verdicts) and re.search(r"^QM-Verdict:\s*PASS\s*$", verdicts[-1], re.M)
-    if not passed:
-        raise Stop(2, f"issue #{issue} stays open: QM did not give 'QM-Verdict: PASS'")
+        # Auto-merge enabled before the approval did not fire on its own in the
+        # first runs; asking again merges at once when the rules are met, and
+        # only then.
+        gh(["pr", "merge", str(number), "--auto", "--merge"], role=role, check=False)
+        if not wait_for_merge(number):
+            raise Stop(2, f"pull request #{number} is approved but GitHub has not merged it; check the rules on main")
+        say(f"pull request #{number} merged")
+        run(["git", "pull", "--ff-only"], cwd=cwd)
+        if not re.search(r"^Completes-Story:\s*yes\s*$", review_body, re.M | re.I):
+            raise Stop(2, f"pull request #{number} merged, but the review did not state 'Completes-Story: yes'; "
+                          f"issue #{issue} stays ready for a further pull request")
+        gh(["issue", "edit", str(issue), "--remove-label", "state:ready", "--add-label", "state:implemented"],
+           role="architect")
 
-    body = gh_json(["issue", "view", str(issue), "--json", "body"])["body"].replace("- [ ] **AC", "- [x] **AC")
-    body_file = os.path.join(run_dir, "body.md")
-    with open(body_file, "w") as f:
-        f.write(body)
-    gh(["issue", "edit", str(issue), "--body-file", body_file], role="architect")
-    gh(["issue", "close", str(issue), "--reason", "completed", "--comment",
-        f"Closed as completed after the QM verdict above; pull request #{number} merged under the rules on "
-        "main. Acceptance criteria ticked on the basis of that verdict.\n\n"
-        "Role: Architect (pipeline) · Model: none"], role="architect")
-    say(f"issue #{issue} closed as completed")
+        agent("qm", f"Verify issue {issue}, which now has state:implemented; its pull request {number} is merged. "
+                    "Follow your role definition.", log, cwd=cwd)
+        comments = gh_json(["issue", "view", str(issue), "--json", "comments"])["comments"]
+        verdicts = [c["body"] for c in comments if is_app(c["author"]["login"], "qm")]
+        passed = bool(verdicts) and re.search(r"^QM-Verdict:\s*PASS\s*$", verdicts[-1], re.M)
+        if not passed:
+            raise Stop(2, f"issue #{issue} stays open: QM did not give 'QM-Verdict: PASS'")
+
+        body = gh_json(["issue", "view", str(issue), "--json", "body"])["body"].replace("- [ ] **AC", "- [x] **AC")
+        body_file = os.path.join(run_dir, "body.md")
+        with open(body_file, "w") as f:
+            f.write(body)
+        gh(["issue", "edit", str(issue), "--body-file", body_file], role="architect")
+        gh(["issue", "close", str(issue), "--reason", "completed", "--comment",
+            f"Closed as completed after the QM verdict above; pull request #{number} merged under the rules on "
+            "main. Acceptance criteria ticked on the basis of that verdict.\n\n"
+            "Role: Architect (pipeline) · Model: none"], role="architect")
+        say(f"issue #{issue} closed as completed")
+        return 0
+    except Stop as stop:
+        say(str(stop))
+        return stop.status
+    except KeyboardInterrupt:
+        say("interrupted")
+        return 1
+    except Exception as exc:
+        say(f"unexpected error: {exc}")
+        if log:
+            try:
+                with open(log, "a", encoding="utf-8") as f:
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
+        return 1
+    finally:
+        cleanup_checkout(cwd=cwd)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main() or 0)
-    except Stop as stop:
-        say(str(stop))
-        sys.exit(stop.status)
+    sys.exit(main())
