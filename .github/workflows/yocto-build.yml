@@ -20,14 +20,6 @@ on:
           - ubuntu-24.04
           - ubuntu-24.04-arm
           - self-hosted
-      yocto_branch:
-        description: 'OpenEmbedded/Yocto layer branch (scarthgap LTS or wrynose)'
-        required: true
-        default: 'scarthgap'
-        type: choice
-        options:
-          - scarthgap
-          - wrynose
 
 permissions:
   contents: read
@@ -70,13 +62,9 @@ jobs:
           path: |
             ${{ github.workspace }}/yocto-cache/downloads
             ${{ github.workspace }}/yocto-cache/sstate-cache
-          key: yocto-${{ inputs.runner }}-${{ inputs.yocto_branch }}-${{ hashFiles('kas/**', 'meta-nextoomio/**') }}
+          key: yocto-${{ inputs.runner }}-wrynose-${{ hashFiles('kas/**', 'meta-nextoomio/**') }}
           restore-keys: |
-            yocto-${{ inputs.runner }}-${{ inputs.yocto_branch }}-
-
-      - name: Select Yocto branch in kas/base.yml
-        run: |
-          sed -i "s/branch: wrynose/branch: ${{ inputs.yocto_branch }}/g" kas/base.yml
+            yocto-${{ inputs.runner }}-wrynose-
 
       - name: Run BitBake layer & recipe parse verification (parse-only)
         if: inputs.mode == 'parse-only'
