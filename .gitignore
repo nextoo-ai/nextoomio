@@ -16,6 +16,8 @@ Claude outputs/
 /.claude/worktrees/
 # Local Claude Code settings
 /.claude/settings.local.json
+# Local Codex configuration; the role definitions are in .claude/agents/
+/.codex/
 
 # Rust build artifacts
 /core/target/
