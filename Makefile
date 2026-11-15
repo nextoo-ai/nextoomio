@@ -2,7 +2,7 @@
 
 all: check
 
-check: check-docs check-doc-versions check-evidence check-i18n
+check: check-docs check-doc-versions check-evidence check-i18n yocto-validate
 
 check-docs:
 	python3 scripts/check_traceability.py
