@@ -55,12 +55,14 @@ ALWAYS_EXCLUDED = ["SK/**", ".git/**"]
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
-# Shell commands no agent runs. Merging, closing issues, and changing
-# repository settings belong to the project owner.
+# Shell commands no agent runs. Merging and changing repository settings
+# belong to the project owner. Closing issues is the pipeline's step after a
+# QM verdict; the Architect alone may also close one, in the cases
+# docs/backlog/README.md (section "Status") names. The guard cannot tell
+# those cases apart, so it only limits the command to that role.
 DENIED_COMMANDS = [
     (r"\bgh\s+pr\s+merge\b", "merging is done by the project owner"),
     (r"\bgh\s+api\b[^|;&]*\bpulls/\d+/merge\b", "merging is done by the project owner"),
-    (r"\bgh\s+issue\s+close\b", "issues are closed by the project owner"),
     (r"\bgh\s+issue\s+delete\b", "issues are not deleted by agents"),
     (r"\bgh\s+repo\s+(edit|delete|rename|archive)\b", "repository settings belong to the project owner"),
     (r"\bgh\s+api\b[^|;&]*\b(rulesets|branches/[^/\s]+/protection)\b[^|;&]*(-X|--method)\s*(PUT|POST|PATCH|DELETE)",
@@ -68,6 +70,9 @@ DENIED_COMMANDS = [
     (r"\bgit\s+push\b[^|;&]*(\s--force\b|\s--force-with-lease\b|\s-f\b)", "forced pushes are not allowed"),
     (r"\bgit\s+push\b[^|;&]*\s(\S+:)?(refs/heads/)?main\b", "main changes only through a pull request"),
 ]
+
+# Only the Architect closes issues by hand (see the comment above).
+CLOSE_COMMAND = r"\bgh\s+issue\s+close\b"
 
 # Only the Reviewer submits pull-request reviews.
 REVIEW_COMMAND = r"\bgh\s+pr\s+review\b"
@@ -168,6 +173,8 @@ def check_command(role, tool_input):
     for pattern, reason in DENIED_COMMANDS:
         if re.search(pattern, command):
             deny(reason)
+    if role != "architect" and re.search(CLOSE_COMMAND, command):
+        deny("issues are closed by the pipeline after a QM verdict, or by the Architect")
     if role != "reviewer" and re.search(REVIEW_COMMAND, command):
         deny("only the Reviewer submits pull-request reviews")
 

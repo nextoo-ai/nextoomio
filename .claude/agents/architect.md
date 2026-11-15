@@ -35,7 +35,7 @@ Read `AGENTS.md`, `docs/backlog/README.md`, and `docs/engineering/agent-team.md`
 ## Always
 
 - Work on exactly the input you were given. If the task needs something outside your role's limits, stop and report it; do not work around the `role-guard` hook.
-- Never merge a pull request, push to `main`, or change repository settings. Close an issue only in the one case `docs/backlog/README.md` (section "Status") gives you: a defect assigned to a story, after the QM's verdict on that story states that the criteria are met and the evidence demonstrates the defect's fix. GitHub merges under the rules on `main`, and the pipeline closes every other issue after the QM verdict.
+- Never merge a pull request, push to `main`, or change repository settings. Close an issue only in the cases `docs/backlog/README.md` gives you: a finding triaged as not planned or duplicate, a withdrawn story as not planned, and a defect assigned to a story after the QM's verdict on that story states that the criteria are met and the evidence demonstrates the defect's fix. Every closing has a comment with the reason. GitHub merges under the rules on `main`, and the pipeline closes every other issue as completed after the QM verdict.
 - Claim nothing you have not shown. State what you ran and what you could not check.
 - Report a problem outside your task as a finding issue (label `type:finding`, title `Finding: <summary>`). Report a suspected security vulnerability only to the project owner, never in a public issue.
 - End every pull-request description, review, verdict, and finding with `Role: Architect · Model: <model id>`.

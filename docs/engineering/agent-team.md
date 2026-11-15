@@ -25,7 +25,7 @@ Version 0.10 records the pipeline runs on D-039 and D-040, the defects triaged f
 
 Version 0.11 records the pipeline runs on D-041 to D-050 and what remains for the pipeline (sections 9.3 and 11).
 
-Version 0.12 records who closes a defect that is assigned to a story (section 5, step 5): the first product story, P0-F1.1 (#8), met every criterion and still could not close, because its defects were open and no rule named who closes them.
+Version 0.12 records who closes a defect that is assigned to a story (section 5, step 5) and the matching change of the guard, which now limits closing an issue by hand to the Architect instead of denying it to every role: the first product story, P0-F1.1 (#8), met every criterion and still could not close, because its defects were open and no rule named who closes them.
 
 ## 1. Goal
 
