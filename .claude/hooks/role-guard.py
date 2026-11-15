@@ -47,7 +47,8 @@ ROLE_PATHS = {
 
 # Paths that stay read-only for a role even when a pattern above matches.
 ROLE_EXCLUDED = {
-    "architect": ["docs/evidence/**", "docs/api/**"],
+    # Evidence wording may be corrected by the Architect to unblock a story (AGENTS.md); results may not.
+    "architect": ["docs/api/**"],
 }
 
 # Read-only for every role.
