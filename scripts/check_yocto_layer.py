@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -17,7 +18,7 @@ def main() -> int:
         ROOT / "meta-nextoomio/COPYING.MIT",
         ROOT / "meta-nextoomio/conf/layer.conf",
         ROOT / "meta-nextoomio/conf/distro/nextoomio.conf",
-        ROOT / "meta-nextoomio/wic/nextoomio-ab.wks.in",
+        ROOT / "meta-nextoomio/files/wic/nextoomio-ab.wks.in",
         ROOT / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json",
         ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb",
         ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
@@ -30,6 +31,17 @@ def main() -> int:
         if not path.is_file():
             errors.append(f"Missing required Yocto/kas file: {path.relative_to(ROOT)}")
 
+    kas_dir = ROOT / "kas"
+    if kas_dir.is_dir():
+        for kas_file in sorted(kas_dir.glob("*.yml")):
+            for line_idx, line in enumerate(kas_file.read_text(encoding="utf-8").splitlines(), start=1):
+                m = re.match(r"^\s*branch:\s*([0-9]+(?:\.[0-9]+)*)\s*(?:#.*)?$", line)
+                if m:
+                    errors.append(
+                        f"{kas_file.relative_to(ROOT)} line {line_idx}: branch value '{m.group(1)}' "
+                        f"must be quoted as a string to avoid YAML float parsing"
+                    )
+
     profile_path = ROOT / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
     if profile_path.is_file():
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -40,7 +52,13 @@ def main() -> int:
         if profile.get("default_logical_volume_percent") != 30:
             errors.append("Default logical volume must be 30% per SPECIFICATION.md section 5.1")
 
-    wks_path = ROOT / "meta-nextoomio/wic/nextoomio-ab.wks.in"
+    if (ROOT / "meta-nextoomio/wic").exists():
+        errors.append(
+            "Legacy directory meta-nextoomio/wic must be removed; "
+            "wic/wks files must reside in meta-nextoomio/files/wic per OE-core sanity requirements"
+        )
+
+    wks_path = ROOT / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
     if wks_path.is_file():
         wks_text = wks_path.read_text(encoding="utf-8")
         for label in ("select", "boot_a", "boot_b", "root_a", "root_b", "data"):

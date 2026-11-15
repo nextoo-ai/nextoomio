@@ -20,19 +20,30 @@ on:
           - ubuntu-24.04
           - ubuntu-24.04-arm
           - self-hosted
+  pull_request:
+    branches: [main]
+    paths:
+      - 'kas/**'
+      - 'meta-nextoomio/**'
+      - '.github/workflows/yocto-build.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'kas/**'
+      - 'meta-nextoomio/**'
+      - '.github/workflows/yocto-build.yml'
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   yocto:
-    name: Yocto (${{ inputs.mode }} on ${{ inputs.runner }})
-    runs-on: ${{ inputs.runner }}
+    name: Yocto (${{ inputs.mode || 'parse-only' }} on ${{ inputs.runner || 'ubuntu-24.04' }})
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 360
     steps:
       - name: Maximize runner disk space (GitHub-hosted full-image builds only)
-        if: inputs.runner != 'self-hosted' && inputs.mode == 'full-image'
+        if: (inputs.runner || 'ubuntu-24.04') != 'self-hosted' && inputs.mode == 'full-image'
         run: |
           df -h
           sudo rm -rf /usr/share/dotnet \
@@ -49,7 +60,7 @@ jobs:
 
       - name: Prepare build and cache directories
         run: |
-          if [ "${{ inputs.runner }}" != "self-hosted" ]; then
+          if [ "${{ inputs.runner || 'ubuntu-24.04' }}" != "self-hosted" ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           fi
           mkdir -p "${GITHUB_WORKSPACE}/build"
@@ -62,12 +73,12 @@ jobs:
           path: |
             ${{ github.workspace }}/yocto-cache/downloads
             ${{ github.workspace }}/yocto-cache/sstate-cache
-          key: yocto-${{ inputs.runner }}-wrynose-${{ hashFiles('kas/**', 'meta-nextoomio/**') }}
+          key: yocto-${{ inputs.runner || 'ubuntu-24.04' }}-wrynose-${{ hashFiles('kas/**', 'meta-nextoomio/**') }}
           restore-keys: |
-            yocto-${{ inputs.runner }}-wrynose-
+            yocto-${{ inputs.runner || 'ubuntu-24.04' }}-wrynose-
 
       - name: Run BitBake layer & recipe parse verification (parse-only)
-        if: inputs.mode == 'parse-only'
+        if: (inputs.mode || 'parse-only') == 'parse-only'
         run: |
           docker run --rm \
             --user=root \
