@@ -1,7 +1,7 @@
 # Agent team
 
-Document version: **0.10 (autonomous operation)**  
-Date: **2026-11-14**  
+Document version: **0.11 (autonomous operation)**  
+Date: **2026-11-15**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
 
@@ -22,6 +22,8 @@ Version 0.8 records the first complete pipeline run and ends the bootstrap excep
 Version 0.9 records the pipeline run on D-038 and the correction to the Reviewer definition that it led to (sections 5 and 9.3).
 
 Version 0.10 records the pipeline runs on D-039 and D-040, the defects triaged from them, and where defect evidence is recorded (sections 9.3 and 11).
+
+Version 0.11 records the pipeline runs on D-041 to D-050 and what remains for the pipeline (sections 9.3 and 11).
 
 ## 1. Goal
 
@@ -309,6 +311,30 @@ What these runs showed:
 
 Defects that came from these runs, all for DevOps: D-041 (#164, the evidence template names a path for defect evidence that no document defines), D-042 (#173, stale branch on restart), D-043 (#175, the D-038 evidence names the base commit), D-044 (#178, a failed role session is read as a missing verdict), and D-045 (#179, an hour's wait on a conflicting pull request).
 
+**Pipeline runs on D-041 to D-050, 2026-11-15.** Ten defects, all for DevOps, were run one after another with one command each. The pipeline changed itself in eight of them.
+
+| Defect | Issue | Pull request | Start to close | Observed |
+| --- | --- | --- | --- | --- |
+| D-042 stale branch on restart | #173 | #181 | 11 min | Approved at the first head commit; the Reviewer filed a finding (#182, D-046) |
+| D-044 failed role session read as a missing verdict | #178 | #183 | 10 min | Approved at the first head commit |
+| D-045 wait on a conflicting pull request | #179 | #184 | 12 min | Approved at the first head commit |
+| D-041 path in the evidence template | #164 | #185 | 7 min | Approved at the first head commit |
+| D-043 commit in the D-038 evidence | #175 | #186, #187 | 11 min and 7 min | First QM verdict FAIL: the criteria were met, but the Date field contradicted the recorded output. The Architect returned the issue to `state:ready` with the scope; the second run passed |
+| D-046 push when the branch name exists on the remote | #182 | #191 | 15 min | Approved at the first head commit |
+| D-047 end on `main` | #188 | #192 | 55 min | The author's first run took 42 minutes; one round of changes |
+| D-048 required check names from the rule set | #189 | #193 | 16 min | Approved at the first head commit; QM filed a finding (#194, D-050) |
+| D-049 repeated issue reference and role line | #190 | #195 | 10 min | Approved at the first head commit |
+| D-050 failed check that is not required | #194 | #196 | not complete | The Reviewer's session could not start because the account's usage limit was reached. The pipeline stopped with exit status 1, left the issue `state:ready`, and ended on `main`, as D-044 and D-047 define. The Architect repeated the review and the QM run by hand; QM gave `QM-Verdict: PASS` |
+
+Every issue was closed only after `QM-Verdict: PASS`, and every pull request was merged by GitHub under the rule set.
+
+What these runs showed:
+
+- **Findings feed the backlog without the owner.** The Reviewer and QM each reported a fault outside the change in front of them; the Architect converted both into defects, and the same pipeline fixed them.
+- **QM holds evidence to its own fields.** D-043 failed on a date, as D-040 had failed on a commit.
+- **An interrupted run cannot be continued.** A repeated run starts with the author, who has nothing to change, and the issue would be blocked. This is D-051 (#197).
+- **The usage limit of one account is shared by the Reviewer, QM, and the Architect.** It stopped two runs in two days. The pipeline now stops cleanly, but someone has to repeat the run after the limit resets.
+
 Not yet shown: a Developer run (application code under `core/`, `matter/`, or `webui/`); a story with hardware evidence; a run that the pipeline blocks after two rounds; parallel runs.
 
 ## 10. Review findings
@@ -334,7 +360,7 @@ Created by the Architect as stories under feature P0-F8 (#71) with the next free
 
 | # | Work item | Role |
 | --- | --- | --- |
-| 1 | Pipeline defects D-042 (#173), D-044 (#178), and D-045 (#179), and the evidence defects D-041 (#164) and D-043 (#175). Seen in the first complete run and not yet filed: end on `main`; handle a crash between push and pull-request creation; take the required check names from the rule set instead of a fixed list | DevOps |
+| 1 | Continue an interrupted run from the state on GitHub (D-051, #197). The pipeline defects D-042 and D-044 to D-050 and the evidence defects D-041 and D-043 are closed | DevOps |
 | 2 | CI role path-scope check (CQ-M10), the control behind the guard and the only path control for the Antigravity roles; lock-file enforcement (CQ-M8) | DevOps |
 | 3 | Describe the rule set in `CONTRIBUTING.md` and record the evidence for P0-F8.2 (#85) | DevOps |
 | 4 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88); the key is created and placed by the owner | DevOps |
