@@ -351,7 +351,7 @@ def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
 
 
 def find_pr(issue, role):
-    prs = gh_json(["pr", "list", "--state", "open", "--limit", "50",
+    prs = gh_json(["pr", "list", "--state", "open", "--search", f"Refs #{issue}",
                    "--json", "number,body,author,headRefName,headRefOid"])
     pattern = re.compile(rf"\bRefs\s+#{issue}\b")
     for pr in prs:
@@ -361,7 +361,7 @@ def find_pr(issue, role):
 
 
 def find_merged_pr(issue, role):
-    prs = gh_json(["pr", "list", "--state", "merged", "--limit", "50",
+    prs = gh_json(["pr", "list", "--state", "merged", "--search", f"Refs #{issue}",
                    "--json", "number,body,author,headRefName,headRefOid"])
     pattern = re.compile(rf"\bRefs\s+#{issue}\b")
     for pr in prs:
@@ -2166,6 +2166,142 @@ sys.exit(0)
             os.environ.pop("D051_RECORD_FILE", None)
             os.environ.pop("D051_CHANGE_FILE", None)
             os.environ.pop("D051_REVIEWER_FLAG", None)
+
+        # Test 15: AC1, AC2, and AC4 verification of looking up pull requests by search query without fixed limits (D-052)
+        old_gh_d052 = gh
+        recorded_calls = []
+
+        mock_responses = {
+            "open": [],
+            "merged": [],
+        }
+
+        def mock_gh_d052(args, role=None, check=True):
+            recorded_calls.append(list(args))
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "list":
+                state = "open"
+                if "--state" in args:
+                    state = args[args.index("--state") + 1]
+                return json.dumps(mock_responses.get(state, []))
+            return "[]"
+
+        try:
+            gh = mock_gh_d052
+
+            # --- AC1: find_merged_pr and find_pr query GitHub with --search and no --limit ---
+            recorded_calls.clear()
+            mock_responses["merged"] = [
+                {
+                    "number": 100,
+                    "author": {"login": "nextoomio-devops[bot]"},
+                    "body": "Refs #77\nMerged PR body",
+                    "headRefName": "ops/D-052-merged",
+                    "headRefOid": "abc1234",
+                }
+            ]
+            res_merged = find_merged_pr(77, "devops")
+            assert res_merged is not None and res_merged["number"] == 100, \
+                f"AC1 failed: find_merged_pr did not return matching PR: {res_merged}"
+            assert len(recorded_calls) == 1, f"AC1 failed: expected 1 gh call, got {len(recorded_calls)}"
+            args_merged = recorded_calls[0]
+            assert "--search" in args_merged, f"AC1 failed: --search flag missing in args: {args_merged}"
+            search_idx = args_merged.index("--search")
+            assert args_merged[search_idx + 1] == "Refs #77", \
+                f"AC1 failed: unexpected --search value: {args_merged[search_idx + 1]}"
+            assert "--limit" not in args_merged, \
+                f"AC1 failed: --limit present in args (must not depend on fixed number of recent PRs): {args_merged}"
+            assert "--state" in args_merged and args_merged[args_merged.index("--state") + 1] == "merged", \
+                f"AC1 failed: expected --state merged: {args_merged}"
+
+            recorded_calls.clear()
+            mock_responses["open"] = [
+                {
+                    "number": 101,
+                    "author": {"login": "nextoomio-developer[bot]"},
+                    "body": "Refs #88\nOpen PR body",
+                    "headRefName": "dev/D-052-open",
+                    "headRefOid": "def5678",
+                }
+            ]
+            res_open = find_pr(88, "developer")
+            assert res_open is not None and res_open["number"] == 101, \
+                f"AC1 failed: find_pr did not return matching PR: {res_open}"
+            assert len(recorded_calls) == 1, f"AC1 failed: expected 1 gh call, got {len(recorded_calls)}"
+            args_open = recorded_calls[0]
+            assert "--search" in args_open, f"AC1 failed: --search flag missing in open PR args: {args_open}"
+            search_idx_open = args_open.index("--search")
+            assert args_open[search_idx_open + 1] == "Refs #88", \
+                f"AC1 failed: unexpected --search value: {args_open[search_idx_open + 1]}"
+            assert "--limit" not in args_open, \
+                f"AC1 failed: --limit present in open PR args: {args_open}"
+            assert "--state" in args_open and args_open[args_open.index("--state") + 1] == "open", \
+                f"AC1 failed: expected --state open: {args_open}"
+
+            print("test_d052_ac1_lookup_searches_issue_ref_without_fixed_limit: OK")
+
+            # --- AC2: Search result with Refs #<n> and Refs #<n>0 picks only Refs #<n> ---
+            # Test case A: order is [PR for <n>, PR for <n>0]
+            pr_n = {
+                "number": 501,
+                "author": {"login": "nextoomio-devops[bot]"},
+                "body": "Fixes bug.\n\nRefs #50\n\nSome more description",
+                "headRefName": "ops/D-052-n",
+                "headRefOid": "oid50",
+            }
+            pr_n0 = {
+                "number": 502,
+                "author": {"login": "nextoomio-devops[bot]"},
+                "body": "Fixes other bug.\n\nRefs #500\n\nSome description",
+                "headRefName": "ops/D-052-n0",
+                "headRefOid": "oid500",
+            }
+            mock_responses["merged"] = [pr_n, pr_n0]
+            picked_n = find_merged_pr(50, "devops")
+            assert picked_n is not None and picked_n["number"] == 501, \
+                f"AC2 failed: did not pick PR for issue 50 (got {picked_n})"
+            picked_n0 = find_merged_pr(500, "devops")
+            assert picked_n0 is not None and picked_n0["number"] == 502, \
+                f"AC2 failed: did not pick PR for issue 500 (got {picked_n0})"
+
+            # Test case B: order is inverted [PR for <n>0, PR for <n>]; looking for <n> must still pick only <n>
+            mock_responses["merged"] = [pr_n0, pr_n]
+            picked_inverted = find_merged_pr(50, "devops")
+            assert picked_inverted is not None and picked_inverted["number"] == 501, \
+                f"AC2 failed: inverted search order picked wrong PR: {picked_inverted}"
+
+            # Test case C: same distinction applies to open PRs in find_pr()
+            mock_responses["open"] = [pr_n0, pr_n]
+            picked_open = find_pr(50, "devops")
+            assert picked_open is not None and picked_open["number"] == 501, \
+                f"AC2 failed: open PR lookup with inverted order picked wrong PR: {picked_open}"
+
+            # Test case D: role isolation and untrusted PRs are still rejected
+            pr_untrusted = {
+                "number": 503,
+                "author": {"login": "attacker"},
+                "body": "Refs #50",
+                "headRefName": "evil/branch",
+                "headRefOid": "bad123",
+            }
+            pr_wrong_role = {
+                "number": 504,
+                "author": {"login": "nextoomio-developer[bot]"},
+                "body": "Refs #50",
+                "headRefName": "dev/branch",
+                "headRefOid": "dev123",
+            }
+            mock_responses["merged"] = [pr_untrusted, pr_wrong_role]
+            assert find_merged_pr(50, "devops") is None, "AC2 failed: untrusted or wrong-role PR was matched"
+
+            print("test_d052_ac2_exact_issue_match_filters_out_longer_number_suffix: OK")
+
+            # --- AC4: Substituted responses, no network ---
+            assert gh is mock_gh_d052, "AC4 failed: gh was not substituted with mock"
+            assert len(recorded_calls) > 0, "AC4 failed: no gh calls were recorded through mock"
+            print("test_d052_ac4_offline_coverage: OK")
+
+        finally:
+            gh = old_gh_d052
 
     print("OK: all self-tests passed.")
     return 0
