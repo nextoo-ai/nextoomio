@@ -3,7 +3,7 @@
 # Partition table (MBR, logical partitions 5–7):
 #   1: select  (FAT, 64 MiB)   - autoboot.txt / tryboot selector
 #   2: boot_a  (FAT, 256 MiB)  - Slot A firmware, config.txt, kernel, overlays
-#   3: boot_b  (FAT, 256 MiB)  - Slot B firmware, config.txt, kernel, overlays
+#   3: boot_b  (FAT, 256 MiB)  - Slot B firmware, config.txt, kernel, overlays (inactive initially)
 #   5: root_a  (ext4, 3072 MiB)- Slot A read-only rootfs
 #   6: root_b  (ext4, 3072 MiB)- Slot B read-only rootfs (inactive initially)
 #   7: data    (ext4, grown)   - /data/config/v<N>, /data/secrets/v<N>, /data/music, /data/update

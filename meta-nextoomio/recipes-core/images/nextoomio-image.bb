@@ -11,6 +11,9 @@ IMAGE_FEATURES:remove = "debug-tweaks ssh-server-dropbear ssh-server-openssh pac
 WKS_FILE = "nextoomio-ab.wks.in"
 IMAGE_FSTYPES = "wic.bz2 wic.bmap ext4.gz"
 
+# Depend on rpi-autoboot deploy task for selector partition population (D-005)
+do_image_wic[depends] += "rpi-autoboot:do_deploy"
+
 # Size budget guard (AR-08: root slot is 3 GiB = 3,145,728 KiB)
 IMAGE_ROOTFS_MAXSIZE = "2800000"
 
