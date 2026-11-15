@@ -18,7 +18,7 @@ def main() -> int:
         ROOT / "meta-nextoomio/COPYING.MIT",
         ROOT / "meta-nextoomio/conf/layer.conf",
         ROOT / "meta-nextoomio/conf/distro/nextoomio.conf",
-        ROOT / "meta-nextoomio/wic/nextoomio-ab.wks.in",
+        ROOT / "meta-nextoomio/files/wic/nextoomio-ab.wks.in",
         ROOT / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json",
         ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb",
         ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
@@ -52,7 +52,13 @@ def main() -> int:
         if profile.get("default_logical_volume_percent") != 30:
             errors.append("Default logical volume must be 30% per SPECIFICATION.md section 5.1")
 
-    wks_path = ROOT / "meta-nextoomio/wic/nextoomio-ab.wks.in"
+    if (ROOT / "meta-nextoomio/wic").exists():
+        errors.append(
+            "Legacy directory meta-nextoomio/wic must be removed; "
+            "wic/wks files must reside in meta-nextoomio/files/wic per OE-core sanity requirements"
+        )
+
+    wks_path = ROOT / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
     if wks_path.is_file():
         wks_text = wks_path.read_text(encoding="utf-8")
         for label in ("select", "boot_a", "boot_b", "root_a", "root_b", "data"):

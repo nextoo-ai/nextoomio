@@ -15,7 +15,7 @@ OpenEmbedded / Yocto layer for the **nextoomio** audio operating system (`AD-01`
 
 - Machine: `raspberrypi4-64`
 - Reference audio profile: `hifiberry-amp` ("HiFiBerry Amp", for Raspberry Pi 4 + HiFiBerry Amp+, see `files/hardware-profiles/hifiberry-amp.json`)
-- Partition layout: `wic/nextoomio-ab.wks.in` (MBR dual A/B slots + persistent `/data`)
+- Partition layout: `files/wic/nextoomio-ab.wks.in` (MBR dual A/B slots + persistent `/data`)
 
 ## License
 
