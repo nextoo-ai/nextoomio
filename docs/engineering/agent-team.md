@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.9 (autonomous operation)**  
+Document version: **0.10 (autonomous operation)**  
 Date: **2026-11-14**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -20,6 +20,8 @@ Version 0.7 records the third pipeline run (section 9.3).
 Version 0.8 records the first complete pipeline run and ends the bootstrap exception (sections 8, 9.3, and 11).
 
 Version 0.9 records the pipeline run on D-038 and the correction to the Reviewer definition that it led to (sections 5 and 9.3).
+
+Version 0.10 records the pipeline runs on D-039 and D-040, the defects triaged from them, and where defect evidence is recorded (sections 9.3 and 11).
 
 ## 1. Goal
 
@@ -288,6 +290,25 @@ Observed and not yet resolved:
 
 **Pipeline run on D-038 (#163), 2026-11-14.** The DevOps role delivered the fix in seven minutes, the Reviewer approved the first head commit, and GitHub merged pull request #166, nine minutes after the start. The pipeline then stopped before QM: the review said `Completes-Story: no`, because the Reviewer definition told it to write `no` for a pull request that belongs to no story, and the work item was a defect. The definition now says that the line refers to the issue the pull request was made for, whatever its type. The Architect completed #163 outside the pipeline with the same steps: `state:implemented`, the QM run, and closing on its verdict.
 
+**Pipeline runs on D-039 (#168) and D-040 (#170), 2026-11-14 and 2026-11-15.** These two defects were the first changes the pipeline made to itself.
+
+| Run | Observed |
+| --- | --- |
+| D-039, first run | The change (pull request #169) broke `scripts/agent-run.sh`. After the review the pipeline started the DevOps role with the script of the branch under change; the role ended at once with exit status 127 and the issue was blocked. The Architect filed D-040 |
+| D-040 | Pull request #171 merged after two rounds of changes. The pipeline now copies the session script, the token script, the guard, and the agent definitions from `main` into its run directory and uses only those copies. QM reproduced all three criteria and still gave `QM-Verdict: FAIL`: the evidence named a commit whose code does not produce the recorded output |
+| D-039, restart | The pipeline reused a local branch left from the first run and a remote-tracking ref of a branch already deleted on GitHub. The resulting pull request #172 conflicted with `main`, GitHub started no checks on it, and the pipeline waited for them. The Architect closed #172; DevOps reported the cause as a finding (#173) |
+| D-039, last run | Pull request #174 merged after two rounds. The Reviewer's session for the second round did not start because the account's usage limit was reached; the pipeline read this as a missing verdict and blocked the issue. The Architect repeated the review, the marker replacement, and the QM run by hand in the pipeline's order; QM gave `QM-Verdict: PASS` |
+| D-040, rework | The Architect returned #170 to `state:ready` with the scope limited to the evidence file. One pipeline run took it to closed as completed in under eight minutes (pull request #177), with no one acting in between. It was the first run in which the pipeline replaced the `{{COMMIT}}` marker in evidence with the change commit |
+
+What these runs showed:
+
+- **A change to the pipeline's own tooling must not be applied to its own review.** D-040 resolves this for the session script, the token script, the guard, and the agent definitions of the author roles.
+- **QM fails a story on its evidence alone.** With every criterion met, a wrong commit in the evidence file was enough for a failing verdict, and the correction went through the same roles as any other change.
+- **A role that could not run is not a role that gave no verdict.** The pipeline does not tell them apart yet (D-044, #178).
+- **A small owner-requested change with no issue** (pull request #176, an ignore rule) went through the same review and rule set; the Reviewer stated `Completes-Story: no`.
+
+Defects that came from these runs, all for DevOps: D-041 (#164, the evidence template names a path for defect evidence that no document defines), D-042 (#173, stale branch on restart), D-043 (#175, the D-038 evidence names the base commit), D-044 (#178, a failed role session is read as a missing verdict), and D-045 (#179, an hour's wait on a conflicting pull request).
+
 Not yet shown: a Developer run (application code under `core/`, `matter/`, or `webui/`); a story with hardware evidence; a run that the pipeline blocks after two rounds; parallel runs.
 
 ## 10. Review findings
@@ -313,7 +334,7 @@ Created by the Architect as stories under feature P0-F8 (#71) with the next free
 
 | # | Work item | Role |
 | --- | --- | --- |
-| 1 | Pipeline faults seen in the first complete run: end on `main`; handle a crash between push and pull-request creation; take the required check names from the rule set instead of a fixed list | DevOps |
+| 1 | Pipeline defects D-042 (#173), D-044 (#178), and D-045 (#179), and the evidence defects D-041 (#164) and D-043 (#175). Seen in the first complete run and not yet filed: end on `main`; handle a crash between push and pull-request creation; take the required check names from the rule set instead of a fixed list | DevOps |
 | 2 | CI role path-scope check (CQ-M10), the control behind the guard and the only path control for the Antigravity roles; lock-file enforcement (CQ-M8) | DevOps |
 | 3 | Describe the rule set in `CONTRIBUTING.md` and record the evidence for P0-F8.2 (#85) | DevOps |
 | 4 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88); the key is created and placed by the owner | DevOps |
