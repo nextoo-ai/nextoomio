@@ -1,0 +1,8 @@
+# nextoomio firewall extension directory (/etc/nftables.d/)
+# Recipes for enabled features (SSH, WebUI, etc.) drop *.nft files here to extend the ruleset.
+# Example:
+# table inet filter {
+#     chain input {
+#         tcp dport 22 accept
+#     }
+# }

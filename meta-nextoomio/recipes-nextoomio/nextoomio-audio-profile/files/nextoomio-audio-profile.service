@@ -1,0 +1,14 @@
+[Unit]
+Description=nextoomio audio hardware profile and mixer initialization
+Documentation=https://github.com/nextoo-ai/nextoomio
+After=sound.target alsa-restore.service
+Wants=sound.target
+Before=pipewire.service mpd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nextoomio-audio-profile-setup
+
+[Install]
+WantedBy=multi-user.target

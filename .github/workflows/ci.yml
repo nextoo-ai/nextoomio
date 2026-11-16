@@ -34,7 +34,13 @@ jobs:
           python3 scripts/check_evidence.py
 
       - name: Validate meta-nextoomio layer and kas definitions
-        run: python3 scripts/check_yocto_layer.py
+        run: |
+          python3 scripts/check_yocto_layer.py --test
+          python3 scripts/check_yocto_layer.py
+
+      - name: Verify bench tooling and self-tests
+        run: |
+          make check-bench
 
   rust-core:
     name: Rust Core & License Gate

@@ -20,4 +20,6 @@ export const API_ERROR_KEYS: Record<string, string> = {
   update_incompatible_hardware: 'errors.update_incompatible_hardware',
   update_incompatible_schema: 'errors.update_incompatible_schema',
   update_busy: 'errors.update_busy',
+  update_truncated: 'errors.update_truncated',
+  update_corrupted_artifact: 'errors.update_corrupted_artifact',
 };

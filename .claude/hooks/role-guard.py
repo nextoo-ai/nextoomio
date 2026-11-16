@@ -39,6 +39,7 @@ ROLE_PATHS = {
         "Makefile",
         ".gitignore",
         "docs/evidence/**",
+        "docs/bench/**",
         "ARCHITECTURE.md",  # register rows in section 10 only; checked in review (CQ-R13)
     ],
     "reviewer": [],
@@ -47,7 +48,8 @@ ROLE_PATHS = {
 
 # Paths that stay read-only for a role even when a pattern above matches.
 ROLE_EXCLUDED = {
-    "architect": ["docs/evidence/**", "docs/api/**"],
+    # Evidence wording may be corrected by the Architect to unblock a story (AGENTS.md); results may not.
+    "architect": ["docs/api/**"],
 }
 
 # Read-only for every role.

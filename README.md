@@ -57,7 +57,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete system design.
 | [`webui/`](webui/) | Vue 3 + TypeScript + `vue-i18n` single-page application | Apache-2.0 |
 | [`meta-nextoomio/`](meta-nextoomio/) | OpenEmbedded / Yocto 6.0 LTS layer, images, Wic A/B layout, hardware profiles | MIT (metadata) |
 | [`kas/`](kas/) | `kas` configuration files for reproducible Yocto builds (local & CI) | Apache-2.0 |
-| [`docs/`](docs/) | OpenAPI specification, hardware compatibility matrix, and spike reports | Apache-2.0 |
+| [`docs/`](docs/) | OpenAPI specification, hardware compatibility matrix, test bench documentation, and spike reports | Apache-2.0 |
 | [`scripts/`](scripts/) | Automated traceability, i18n catalog, and layer verification tools | Apache-2.0 |
 | [`SK/`](SK/) | Deprecated, frozen historical Slovak archive (do not modify) | Historical |
 | [docs/backlog/](docs/backlog/README.md) | Conventions for features, stories, and defects, which are tracked as [GitHub issues](https://github.com/nextoo-ai/nextoomio/issues) | Apache-2.0 |
@@ -88,6 +88,12 @@ node scripts/check_i18n.mjs
 # Run Rust workspace checks and unit tests (requires Rust toolchain)
 cargo test --manifest-path core/Cargo.toml
 ```
+
+---
+
+## Test Bench and First Flash
+
+For initial hardware provisioning and rebuilding the reference test bench from bare metal, see the [first-flash procedure](docs/bench/first-flash.md).
 
 ---
 

@@ -18,8 +18,7 @@ SRC_URI = " \
     file://data.mount.d/10-condition.conf \
 "
 
-S = "${WORKDIR}/sources"
-UNPACKDIR = "${S}"
+S = "${UNPACKDIR}"
 
 SYSTEMD_SERVICE:${PN} = " \
     nextoomio-boot-mount.service \

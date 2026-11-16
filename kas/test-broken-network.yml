@@ -1,0 +1,8 @@
+# kas configuration for deliberately broken image: unreachable network / no SSH service (P0-F4.7 AC3, AC6)
+# Reference hardware: Raspberry Pi 4 (64-bit)
+header:
+  version: 14
+  includes:
+    - rpi4-64.yml
+
+target: nextoomio-image-broken-network

@@ -65,8 +65,93 @@ paths:
           description: Volume updated
         '400':
           $ref: '#/components/responses/ApiErrorResponse'
+  /update/status:
+    get:
+      summary: Retrieve current system update staging and validation state (UPD-04, UPD-05)
+      operationId: getUpdateStatus
+      responses:
+        '200':
+          description: Update transaction status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateStatus'
+  /update/stage:
+    post:
+      summary: Stage update payload into preallocated staging reservation (UPD-05, AR-08)
+      operationId: stageUpdate
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Update staged successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateStatus'
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
+  /update/validate:
+    post:
+      summary: Validate staged update bundle against compatibility and integrity requirements (UPD-04)
+      operationId: validateUpdate
+      responses:
+        '200':
+          description: Update validated and bound to transaction ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateStatus'
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
+  /update/install:
+    post:
+      summary: Install validated update into the inactive system slot (SYS-05, UPD-05)
+      operationId: installUpdate
+      responses:
+        '200':
+          description: Update installed into inactive slot and verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateStatus'
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
 components:
   schemas:
+    UpdateStatus:
+      type: object
+      required:
+        - state
+        - active_slot
+        - default_slot
+        - payload_length
+        - reserved_capacity
+      properties:
+        state:
+          type: string
+          enum: [idle, receiving, staged, validated, installing, installed, trial, committing, committed, failed]
+        active_slot:
+          type: string
+        default_slot:
+          type: string
+        target_slot:
+          type: [string, 'null']
+        tx_id:
+          type: [string, 'null']
+        payload_length:
+          type: integer
+        reserved_capacity:
+          type: integer
+        error_code:
+          type: [string, 'null']
+        message:
+          type: [string, 'null']
     CommandScope:
       type: string
       enum: [local, group]

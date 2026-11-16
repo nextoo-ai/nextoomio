@@ -1,0 +1,15 @@
+[connection]
+id=Wired
+uuid=86ddc5ee-2396-43b9-a417-31a478b273b5
+type=ethernet
+autoconnect=true
+autoconnect-priority=0
+
+[ethernet]
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+addr-gen-mode=default

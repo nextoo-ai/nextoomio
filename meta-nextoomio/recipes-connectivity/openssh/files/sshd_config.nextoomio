@@ -1,0 +1,30 @@
+# nextoomio OpenSSH daemon configuration (AD-23, ARCHITECTURE.md section 3.7)
+# Key authentication only; passwords, interactive auth, and forwardings disabled.
+
+Port 22
+
+# Host keys stored persistently on the shared data partition (AC5)
+HostKey /data/ssh/ssh_host_ed25519_key
+HostKey /data/ssh/ssh_host_rsa_key
+
+# Authorized keys stored exclusively in volatile tmpfs storage (AD-23, AC1, AC3)
+AuthorizedKeysFile /run/ssh/authorized_keys
+
+# Authentication controls (AC2)
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+
+# Forwarding controls (AC2)
+AllowAgentForwarding no
+AllowTcpForwarding no
+X11Forwarding no
+GatewayPorts no
+PermitTunnel no
+
+# Security & environment
+UsePAM no
+PrintMotd no
+AcceptEnv LANG LC_*

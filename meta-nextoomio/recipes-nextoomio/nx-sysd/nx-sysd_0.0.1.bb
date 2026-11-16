@@ -4,17 +4,32 @@ HOMEPAGE = "https://github.com/nextoo-ai/nextoomio"
 LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10"
 
-inherit cargo cargo-update-recipe-crates
+inherit cargo cargo-update-recipe-crates systemd
 
-FILESEXTRAPATHS:prepend := "${THISDIR}/../../..:"
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:${THISDIR}/../../..:"
 
 SRC_URI = " \
     file://core \
+    file://nextoomio-update-init.service \
 "
 
 require ${BPN}-crates.inc
 
-S = "${WORKDIR}/core"
+S = "${UNPACKDIR}/core"
 CARGO_SRC_DIR = ""
 
 CARGO_BUILD_FLAGS:append = " -p nx-sysd"
+
+SYSTEMD_SERVICE:${PN} = "nextoomio-update-init.service"
+SYSTEMD_AUTO_ENABLE:${PN} = "enable"
+
+do_install:append() {
+    if ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'true', 'false', d)}; then
+        install -d ${D}${systemd_system_unitdir}
+        install -m 0644 "${UNPACKDIR}/nextoomio-update-init.service" "${D}${systemd_system_unitdir}/"
+    fi
+}
+
+FILES:${PN} += " \
+    ${systemd_system_unitdir}/nextoomio-update-init.service \
+"

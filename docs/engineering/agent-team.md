@@ -1,7 +1,7 @@
 # Agent team
 
-Document version: **0.12 (autonomous operation)**  
-Date: **2026-11-15**  
+Document version: **0.14 (autonomous operation)**  
+Date: **2026-11-16**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
 
@@ -26,6 +26,10 @@ Version 0.10 records the pipeline runs on D-039 and D-040, the defects triaged f
 Version 0.11 records the pipeline runs on D-041 to D-050 and what remains for the pipeline (sections 9.3 and 11).
 
 Version 0.12 records who closes a defect that is assigned to a story (section 5, step 5) and the matching change of the guard, which now limits closing an issue by hand to the Architect instead of denying it to every role: the first product story, P0-F1.1 (#8), met every criterion and still could not close, because its defects were open and no rule named who closes them.
+
+Version 0.13 records the Architect's authority to unblock development (section 4.1) and what `Completes-Story: yes` means for a story with bench criteria (section 5, step 3), after P0-F2.1 (#11) was blocked twice with no code finding and stories with bench criteria could not reach `state:implemented`.
+
+Version 0.14 adds `docs/bench/` to the DevOps paths and states for DevOps what section 4.2 already states for the Developer: files a story names under "Touches" are inside the role's paths for that story (section 4.5). The first run of the Phase 0 queue blocked P0-F7.1 (#31) because the bench record it must deliver lies under `docs/bench/`, which was in no role's paths (findings #228 and #235), and P0-F2.3 (#13) because its "Touches" names `core/crates/nx-sysd/**`. The guard and the pipeline already accepted "Touches" for both author roles; only the text did not.
 
 ## 1. Goal
 
@@ -75,8 +79,9 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Responsibility:** From the specification, design the approach and components (architecture decisions `AD-*`, open decisions `OD-*`); write features and stories; triage findings into defects; mark stories ready; keep `SPECIFICATION.md`, `ROADMAP.md`, and `ARCHITECTURE.md` consistent and requirement coverage complete; maintain the agent rules.
 - **Input:** The maintained documents, a requested scope (for example "stories for P1-F6"), or findings reported by other agents.
 - **Output:** A documentation pull request on an `arch/` branch, new or edited backlog issues, defect issues.
-- **May edit:** Markdown documents in the repository root and under `docs/` except `docs/evidence/`; `AGENTS.md`; `.claude/agents/`; issues and labels.
-- **May not:** Edit source code, build configuration, CI, or recorded evidence; approve or merge pull requests.
+- **May edit:** Markdown documents in the repository root and under `docs/`; in `docs/evidence/` only the wording, to unblock a story, never a recorded result; `AGENTS.md`; `.claude/agents/`; issues and labels.
+- **May not:** Edit source code, build configuration, or CI; change a recorded result in evidence; approve or merge pull requests; change `SPECIFICATION.md` without the project owner's approval.
+- **Authority to unblock:** The Architect may close any issue that development is waiting on and create whatever is needed for it: issues, rules, and, when a story is blocked on them, corrections to a pull request's description or to the wording of an evidence file (never to a recorded result). Tooling inside the repository still goes through a DevOps issue; the Architect may set up the workstation and local builds outside the repository. Each such act is stated in a comment on the issue or pull request. The Architect does not change `SPECIFICATION.md` without the project owner's approval (project owner's decision, 2026-11-15).
 - **Model:** Claude Fable (`fable`), in Claude Code.
 
 ### 4.2 Developer
@@ -111,8 +116,8 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Responsibility:** CI workflows, kas and Yocto build, image and update-file production, deploy tooling, bench operation, and recording bench evidence.
 - **Input:** One enabler or story issue in its area labelled `state:ready`, a story with `state:implemented` that needs hardware evidence, or a failed build.
 - **Output:** A pull request on an `ops/` branch with build or CI changes, or with an evidence file stating the observed result.
-- **May edit:** `.github/`, `kas/`, `meta-nextoomio/`, `scripts/`, `Makefile`, `.gitignore`, and `docs/evidence/`; the register rows of `ARCHITECTURE.md` section 10 under the same condition as the Developer.
-- **May not:** Edit original application code, the maintained requirement documents, or the agent rules. Bench limits are in OQ-14.
+- **May edit:** `.github/`, `kas/`, `meta-nextoomio/`, `scripts/`, `Makefile`, `.gitignore`, `docs/evidence/`, and `docs/bench/` (bench procedures and the bench record); other files the story names under "Touches"; the register rows of `ARCHITECTURE.md` section 10 under the same condition as the Developer.
+- **May not:** Edit original application code that the story does not name under "Touches", the maintained requirement documents, or the agent rules. Bench limits are in OQ-14.
 - **Model:** Gemini 3.8 Flash (High) in Antigravity (`agy`).
 - **Concurrency:** One DevOps agent at a time, because the bench and the build cache are single resources.
 
@@ -132,7 +137,7 @@ SPECIFICATION ─► Architect ─► story (state:ready) ─► pipeline
 
 1. The author role (Developer, or DevOps for build, CI, image, tooling, and hardware work) implements the issue in the working tree, on a branch the pipeline created. The pipeline then checks every changed path against the role with the guard's own rules; if any is outside, it commits nothing, keeps the changes in a local stash, and blocks the issue. Otherwise it commits and pushes under the role's identity and opens the pull request with the author's summary and `Refs #<n>`.
 2. The pipeline enables auto-merge on the pull request as the author's App. GitHub merges it when the rule set on `main` is satisfied, not before.
-3. CI runs; the pipeline waits until all required checks have reported. The Reviewer reviews the head commit and states `Completes-Story: yes` or `Completes-Story: no` in the review; the line refers to the issue the pull request was made for, including a defect worked on directly. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
+3. CI runs; the pipeline waits until all required checks have reported. The Reviewer reviews the head commit and states `Completes-Story: yes` or `Completes-Story: no` in the review; the line refers to the issue the pull request was made for, including a defect worked on directly, and `yes` means the implementation is complete even when build or bench evidence is still to be recorded. A CI failure or requested changes go back to the author on the same branch. After two such rounds without approval the pipeline labels the issue `state:blocked` with the reason, and the Architect decides whether the story or the approach is wrong.
 4. After the merge, if the review said `Completes-Story: yes`, the pipeline sets `state:implemented` and starts QM. If it said `no`, the pipeline stops and leaves the issue ready for the next pull request, which a further run delivers.
 5. QM ends its verdict with `QM-Verdict: PASS` or `QM-Verdict: FAIL`. On PASS the pipeline ticks the acceptance criteria and closes the issue as completed. Otherwise the issue stays open with the verdict, for the Architect. Where the only obstacle is an open defect assigned to the story, and the verdict states that the criteria are met and the evidence demonstrates the defect's fix, the Architect closes that defect as completed with a link to the verdict and starts QM again ([backlog conventions](../backlog/README.md), section "Status").
 6. Any role that finds a problem outside its task reports a finding; the Architect files the defect.
