@@ -93,6 +93,7 @@ jobs:
             -w /work \
             -e USER_ID="$(id -u)" \
             -e GROUP_ID="$(id -g)" \
+            -e NEXTOOMIO_SOURCE_COMMIT="${{ github.sha }}" \
             -e KAS_WORK_DIR=/work/build \
             -e DL_DIR=/work/yocto-cache/downloads \
             -e SSTATE_DIR=/work/yocto-cache/sstate-cache \
@@ -109,6 +110,7 @@ jobs:
             -w /work \
             -e USER_ID="$(id -u)" \
             -e GROUP_ID="$(id -g)" \
+            -e NEXTOOMIO_SOURCE_COMMIT="${{ github.sha }}" \
             -e KAS_WORK_DIR=/work/build \
             -e DL_DIR=/work/yocto-cache/downloads \
             -e SSTATE_DIR=/work/yocto-cache/sstate-cache \

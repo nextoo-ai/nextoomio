@@ -2,7 +2,7 @@ SUMMARY = "nextoomio read-only release image (v0.0.1 baseline)"
 DESCRIPTION = "Production-style read-only image with PipeWire, MPD, SWUpdate, NetworkManager, Avahi, nftables, nx-sysd, and key-activated OpenSSH per ARCHITECTURE.md section 3.7 and AD-23."
 LICENSE = "MIT"
 
-inherit core-image
+inherit core-image nextoomio-image-version
 
 # Enforce read-only rootfs and remove debug tooling (ARCHITECTURE.md section 3.7)
 # OpenSSH is installed in the single image, stopped by default, and activated via key file (AD-23, D-007)

@@ -1,9 +1,14 @@
 //! Minimal privileged operations helper binary (`nx-sysd`).
 //!
-//! Exposes update staging, validation, and status operations over CLI
-//! for Phase 0 bench and SSH operation (AD-20, UPD-04, UPD-05).
+//! Exposes device identity, image versioning, persistent device ID,
+//! and update staging, validation, and status operations over CLI
+//! for Phase 0 bench and SSH operation (AD-20, UPD-04, UPD-05, AC1-AC4).
 
 use nx_sysd::engine::DEFAULT_STAGING_RESERVATION;
+use nx_sysd::identity::{
+    get_or_create_device_id_with_path, query_device_identity, HardwareIdentity, VersionInfo,
+    DEFAULT_DEVICE_ID_PATH,
+};
 use nx_sysd::journal::FileJournalStorage;
 use nx_sysd::system::{FileStagingStorage, PhysicalSlotBackend};
 use nx_sysd::UpdateEngine;
@@ -18,6 +23,13 @@ fn print_usage() {
     println!(
         "nx-sysd: nextoomio privileged helper daemon\n\n\
         Usage:\n  \
+        nx-sysd [COMMAND] [OPTIONS]\n\n\
+        Identity commands:\n  \
+        nx-sysd identity                                 Print complete device identity as JSON\n  \
+        nx-sysd version [--json]                         Print image version, commit, build ID, and slot\n  \
+        nx-sysd hardware                                 Print board model and hardware compatibility JSON\n  \
+        nx-sysd init-device-id                           Initialize persistent device ID on /data\n\n\
+        Update commands:\n  \
         nx-sysd update init-staging [--dir <path>] [--capacity <bytes>]\n  \
         nx-sysd update stage --file <path> [--declared-length <bytes>] [--dir <path>]\n  \
         nx-sysd update validate [--dir <path>] [--hardware <id>] [--schema <n>]\n  \
@@ -25,6 +37,102 @@ fn print_usage() {
         nx-sysd update status [--dir <path>] [--json]\n  \
         nx-sysd update abort [--dir <path>]\n"
     );
+}
+
+fn print_identity_json() -> ExitCode {
+    match query_device_identity() {
+        Ok(identity) => match serde_json::to_string_pretty(&identity) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Error serializing device identity: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Err(e) => {
+            eprintln!("Error querying device identity: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn handle_version(args: &[String]) -> ExitCode {
+    let want_json = args.iter().any(|a| a == "--json");
+    match query_device_identity() {
+        Ok(identity) => {
+            if want_json {
+                let v = VersionInfo {
+                    image_version: identity.image_version.clone(),
+                    source_commit: identity.source_commit.clone(),
+                    build_id: identity.build_id,
+                    running_slot: identity.running_slot.clone(),
+                };
+                match serde_json::to_string_pretty(&v) {
+                    Ok(json) => {
+                        println!("{json}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("Error serializing version info: {e}");
+                        ExitCode::from(1)
+                    }
+                }
+            } else {
+                println!(
+                    "nextoomio {} ({}, build {}, slot {})",
+                    identity.image_version,
+                    identity.source_commit,
+                    identity.build_id,
+                    identity.running_slot
+                );
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("Error querying version: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn handle_hardware() -> ExitCode {
+    match query_device_identity() {
+        Ok(identity) => {
+            let hw = HardwareIdentity {
+                board_model: identity.board_model,
+                hardware_compatibility: identity.hardware_compatibility,
+            };
+            match serde_json::to_string_pretty(&hw) {
+                Ok(json) => {
+                    println!("{json}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("Error serializing hardware identity: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error querying hardware identity: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn handle_init_device_id() -> ExitCode {
+    match get_or_create_device_id_with_path(Path::new(DEFAULT_DEVICE_ID_PATH)) {
+        Ok(id) => {
+            eprintln!("nextoomio device-id initialized: {id}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize device ID: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn get_engine(
@@ -47,30 +155,6 @@ fn get_engine(
         Some(cap),
     )
     .map_err(|e| format!("engine initialization error: {e}"))
-}
-
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        print_usage();
-        return ExitCode::SUCCESS;
-    }
-
-    match args[1].as_str() {
-        "update" => handle_update(&args[2..]),
-        "help" | "--help" | "-h" => {
-            print_usage();
-            ExitCode::SUCCESS
-        }
-        "version" => {
-            println!("nx-sysd v0.0.1-dev");
-            ExitCode::SUCCESS
-        }
-        unknown => {
-            eprintln!("Unknown command '{unknown}'. Use 'nx-sysd help' for usage.");
-            ExitCode::from(1)
-        }
-    }
 }
 
 fn handle_update(args: &[String]) -> ExitCode {
@@ -165,7 +249,7 @@ fn handle_update(args: &[String]) -> ExitCode {
                 i += 1;
             }
             unknown => {
-                eprintln!("Error: unrecognized argument '{unknown}'");
+                eprintln!("Error: unknown option '{unknown}'");
                 return ExitCode::from(1);
             }
         }
@@ -344,6 +428,30 @@ fn handle_update(args: &[String]) -> ExitCode {
         }
         unknown => {
             eprintln!("Unknown update subcommand '{unknown}'. Use 'nx-sysd update' without arguments for usage.");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        print_usage();
+        return ExitCode::SUCCESS;
+    }
+
+    match args[1].as_str() {
+        "identity" => print_identity_json(),
+        "version" => handle_version(&args[2..]),
+        "hardware" => handle_hardware(),
+        "init-device-id" => handle_init_device_id(),
+        "update" => handle_update(&args[2..]),
+        "help" | "--help" | "-h" => {
+            print_usage();
+            ExitCode::SUCCESS
+        }
+        unknown => {
+            eprintln!("Unknown command '{unknown}'. Use 'nx-sysd help' for usage.");
             ExitCode::from(1)
         }
     }

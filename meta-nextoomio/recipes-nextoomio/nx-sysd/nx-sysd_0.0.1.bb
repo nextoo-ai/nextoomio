@@ -10,6 +10,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:${THISDIR}/../../..:"
 
 SRC_URI = " \
     file://core \
+    file://nextoomio-device-id.service \
     file://nextoomio-update-init.service \
 "
 
@@ -20,16 +21,21 @@ CARGO_SRC_DIR = ""
 
 CARGO_BUILD_FLAGS:append = " -p nx-sysd"
 
-SYSTEMD_SERVICE:${PN} = "nextoomio-update-init.service"
+SYSTEMD_SERVICE:${PN} = " \
+    nextoomio-device-id.service \
+    nextoomio-update-init.service \
+"
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 
 do_install:append() {
     if ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'true', 'false', d)}; then
         install -d ${D}${systemd_system_unitdir}
+        install -m 0644 "${UNPACKDIR}/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
         install -m 0644 "${UNPACKDIR}/nextoomio-update-init.service" "${D}${systemd_system_unitdir}/"
     fi
 }
 
 FILES:${PN} += " \
+    ${systemd_system_unitdir}/nextoomio-device-id.service \
     ${systemd_system_unitdir}/nextoomio-update-init.service \
 "

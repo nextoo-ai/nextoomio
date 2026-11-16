@@ -18,9 +18,6 @@ use std::io::Read;
 /// Default preallocated staging reservation capacity: 1 GiB (ARCHITECTURE.md section 3.6 step 1).
 pub const DEFAULT_STAGING_RESERVATION: u64 = 1_073_741_824;
 
-/// Default hardware compatibility identifier for Phase 0 bench (Raspberry Pi 4).
-pub const DEFAULT_HARDWARE_MODEL: &str = "1.0";
-
 /// Default configuration schema version.
 pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
 
@@ -144,14 +141,41 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// Initializes or loads an update engine instance.
     pub fn new(
         backend: B,
-        mut storage: S,
+        storage: S,
         journal_storage: J,
         hardware_model: Option<String>,
         schema_version: Option<u32>,
         capacity: Option<u64>,
     ) -> Result<Self, UpdateEngineError> {
+        Self::new_with_compatibility_reader(
+            backend,
+            storage,
+            journal_storage,
+            hardware_model,
+            schema_version,
+            capacity,
+            crate::identity::read_hardware_compatibility,
+        )
+    }
+
+    pub(crate) fn new_with_compatibility_reader(
+        backend: B,
+        mut storage: S,
+        journal_storage: J,
+        hardware_model: Option<String>,
+        schema_version: Option<u32>,
+        capacity: Option<u64>,
+        read_compatibility: impl FnOnce() -> Result<String, String>,
+    ) -> Result<Self, UpdateEngineError> {
         let cap = capacity.unwrap_or(DEFAULT_STAGING_RESERVATION);
-        let hw = hardware_model.unwrap_or_else(|| DEFAULT_HARDWARE_MODEL.to_string());
+        let hw = match hardware_model {
+            Some(h) => h,
+            None => read_compatibility().map_err(|e| {
+                UpdateEngineError::Storage(format!(
+                    "failed to determine hardware compatibility from device identity: {e}"
+                ))
+            })?,
+        };
         let schema = schema_version.unwrap_or(DEFAULT_SCHEMA_VERSION);
 
         let active = backend
