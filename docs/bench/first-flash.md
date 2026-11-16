@@ -34,18 +34,52 @@ Physical access to the microSD card is required only for:
     - Partition 5 (`root_a`): 3072 MiB / 3 GiB (ext4)
     - Partition 6 (`root_b`): 3072 MiB / 3 GiB (ext4)
     - Partition 7 (`data`): 1536 MiB initial (ext4, grown on first boot to fill the remainder of the card)
-    - Total fixed initial layout consumes ~8.2 GiB. A card of at least 16 GB ensures sufficient capacity for the initial layout and the grown `/data` storage partition.
+    - Total fixed initial layout consumes 8256 MiB, which is about 8.06 GiB (8.66 GB). A card of at least 16 GB ensures sufficient capacity for the initial layout and the grown `/data` storage partition.
 
 ### Workstation Prerequisites
 
 - MicroSD card reader/writer.
 - Workstation flashing utility: `bmaptool` (recommended for block-mapped writing) or `dd`.
-- CI build artifacts for the image:
-  - `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2` (compressed Wic image)
-  - `nextoomio-image-raspberrypi4-64.rootfs.wic.bmap` (block map file)
+- Decompressed Wic image artifact (`*.wic.bz2`) and matching block map (`*.wic.bmap`) obtained from the CI build workflow (see Section 3.1).
 - A developer SSH public key file (e.g., `~/.ssh/id_ed25519.pub`).
+- GitHub CLI (`gh`) or a web browser to download CI build artifacts.
 
 ## 3. Flashing the Image
+
+### 3.1 Obtaining the CI Image Artifact
+
+In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is built by CI. A person following this procedure can retrieve the required artifacts directly from GitHub Actions:
+
+1. **Workflow source:**
+   - Full BitBake Wic image builds are executed by the workflow `.github/workflows/yocto-build.yml` ("Yocto Image Build").
+   - Full images are built and uploaded on every `push` to `main` modifying build paths (`kas/**`, `meta-nextoomio/**`, `.github/workflows/yocto-build.yml`), or via manual `workflow_dispatch` with input `mode: full-image`.
+   - Build artifacts are retained for 14 days. Pick the latest successful run on `main` (or a specific tagged release/commit).
+
+2. **Download the artifact:**
+   - **Using GitHub CLI (`gh`):**
+     ```bash
+     # List recent successful Yocto image runs on main
+     gh run list --workflow=yocto-build.yml --status=success --branch=main
+
+     # Download the artifact from the selected run ID into the current working directory
+     gh run download <RUN_ID> -n "nextoomio-rpi4-64-*"
+     ```
+   - **Using the GitHub Web UI:**
+     1. Navigate to the repository's **Actions** tab.
+     2. In the left sidebar, select the **Yocto Image Build** workflow.
+     3. Select the latest successful run on the `main` branch.
+     4. Scroll to the **Artifacts** section at the bottom of the summary page.
+     5. Download the artifact named `nextoomio-rpi4-64-<sha>` (packaged as a `.zip` archive).
+
+3. **Extract and identify the Wic image and block map:**
+   ```bash
+   unzip nextoomio-rpi4-64-*.zip
+   ```
+   The archive contains the compressed Wic image (`*.wic.bz2`), block map (`*.wic.bmap`), rootfs manifest (`*.rootfs.manifest`), SBOM archive, and license manifest.
+
+   In BitBake/OpenEmbedded builds, image files are named after the recipe and machine, typically with a build timestamp (e.g., `nextoomio-image-raspberrypi4-64-<timestamp>.rootfs.wic.bz2` or symlink `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2`, along with the corresponding `.wic.bmap`). Identify the `.wic.bz2` file and its matching `.wic.bmap` for flashing.
+
+### 3.2 Identifying the Target MicroSD Card Node
 
 1. Insert the blank microSD card into the workstation card reader.
 2. Identify the target block device node:
@@ -55,22 +89,25 @@ Physical access to the microSD card is required only for:
    > [!IMPORTANT]
    > Ensure the target device node represents the microSD card and NOT a workstation system disk.
 
-3. Write the image artifact to the card:
+### 3.3 Writing the Image to the Card
 
-   - **Using `bmaptool` (recommended, fast and verified):**
-     ```bash
-     sudo bmaptool copy nextoomio-image-raspberrypi4-64.rootfs.wic.bz2 /dev/sdX
-     ```
+Write the image artifact to the card using either `bmaptool` or `dd`:
 
-   - **Using `bunzip2` and `dd`:**
-     ```bash
-     bzcat nextoomio-image-raspberrypi4-64.rootfs.wic.bz2 | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
-     ```
+- **Using `bmaptool` (recommended, fast and verified):**
+  ```bash
+  sudo bmaptool copy nextoomio-image-raspberrypi4-64.rootfs.wic.bz2 /dev/sdX
+  ```
+  *(Replace `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2` with the exact path to your unpacked `.wic.bz2` file and `/dev/sdX` with your card device node.)*
 
-4. Flush buffers to disk:
-   ```bash
-   sync
-   ```
+- **Using `bunzip2` and `dd`:**
+  ```bash
+  bzcat nextoomio-image-raspberrypi4-64.rootfs.wic.bz2 | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+  ```
+
+Flush buffers to disk:
+```bash
+sync
+```
 
 ## 4. Verifying the Written Card
 
@@ -162,7 +199,7 @@ Eject and safely remove the microSD card from the workstation.
 4. Connect the 12V–18V DC power adapter to the HiFiBerry Amp+ DC jack.
 5. Apply power. The system initializes:
    - Raspberry Pi bootloader reads `autoboot.txt` on partition 1 (`select`).
-   - Slot A boot files (`boot_a`, partition 2) are loaded: kernel (`Image`), device tree (`bcm2711-rpi-4-b.dtb`), and sound card overlay.
+   - Slot A boot files (`boot_a`, partition 2, populated by OpenEmbedded `bootimg-partition` in `meta-nextoomio/files/wic/nextoomio-ab.wks.in`) are loaded: 64-bit kernel (`Image`), device tree blob (`bcm2711-rpi-4-b.dtb`), and sound card overlay include `nextoomio-hardware.txt` (deployed by `meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb` and included in `config.txt` via `meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend`, loading `overlays/hifiberry-amp.dtbo`).
    - Kernel boots with root filesystem on slot A (`root_a`, partition 5, `PARTUUID=4e58544d-05`).
    - On first boot, the `/data` partition (partition 7) is mounted, and `/boot/select` is mounted read-only (`ro`).
    - `nextoomio-ssh-keys.service` runs: validates `/boot/select/authorized_keys`, creates volatile authorized keys in `/run/ssh/authorized_keys`, opens firewall port 22 in `nftables`, and starts `sshd.service`.
@@ -183,7 +220,7 @@ Eject and safely remove the microSD card from the workstation.
 
 ## 7. Recording Hardware Revisions
 
-In accordance with acceptance criterion AC3, [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1, and [ROADMAP.md](../../ROADMAP.md) section 2.1, the exact hardware revisions must be read from the running device and recorded in the test bench record upon initial flash.
+In accordance with acceptance criterion AC3, [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1, and [ROADMAP.md](../../ROADMAP.md) section 2.1, the exact hardware revisions must be read from the running device upon initial flash and recorded in the story evidence file [`docs/evidence/p0/P0-F5.2.md`](../evidence/p0/P0-F5.2.md) under the **Hardware model and revision** section and the AC3 row of **Observed result**.
 
 Execute the following commands over the SSH session:
 
@@ -214,29 +251,36 @@ aplay -l
 
 ### Reference Bench Hardware Inventory Table
 
-Record the readings in the bench documentation:
+Record the readings in [`docs/evidence/p0/P0-F5.2.md`](../evidence/p0/P0-F5.2.md). The table below lists the query command, the expected specification or reference format, and the placeholder to be recorded during first flash on physical hardware:
 
-| Component | Specification / Query Command | Recorded Reading |
-| --- | --- | --- |
-| **Board Model** | `/sys/firmware/devicetree/base/model` | Raspberry Pi 4 Model B |
-| **Board Revision** | `grep 'Revision' /proc/cpuinfo` | Recorded upon first flash (e.g., `c03114`) |
-| **RAM Capacity** | `free -h` or `/proc/meminfo` | Recorded upon first flash (e.g., `4 GB`) |
-| **Board Serial** | `grep 'Serial' /proc/cpuinfo` | Recorded upon first flash |
-| **Sound Card** | `aplay -l` / `cat /proc/asound/cards` | `snd_rpi_hifiberry_amp` (`hifiberry-amp`) |
-| **Amp+ PCB Revision**| Physical silkscreen inspection | Recorded upon first flash (e.g., `PCB Rev 1.0`) |
-| **Storage Card** | MicroSD card label inspection | Recorded upon first flash (e.g., SanDisk 32GB) |
-| **Network Interface**| `ip link show eth0` | Wired Gigabit Ethernet `eth0` |
+| Component | Query Command / Inspection Method | Expected Specification / Reference Format | Recorded Reading |
+| --- | --- | --- | --- |
+| **Board Model** | `cat /sys/firmware/devicetree/base/model` | Raspberry Pi 4 Model B (e.g., `Rev 1.4`) | |
+| **Board Revision** | `grep 'Revision' /proc/cpuinfo` | Hardware revision code (e.g., `c03114`) | |
+| **RAM Capacity** | `free -h` or `/proc/meminfo` | Physical RAM (e.g., `3.8Gi` for 4 GB board) | |
+| **Board Serial** | `grep 'Serial' /proc/cpuinfo` | Unique 16-hex-digit SoC serial number | |
+| **Sound Card** | `aplay -l` or `cat /proc/asound/cards` | `snd_rpi_hifiberry_amp` (`hifiberry-amp`) | |
+| **Amp+ PCB Revision** | Visual PCB silkscreen inspection | Silkscreen batch/revision (e.g., `PCB Rev 1.0`) | |
+| **Storage Card** | MicroSD card label inspection | Card brand and capacity (minimum 16 GB) | |
+| **Network Interface** | `ip link show eth0` | Wired Gigabit Ethernet interface `eth0` | |
 
 ## 8. Initial Audio Smoke Verification
 
 During the first flash, verify that the audio pipeline is operational by listening to a test tone:
 
+- In `nextoomio-image.bb`, the image installs `alsa-utils`, PipeWire (`pipewire`, `pipewire-alsa`, `pipewire-pulse`, `wireplumber`), and `nextoomio-audio-profile`.
+- At boot, `nextoomio-audio-profile.service` runs `nextoomio-audio-profile-setup` (`meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile-setup.sh`) to initialize the hardware mixer control (`Master`) to the fixed 30% volume level defined in `hifiberry-amp.json` (D-012).
+- To confirm audible output per [ROADMAP.md](../../ROADMAP.md) section 2.1, play a synthesized test tone through ALSA without relying on external WAV audio files:
+
 ```bash
-# Play ALSA test tone on the HiFiBerry Amp+
-speaker-test -D default -c 2 -t wav -l 1
+# Generate a 440 Hz test tone on the default ALSA output (routed through PipeWire):
+speaker-test -D default -c 2 -t sine -f 440 -l 1
+
+# Or target the HiFiBerry hardware PCM device directly:
+speaker-test -D plughw:CARD=sndrpihifiberry,DEV=0 -c 2 -t sine -f 440 -l 1
 ```
 
-Confirm that the test sound is audible from the connected test speaker. As noted in [ROADMAP.md](../../ROADMAP.md) section 2.1, audible output is confirmed by listening once when someone is physically at the bench device during the initial flash.
+Confirm that the test sound is audible from the connected passive test speaker. As noted in [ROADMAP.md](../../ROADMAP.md) section 2.1, audible output is confirmed by listening once when someone is physically at the bench device during the initial flash.
 
 ## 9. Subsequent Deployments
 
