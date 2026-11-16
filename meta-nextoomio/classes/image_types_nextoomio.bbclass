@@ -4,7 +4,7 @@
 inherit image_types
 
 # Share the slot A root reference with the deployed rpi-cmdline recipe.
-require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/rpi-cmdline.bbappend
+require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc
 NEXTOOMIO_ROOT_B = "PARTUUID=4e58544d-06"
 
 IMAGE_TYPES += "swu"
@@ -31,7 +31,7 @@ do_image_swu[depends] += " \
     virtual/kernel:do_deploy \
     rpi-config:do_deploy \
     rpi-cmdline:do_deploy \
-    bcm2835-bootfiles:do_deploy \
+    rpi-bootfiles:do_deploy \
     nextoomio-audio-profile:do_deploy \
 "
 
@@ -41,10 +41,10 @@ IMAGE_CMD:swu () {
     mkdir -p "${SWU_BUILD_DIR}"
 
     BOOT_ARTIFACT="${SWU_BUILD_DIR}/nextoomio-boot.vfat"
-    ROOTFS_ARTIFACT="${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.rootfs.ext4.gz"
+    ROOTFS_ARTIFACT="${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.ext4.gz"
 
     if [ ! -f "${ROOTFS_ARTIFACT}" ]; then
-        ROOTFS_ARTIFACT="${IMGDEPLOYDIR}/${IMAGE_NAME}.rootfs.ext4.gz"
+        ROOTFS_ARTIFACT="${IMGDEPLOYDIR}/${IMAGE_NAME}.ext4.gz"
     fi
 
     if [ ! -f "${ROOTFS_ARTIFACT}" ]; then
@@ -55,25 +55,41 @@ IMAGE_CMD:swu () {
     # 262144 1 KiB blocks = 268435456 bytes, fitting the 256 MiB boot_a/boot_b slot in ARCHITECTURE.md section 3.6
     mkfs.vfat -F 32 -n "boot" -C "${BOOT_ARTIFACT}" 262144
 
-    # 2. Populate boot files into boot VFAT filesystem
-    # Required boot files must cause fatal build failure if absent (AC1, CQ-R2, D-056)
-    for req in Image bcm2711-rpi-4-b.dtb cmdline.txt config.txt nextoomio-hardware.txt; do
-        if [ ! -f "${DEPLOY_DIR_IMAGE}/${req}" ]; then
-            bbfatal "Required boot file ${req} missing from ${DEPLOY_DIR_IMAGE}"
+    # Use the same boot file list and destinations as wic's boot_a partition.
+    BOOT_FILE_ENTRIES="${IMAGE_BOOT_FILES_label-boot_a}"
+    for entry in ${BOOT_FILE_ENTRIES}; do
+        src="${entry%%;*}"
+        dst=""
+        case "${entry}" in
+            *";"*) dst="${entry#*;}" ;;
+        esac
+        matched=0
+        for f in ${DEPLOY_DIR_IMAGE}/${src}; do
+            [ -e "${f}" ] || continue
+            matched=1
+            if [ -n "${dst}" ]; then
+                dstdir=$(dirname "${dst}")
+                if [ "${dstdir}" != "." ]; then
+                    mdir -i "${BOOT_ARTIFACT}" "::/${dstdir}" >/dev/null 2>&1 || mmd -i "${BOOT_ARTIFACT}" "::/${dstdir}"
+                fi
+                mcopy -o -i "${BOOT_ARTIFACT}" "${f}" "::/${dst}"
+            else
+                mcopy -o -i "${BOOT_ARTIFACT}" -s "${f}" ::/
+            fi
+        done
+        if [ "${matched}" = "0" ]; then
+            bbfatal "Boot file entry ${entry} matches nothing in ${DEPLOY_DIR_IMAGE}"
         fi
-        mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/
     done
 
-    if [ ! -d "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles" ] || [ -z "$(ls -A "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles" 2>/dev/null)" ]; then
-        bbfatal "Firmware directory ${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles is missing or empty"
+    for req in ${SDIMG_KERNELIMAGE} bcm2711-rpi-4-b.dtb cmdline.txt config.txt nextoomio-hardware.txt start4.elf fixup4.dat; do
+        if ! mdir -i "${BOOT_ARTIFACT}" "::/${req}" >/dev/null 2>&1; then
+            bbfatal "Required boot file ${req} is not in the boot payload"
+        fi
+    done
+    if ! mdir -i "${BOOT_ARTIFACT}" ::/overlays 2>/dev/null | grep -qi "dtbo"; then
+        bbfatal "The boot payload has no device tree overlays"
     fi
-    mcopy -i "${BOOT_ARTIFACT}" -s "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles/"* ::/
-
-    if [ ! -d "${DEPLOY_DIR_IMAGE}/overlays" ] || [ -z "$(ls -A "${DEPLOY_DIR_IMAGE}/overlays" 2>/dev/null)" ]; then
-        bbfatal "Device tree overlays directory ${DEPLOY_DIR_IMAGE}/overlays is missing or empty"
-    fi
-    mmd -i "${BOOT_ARTIFACT}" ::/overlays
-    mcopy -i "${BOOT_ARTIFACT}" -s "${DEPLOY_DIR_IMAGE}/overlays/"* ::/overlays/
 
     # Reject a changed slot A reference before deriving the slot-specific payloads.
     if [ "${CMDLINE_ROOT_PARTITION}" != "${@d.getVar('NEXTOOMIO_ROOT_B').replace('-06', '-05')}" ]; then
@@ -112,10 +128,10 @@ IMAGE_CMD:swu () {
     done
 
     # 3. Enforce the root slot size limit.
-    if [ -f "${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.rootfs.ext4" ]; then
-        ROOT_EXPANDED_SIZE=$(stat -c %s "${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.rootfs.ext4")
-    elif [ -f "${IMGDEPLOYDIR}/${IMAGE_NAME}.rootfs.ext4" ]; then
-        ROOT_EXPANDED_SIZE=$(stat -c %s "${IMGDEPLOYDIR}/${IMAGE_NAME}.rootfs.ext4")
+    if [ -f "${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.ext4" ]; then
+        ROOT_EXPANDED_SIZE=$(stat -c %s "${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.ext4")
+    elif [ -f "${IMGDEPLOYDIR}/${IMAGE_NAME}.ext4" ]; then
+        ROOT_EXPANDED_SIZE=$(stat -c %s "${IMGDEPLOYDIR}/${IMAGE_NAME}.ext4")
     else
         ROOT_EXPANDED_SIZE=$(gzip -dc "${ROOTFS_ARTIFACT}" | wc -c)
     fi

@@ -192,8 +192,12 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
 
     has_cmdline_root = False
     expected_partuuid = None
-    if cmdline_bbappend.is_file():
-        bbappend_text = cmdline_bbappend.read_text(encoding="utf-8")
+    cmdline_include = cmdline_bbappend.with_name("nextoomio-cmdline.inc")
+    include_directive = "require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc"
+    if not cmdline_bbappend.is_file() or include_directive not in cmdline_bbappend.read_text(encoding="utf-8"):
+        errors.append("rpi-cmdline.bbappend must require nextoomio-cmdline.inc")
+    if cmdline_include.is_file():
+        bbappend_text = cmdline_include.read_text(encoding="utf-8")
         for line in bbappend_text.splitlines():
             line_clean = line.strip()
             if line_clean.startswith("#") or not line_clean:
@@ -782,23 +786,14 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append(
                 "image_types_nextoomio.bbclass must not use '|| true' on mcopy or mmd (silent boot assembly failure forbidden, CQ-R2)"
             )
-        for req_boot in ("Image", "bcm2711-rpi-4-b.dtb", "cmdline.txt", "config.txt", "nextoomio-hardware.txt"):
+        for req_boot in ("${SDIMG_KERNELIMAGE}", "bcm2711-rpi-4-b.dtb", "cmdline.txt", "config.txt", "nextoomio-hardware.txt", "start4.elf", "fixup4.dat"):
             if req_boot not in class_text:
-                errors.append(f"image_types_nextoomio.bbclass must check presence of required boot file '{req_boot}' with bbfatal (CQ-R2, D-056)")
-        if "bcm2835-bootfiles:do_deploy" not in class_text:
-            errors.append(
-                "image_types_nextoomio.bbclass: do_image_swu[depends] must include 'bcm2835-bootfiles:do_deploy' "
-                "for firmware deployment (CQ-R1, CQ-R2, AC1, AC4)"
-            )
-        if not re.search(r'bcm2835-bootfiles[^\n]*\n\s*bbfatal', class_text):
-            errors.append(
-                "image_types_nextoomio.bbclass must fail with bbfatal when bcm2835-bootfiles firmware directory "
-                "is missing or empty (CQ-R1, CQ-R2, AC4)"
-            )
-        if not re.search(r'overlays[^\n]*\n\s*bbfatal', class_text):
-            errors.append(
-                "image_types_nextoomio.bbclass must fail with bbfatal when overlays directory is missing or empty (CQ-R2, D-056)"
-            )
+                errors.append(f"image_types_nextoomio.bbclass must check required boot file '{req_boot}' (D-056)")
+        if "rpi-bootfiles:do_deploy" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must depend on rpi-bootfiles:do_deploy")
+        for required in ('${IMAGE_BOOT_FILES_label-boot_a}', 'bbfatal "Boot file entry ${entry} matches nothing', 'bbfatal "Required boot file ${req} is not in the boot payload', 'bbfatal "The boot payload has no device tree overlays'):
+            if required not in class_text:
+                errors.append(f"image_types_nextoomio.bbclass missing boot assembly check: {required}")
         if "gzip -l" in class_text:
             errors.append(
                 "image_types_nextoomio.bbclass must not use 'gzip -l' for uncompressed size calculation "
@@ -809,7 +804,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
 
         # D-067: both slot payloads and the fatal FAT read-back must remain wired in.
         required_slot_fragments = (
-            'require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/rpi-cmdline.bbappend',
+            'require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc',
             'NEXTOOMIO_ROOT_B = "PARTUUID=4e58544d-06"',
             'BOOT_PKG_A="nextoomio-boot-a.vfat.gz"',
             'BOOT_PKG_B="nextoomio-boot-b.vfat.gz"',
@@ -1076,6 +1071,7 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend",
+        "meta-nextoomio/recipes-bsp/bootfiles/nextoomio-cmdline.inc",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend",
         "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
@@ -1523,8 +1519,8 @@ def run_self_tests() -> int:
 
         # 41. CQ-R2 / Point 3: Fail when boot assembly uses || true
         true_class = orig_class.replace(
-            'mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/',
-            'mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/ || true'
+            'mcopy -o -i "${BOOT_ARTIFACT}" "${f}" "::/${dst}"',
+            'mcopy -o -i "${BOOT_ARTIFACT}" "${f}" "::/${dst}" || true'
         )
         class_p.write_text(true_class, encoding="utf-8")
         errs = validate_layer(tmp_root)
@@ -1564,35 +1560,18 @@ def run_self_tests() -> int:
         class_p.write_text(orig_class, encoding="utf-8")
         print("  test_check_fails_when_uncompressed_size_uses_gzip_l: OK")
 
-        # 46. CQ-R1 / CQ-R2: Fail when do_image_swu[depends] is missing bcm2835-bootfiles:do_deploy
-        no_dep_class = orig_class.replace("bcm2835-bootfiles:do_deploy", "")
-        class_p.write_text(no_dep_class, encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("bcm2835-bootfiles:do_deploy" in e for e in errs), f"Expected bcm2835-bootfiles:do_deploy failure: {errs}"
+        # Reject a missing firmware dependency or nonfatal boot payload checks.
+        for original, replacement, expected in (
+            ("rpi-bootfiles:do_deploy", "", "rpi-bootfiles:do_deploy"),
+            ('bbfatal "Required boot file ${req} is not in the boot payload"', 'echo "skipping required file"', "Required boot file"),
+            ('bbfatal "The boot payload has no device tree overlays"', 'echo "skipping overlays"', "no device tree overlays"),
+            ('${IMAGE_BOOT_FILES_label-boot_a}', '', 'IMAGE_BOOT_FILES_label-boot_a'),
+        ):
+            assert original in orig_class
+            class_p.write_text(orig_class.replace(original, replacement), encoding="utf-8")
+            assert any(expected in e for e in validate_layer(tmp_root))
         class_p.write_text(orig_class, encoding="utf-8")
-        print("  test_check_fails_when_swu_depends_missing_bcm2835_bootfiles: OK")
-
-        # 47. CQ-R1 / CQ-R2 / AC4: Fail when bcm2835-bootfiles firmware directory check is not fatal
-        no_fw_fatal = orig_class.replace(
-            'bbfatal "Firmware directory ${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles is missing or empty"',
-            'echo "skipping firmware"'
-        )
-        class_p.write_text(no_fw_fatal, encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("bcm2835-bootfiles firmware directory" in e for e in errs), f"Expected bcm2835-bootfiles fatal check failure: {errs}"
-        class_p.write_text(orig_class, encoding="utf-8")
-        print("  test_check_fails_when_firmware_check_not_fatal: OK")
-
-        # 48. CQ-R2 / D-056: Fail when overlays directory check is not fatal
-        no_ov_fatal = orig_class.replace(
-            'bbfatal "Device tree overlays directory ${DEPLOY_DIR_IMAGE}/overlays is missing or empty"',
-            'echo "skipping overlays"'
-        )
-        class_p.write_text(no_ov_fatal, encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("overlays directory is missing or empty" in e for e in errs), f"Expected overlays fatal check failure: {errs}"
-        class_p.write_text(orig_class, encoding="utf-8")
-        print("  test_check_fails_when_overlays_check_not_fatal: OK")
+        print("  test_boot_assembly_checks: OK")
 
         # D-067: reject a shared boot payload and a removed FAT read-back.
         sw_desc_p.write_text(orig_sw_desc.replace("@BOOT_PKG_B@", "@BOOT_PKG_A@"), encoding="utf-8")

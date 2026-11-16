@@ -4,4 +4,4 @@
 # Unconditional assignment (=) overrides upstream meta-raspberrypi default (?=).
 # Disk signature 0x4e58544d is defined in meta-nextoomio/files/wic/nextoomio-ab.wks.in.
 # The update image class shares this value when generating slot-specific boot images (D-067).
-CMDLINE_ROOT_PARTITION = "PARTUUID=4e58544d-05"
+require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc
