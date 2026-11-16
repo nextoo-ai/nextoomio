@@ -84,7 +84,7 @@ python3 scripts/bench/soak.py --test
 
 - **Cycles Requirement (AC1):** The `--cycles` parameter defaults to 10 (the P0-F5.3 exit gate requirement). Specifying fewer than 10 cycles marks the execution as a non-gate result (`NON-GATE` / `FAILED`), while cycle counts `< 1` are rejected with exit code 2.
 - **CQ-R7 (Safe Identifiers and Path Validation):** Host and user arguments are strictly validated against `^[A-Za-z0-9][A-Za-z0-9._-]*$`. Any leading dash (`-`) or shell metacharacter is rejected with exit code 2 to prevent SSH option injection. In addition, `--marker-path` is strictly validated to ensure it is an absolute path residing under `/data/` containing only safe characters, preventing arbitrary filesystem access or shell injection.
-- **AC6 / AD-23 (Credential Protection):** The runner uses the workstation's system `ssh` and active `ssh-agent`. It stores no passwords or private keys on disk and prints no key material in logs or reports.
+- **P0-F5.1 (#25) AC6 / AD-23 (Credential Protection):** The runner uses the workstation's system `ssh` and active `ssh-agent`. It stores no passwords or private keys on disk and prints no key material in logs or reports.
 
 ---
 
