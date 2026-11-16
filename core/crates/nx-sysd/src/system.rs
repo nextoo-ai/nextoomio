@@ -93,6 +93,19 @@ impl fmt::Display for Slot {
     }
 }
 
+/// Local health check evaluation report per ARCHITECTURE.md section 3.6 step 5, UPD-06, and AC2.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HealthReport {
+    pub healthy: bool,
+    pub system_target_reached: bool,
+    pub data_mounted: bool,
+    pub sound_card_openable: bool,
+    pub ssh_listening: bool,
+    pub ssh_key_file_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
 /// Abstract slot interface for inspecting slots, writing partitions, and hardware includes (AC1..AC4).
 pub trait SlotBackend: Send + Sync {
     /// Returns the currently running system slot.
@@ -132,6 +145,18 @@ pub trait SlotBackend: Send + Sync {
 
     /// Flushes and syncs all partition writes to persistent storage (ARCHITECTURE.md section 3.6).
     fn sync_partitions(&mut self) -> Result<(), String>;
+
+    /// Arms one-shot trial boot for the specified slot (AC1, AD-14).
+    fn arm_trial_boot(&mut self, target_slot: Slot) -> Result<(), String>;
+
+    /// Returns the currently armed trial slot, if any.
+    fn is_trial_armed(&self) -> Result<Option<Slot>, String>;
+
+    /// Triggers system reboot to execute the trial or recovery boot (AC1, AC3).
+    fn trigger_reboot(&mut self) -> Result<(), String>;
+
+    /// Evaluates the local trial boot health check conditions (AC2, AC7).
+    fn check_health(&self) -> Result<HealthReport, String>;
 }
 
 /// Mock slot backend for unit tests.
@@ -145,6 +170,9 @@ pub struct MockSlotBackend {
     pub corrupt_readback: bool,
     pub write_active_slot_glitch: bool,
     pub abort_during_write: bool,
+    pub trial_armed: Option<Slot>,
+    pub reboot_triggered: bool,
+    pub health_report: Option<HealthReport>,
 }
 
 impl MockSlotBackend {
@@ -168,6 +196,9 @@ impl MockSlotBackend {
             corrupt_readback: false,
             write_active_slot_glitch: false,
             abort_during_write: false,
+            trial_armed: None,
+            reboot_triggered: false,
+            health_report: None,
         }
     }
 }
@@ -257,6 +288,36 @@ impl SlotBackend for MockSlotBackend {
 
     fn sync_partitions(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn arm_trial_boot(&mut self, target_slot: Slot) -> Result<(), String> {
+        self.trial_armed = Some(target_slot);
+        Ok(())
+    }
+
+    fn is_trial_armed(&self) -> Result<Option<Slot>, String> {
+        Ok(self.trial_armed)
+    }
+
+    fn trigger_reboot(&mut self) -> Result<(), String> {
+        self.reboot_triggered = true;
+        Ok(())
+    }
+
+    fn check_health(&self) -> Result<HealthReport, String> {
+        if let Some(ref report) = self.health_report {
+            Ok(report.clone())
+        } else {
+            Ok(HealthReport {
+                healthy: true,
+                system_target_reached: true,
+                data_mounted: true,
+                sound_card_openable: true,
+                ssh_listening: true,
+                ssh_key_file_present: true,
+                details: None,
+            })
+        }
     }
 }
 
@@ -716,6 +777,238 @@ impl SlotBackend for PhysicalSlotBackend {
             }
         }
         Ok(())
+    }
+
+    fn arm_trial_boot(&mut self, target_slot: Slot) -> Result<(), String> {
+        let autoboot_path = if let Ok(val) = std::env::var("NEXTOOMIO_AUTOBOOT_TXT") {
+            PathBuf::from(val)
+        } else if let Ok(val) = std::env::var("NEXTOOMIO_SELECT_DIR") {
+            PathBuf::from(val).join("autoboot.txt")
+        } else {
+            PathBuf::from("/boot/select/autoboot.txt")
+        };
+
+        let default_slot = self.get_default_slot().unwrap_or(Slot::A);
+        let default_part = match default_slot {
+            Slot::A => 2,
+            Slot::B => 3,
+        };
+        let target_part = match target_slot {
+            Slot::A => 2,
+            Slot::B => 3,
+        };
+
+        let content = format!(
+            "[all]\ntryboot_a_b=1\nboot_partition={default_part}\n\n[tryboot]\nboot_partition={target_part}\n"
+        );
+
+        if let Some(parent) = autoboot_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&autoboot_path)
+            .map_err(|e| format!("cannot open {}: {e}", autoboot_path.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", autoboot_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync error {}: {e}", autoboot_path.display()))?;
+        Ok(())
+    }
+
+    fn is_trial_armed(&self) -> Result<Option<Slot>, String> {
+        let autoboot_path = if let Ok(val) = std::env::var("NEXTOOMIO_AUTOBOOT_TXT") {
+            PathBuf::from(val)
+        } else if let Ok(val) = std::env::var("NEXTOOMIO_SELECT_DIR") {
+            PathBuf::from(val).join("autoboot.txt")
+        } else {
+            PathBuf::from("/boot/select/autoboot.txt")
+        };
+
+        if !autoboot_path.exists() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&autoboot_path)
+            .map_err(|e| format!("cannot read {}: {e}", autoboot_path.display()))?;
+        let mut in_tryboot = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[tryboot]" {
+                in_tryboot = true;
+            } else if trimmed.starts_with('[') {
+                in_tryboot = false;
+            } else if in_tryboot {
+                if let Some(val) = trimmed.strip_prefix("boot_partition=") {
+                    if val.trim() == "2" {
+                        return Ok(Some(Slot::A));
+                    } else if val.trim() == "3" {
+                        return Ok(Some(Slot::B));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn trigger_reboot(&mut self) -> Result<(), String> {
+        if std::env::var("NEXTOOMIO_NO_REBOOT").is_ok() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("systemctl")
+                .arg("reboot")
+                .output();
+        }
+        Ok(())
+    }
+
+    fn check_health(&self) -> Result<HealthReport, String> {
+        // AC2 & AC7:
+        // System target reached, data mounted, configured sound card present and can be opened,
+        // and SSH server is listening when a valid key file is present.
+        // Unaffected by internet, NAS, Music Assistant, or Home Assistant.
+
+        // 1. System target reached
+        let system_target_reached = if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_SYSTEM_TARGET")
+        {
+            val == "1" || val.eq_ignore_ascii_case("true")
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                let output = std::process::Command::new("systemctl")
+                    .arg("is-system-running")
+                    .output();
+                match output {
+                    Ok(out) => {
+                        let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        status == "running" || status == "degraded"
+                    }
+                    Err(_) => false,
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                true
+            }
+        };
+
+        // 2. Data partition mounted
+        let data_mounted = if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_DATA_MOUNTED") {
+            val == "1" || val.eq_ignore_ascii_case("true")
+        } else {
+            let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+            mounts.lines().any(|l| {
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                parts.len() >= 2 && parts[1] == "/data"
+            }) || Path::new("/data").is_dir()
+        };
+
+        // 3. Configured sound card present and can be opened
+        let sound_card_openable = if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_SOUND_CARD") {
+            val == "1" || val.eq_ignore_ascii_case("true")
+        } else {
+            let cards = fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+            let has_cards = !cards.trim().is_empty();
+            let pcm_devs = Path::new("/dev/snd");
+            let has_pcm = pcm_devs.is_dir()
+                && fs::read_dir(pcm_devs)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .any(|entry| entry.file_name().to_string_lossy().starts_with("pcm"))
+                    })
+                    .unwrap_or(false);
+            has_cards || has_pcm
+        };
+
+        // 4. SSH server is listening when a valid key file is present
+        let select_dir = std::env::var("NEXTOOMIO_SELECT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/boot/select"));
+        let key_file_1 = select_dir.join("authorized_keys");
+        let key_file_2 = select_dir.join("authorized_keys.txt");
+        let ssh_key_file_present =
+            if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_SSH_KEY_PRESENT") {
+                val == "1" || val.eq_ignore_ascii_case("true")
+            } else {
+                (key_file_1.exists()
+                    && fs::metadata(&key_file_1)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false))
+                    || (key_file_2.exists()
+                        && fs::metadata(&key_file_2)
+                            .map(|m| m.len() > 0)
+                            .unwrap_or(false))
+            };
+
+        let ssh_listening = if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_SSH_LISTENING") {
+            val == "1" || val.eq_ignore_ascii_case("true")
+        } else if !ssh_key_file_present {
+            // If no valid key file is present, SSH is disabled by design (AD-23)
+            true
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                let tcp = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
+                let tcp6 = fs::read_to_string("/proc/net/tcp6").unwrap_or_default();
+                let is_port_22_listening = |data: &str| {
+                    data.lines().skip(1).any(|line| {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 4 {
+                            let local_addr = parts[1];
+                            let state = parts[3];
+                            local_addr.ends_with(":0016") && state == "0A" // 0x16 = 22, 0A = TCP_LISTEN
+                        } else {
+                            false
+                        }
+                    })
+                };
+                is_port_22_listening(&tcp) || is_port_22_listening(&tcp6)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                true
+            }
+        };
+
+        let healthy = system_target_reached
+            && data_mounted
+            && sound_card_openable
+            && (!ssh_key_file_present || ssh_listening);
+
+        let mut missing = Vec::new();
+        if !system_target_reached {
+            missing.push("system target not reached");
+        }
+        if !data_mounted {
+            missing.push("data partition not mounted");
+        }
+        if !sound_card_openable {
+            missing.push("configured sound card missing or cannot be opened");
+        }
+        if ssh_key_file_present && !ssh_listening {
+            missing.push("SSH server not listening with key file present");
+        }
+
+        let details = if missing.is_empty() {
+            None
+        } else {
+            Some(missing.join(", "))
+        };
+
+        Ok(HealthReport {
+            healthy,
+            system_target_reached,
+            data_mounted,
+            sound_card_openable,
+            ssh_listening,
+            ssh_key_file_present,
+            details,
+        })
     }
 }
 

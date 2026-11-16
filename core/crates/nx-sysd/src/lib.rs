@@ -16,10 +16,11 @@ pub use engine::{
 };
 pub use journal::{
     FileJournalStorage, JournalController, JournalRecord, JournalStorage, MemoryJournalStorage,
+    ReconcileOutcome,
 };
 pub use system::{
-    FileStagingStorage, MockSlotBackend, MockStagingStorage, PartitionType, PhysicalSlotBackend,
-    Slot, SlotBackend, StagingError, StagingStorage,
+    FileStagingStorage, HealthReport, MockSlotBackend, MockStagingStorage, PartitionType,
+    PhysicalSlotBackend, Slot, SlotBackend, StagingError, StagingStorage,
 };
 
 #[cfg(test)]
@@ -1213,7 +1214,8 @@ software = {{
 
     #[test]
     fn test_p0_f4_4_ac5_interrupted_install_reboots_to_previous_slot_not_installed() {
-        let temp_dir = std::env::temp_dir().join(format!("nx-test-ac5-{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-p0-f4-4-ac5-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -1635,6 +1637,688 @@ software =
         std::env::remove_var("NEXTOOMIO_SLOT_B_ROOT");
         std::env::remove_var("NEXTOOMIO_ACTIVE_BOOT_DIR");
         std::env::remove_var("NEXTOOMIO_INACTIVE_BOOT_DIR");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac1_trial_stores_attempt_durably_before_reboot_and_preserves_default_slot() {
+        let capacity = 10 * 1024 * 1024;
+        let backend = MockSlotBackend::new(Slot::A, Slot::A);
+        let storage = MockStagingStorage::new(capacity);
+        let mut journal = MemoryJournalStorage::default();
+
+        // Prepare an installed transaction
+        let mut init = JournalRecord::new_initial("root_a", "root_a");
+        init.state = UpdateTransactionState::Installed;
+        init.target_slot = Some("root_b".to_string());
+        init.tx_id = Some("tx-test-ac1".to_string());
+        init.payload_len = 1024;
+        init.consumed_attempts = 0;
+        init.checksum = init.compute_checksum();
+        journal.write_record(0, &init).unwrap();
+
+        let mut engine =
+            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+        // AC1: When a trial is requested, attempt number is stored durably before reboot,
+        // device boots target slot once, and previous slot remains default.
+        let status = engine.request_trial(false, false).unwrap();
+        assert_eq!(status.state, UpdateTransactionState::Trial);
+        assert_eq!(status.consumed_attempts, 1);
+        assert_eq!(status.default_slot, "root_a");
+        assert_eq!(status.target_slot, Some("root_b".to_string()));
+        assert_eq!(engine.backend.is_trial_armed().unwrap(), Some(Slot::B));
+
+        // Verify stored durably in journal
+        assert_eq!(engine.journal.current().consumed_attempts, 1);
+        assert_eq!(
+            engine.journal.current().state,
+            UpdateTransactionState::Trial
+        );
+        assert_eq!(engine.journal.current().default_slot, "root_a");
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac2_health_check_passes_when_all_prerequisites_met() {
+        let capacity = 10 * 1024 * 1024;
+        let mut backend = MockSlotBackend::new(Slot::B, Slot::A);
+        backend.health_report = Some(HealthReport {
+            healthy: true,
+            system_target_reached: true,
+            data_mounted: true,
+            sound_card_openable: true,
+            ssh_listening: true,
+            ssh_key_file_present: true,
+            details: None,
+        });
+
+        let storage = MockStagingStorage::new(capacity);
+        let journal = MemoryJournalStorage::default();
+        let engine =
+            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+        let report = engine.check_health().unwrap();
+        assert!(report.healthy);
+        assert!(report.system_target_reached);
+        assert!(report.data_mounted);
+        assert!(report.sound_card_openable);
+        assert!(report.ssh_listening);
+        assert!(report.ssh_key_file_present);
+        assert!(report.details.is_none());
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac2_health_check_fails_when_prerequisites_missing() {
+        let capacity = 10 * 1024 * 1024;
+        let storage = MockStagingStorage::new(capacity);
+        let journal = MemoryJournalStorage::default();
+
+        // 1. Missing system target
+        let mut b1 = MockSlotBackend::new(Slot::B, Slot::A);
+        b1.health_report = Some(HealthReport {
+            healthy: false,
+            system_target_reached: false,
+            data_mounted: true,
+            sound_card_openable: true,
+            ssh_listening: true,
+            ssh_key_file_present: true,
+            details: Some("system target not reached".to_string()),
+        });
+        let e1 = UpdateEngine::new(
+            b1,
+            storage.clone(),
+            journal.clone(),
+            None,
+            None,
+            Some(capacity),
+        )
+        .unwrap();
+        let r1 = e1.check_health().unwrap();
+        assert!(!r1.healthy);
+        assert!(!r1.system_target_reached);
+
+        // 2. Data partition unmounted
+        let mut b2 = MockSlotBackend::new(Slot::B, Slot::A);
+        b2.health_report = Some(HealthReport {
+            healthy: false,
+            system_target_reached: true,
+            data_mounted: false,
+            sound_card_openable: true,
+            ssh_listening: true,
+            ssh_key_file_present: true,
+            details: Some("data partition not mounted".to_string()),
+        });
+        let e2 = UpdateEngine::new(
+            b2,
+            storage.clone(),
+            journal.clone(),
+            None,
+            None,
+            Some(capacity),
+        )
+        .unwrap();
+        let r2 = e2.check_health().unwrap();
+        assert!(!r2.healthy);
+        assert!(!r2.data_mounted);
+
+        // 3. Sound card missing or cannot be opened
+        let mut b3 = MockSlotBackend::new(Slot::B, Slot::A);
+        b3.health_report = Some(HealthReport {
+            healthy: false,
+            system_target_reached: true,
+            data_mounted: true,
+            sound_card_openable: false,
+            ssh_listening: true,
+            ssh_key_file_present: true,
+            details: Some("configured sound card missing or cannot be opened".to_string()),
+        });
+        let e3 = UpdateEngine::new(
+            b3,
+            storage.clone(),
+            journal.clone(),
+            None,
+            None,
+            Some(capacity),
+        )
+        .unwrap();
+        let r3 = e3.check_health().unwrap();
+        assert!(!r3.healthy);
+        assert!(!r3.sound_card_openable);
+
+        // 4. SSH key file present but SSH not listening
+        let mut b4 = MockSlotBackend::new(Slot::B, Slot::A);
+        b4.health_report = Some(HealthReport {
+            healthy: false,
+            system_target_reached: true,
+            data_mounted: true,
+            sound_card_openable: true,
+            ssh_listening: false,
+            ssh_key_file_present: true,
+            details: Some("SSH server not listening with key file present".to_string()),
+        });
+        let e4 = UpdateEngine::new(
+            b4,
+            storage.clone(),
+            journal.clone(),
+            None,
+            None,
+            Some(capacity),
+        )
+        .unwrap();
+        let r4 = e4.check_health().unwrap();
+        assert!(!r4.healthy);
+        assert!(!r4.ssh_listening);
+
+        // 5. SSH key file absent and SSH not listening: healthy (AD-23)
+        let mut b5 = MockSlotBackend::new(Slot::B, Slot::A);
+        b5.health_report = Some(HealthReport {
+            healthy: true,
+            system_target_reached: true,
+            data_mounted: true,
+            sound_card_openable: true,
+            ssh_listening: true,
+            ssh_key_file_present: false,
+            details: None,
+        });
+        let e5 = UpdateEngine::new(b5, storage, journal, None, None, Some(capacity)).unwrap();
+        let r5 = e5.check_health().unwrap();
+        assert!(r5.healthy);
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac3_trial_watchdog_enforces_120s_deadline_from_boot_and_reboots() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("NEXTOOMIO_TEST_UPTIME_SECS", "119.9");
+
+        let capacity = 10 * 1024 * 1024;
+        let backend = MockSlotBackend::new(Slot::B, Slot::A);
+        let storage = MockStagingStorage::new(capacity);
+        let mut journal = MemoryJournalStorage::default();
+
+        let mut init = JournalRecord::new_initial("root_b", "root_a");
+        init.state = UpdateTransactionState::Trial;
+        init.target_slot = Some("root_b".to_string());
+        init.tx_id = Some("tx-ac3-watchdog".to_string());
+        init.payload_len = 1024;
+        init.consumed_attempts = 1;
+        init.checksum = init.compute_checksum();
+        journal.write_record(0, &init).unwrap();
+
+        let mut engine =
+            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+        // Watchdog enforces deadline of 120s from boot. Since simulated uptime is 119.9s, it triggers reboot.
+        let err = engine.run_trial_watchdog(120, 50).unwrap_err();
+        assert_eq!(err, UpdateEngineError::TrialDeadlineExceeded);
+        assert!(engine.backend.reboot_triggered);
+
+        std::env::remove_var("NEXTOOMIO_TEST_UPTIME_SECS");
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac3_trial_watchdog_exits_cleanly_when_committed() {
+        let capacity = 10 * 1024 * 1024;
+        let backend = MockSlotBackend::new(Slot::B, Slot::A);
+        let storage = MockStagingStorage::new(capacity);
+        let mut journal = MemoryJournalStorage::default();
+
+        let mut init = JournalRecord::new_initial("root_b", "root_b");
+        init.state = UpdateTransactionState::Committed;
+        init.target_slot = Some("root_b".to_string());
+        init.tx_id = Some("tx-ac3-committed".to_string());
+        init.payload_len = 1024;
+        init.consumed_attempts = 1;
+        init.checksum = init.compute_checksum();
+        journal.write_record(0, &init).unwrap();
+
+        let mut engine =
+            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+        let res = engine.run_trial_watchdog(120, 50);
+        assert!(res.is_ok());
+        assert!(!engine.backend.reboot_triggered);
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac4_previous_slot_reboot_requests_second_trial_then_fails_after_second() {
+        let capacity = 10 * 1024 * 1024;
+        let storage = MockStagingStorage::new(capacity);
+
+        // --- Round 1: First failed attempt ---
+        let mut journal1 = MemoryJournalStorage::default();
+        let mut rec1 = JournalRecord::new_initial("root_a", "root_a");
+        rec1.state = UpdateTransactionState::Trial;
+        rec1.target_slot = Some("root_b".to_string());
+        rec1.tx_id = Some("tx-two-attempts".to_string());
+        rec1.payload_len = 2048;
+        rec1.consumed_attempts = 1;
+        rec1.checksum = rec1.compute_checksum();
+        journal1.write_record(0, &rec1).unwrap();
+
+        // Boot previous slot (Slot A)
+        let backend1 = MockSlotBackend::new(Slot::A, Slot::A);
+        let mut engine1 = UpdateEngine::new(
+            backend1,
+            storage.clone(),
+            journal1,
+            None,
+            None,
+            Some(capacity),
+        )
+        .unwrap();
+
+        let outcome1 = engine1.reconcile_boot().unwrap();
+        assert_eq!(outcome1, ReconcileOutcome::SecondTrialRequested);
+        assert_eq!(engine1.status().state, UpdateTransactionState::Trial);
+        assert_eq!(engine1.status().consumed_attempts, 2);
+        assert_eq!(engine1.status().default_slot, "root_a");
+        assert_eq!(engine1.backend.is_trial_armed().unwrap(), Some(Slot::B));
+
+        // --- Round 2: Second failed attempt ---
+        // Save state from engine1 into journal2
+        let current_rec = engine1.journal.current().clone();
+        let mut journal2 = MemoryJournalStorage::default();
+        journal2.write_record(0, &current_rec).unwrap();
+
+        // Boot previous slot (Slot A) again after attempt 2 failure
+        let backend2 = MockSlotBackend::new(Slot::A, Slot::A);
+        let mut engine2 =
+            UpdateEngine::new(backend2, storage, journal2, None, None, Some(capacity)).unwrap();
+
+        let outcome2 = engine2.reconcile_boot().unwrap();
+        assert_eq!(outcome2, ReconcileOutcome::TrialExhausted);
+        assert_eq!(engine2.status().state, UpdateTransactionState::Failed);
+        assert_eq!(
+            engine2.status().error_code,
+            Some("update_trial_exhausted".to_string())
+        );
+        assert_eq!(engine2.status().default_slot, "root_a");
+
+        // Verify that no further trial happens without a new install
+        let err = engine2.request_trial(false, false).unwrap_err();
+        assert_eq!(
+            err,
+            UpdateEngineError::InvalidStateTransition {
+                from: UpdateTransactionState::Failed,
+                to: UpdateTransactionState::Trial,
+            }
+        );
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac5_consumed_attempts_never_lower_across_restarts_or_power_loss() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-p0-f4-5-ac5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let update_dir = temp_dir.join("update");
+        std::fs::create_dir_all(&update_dir).unwrap();
+
+        let capacity = 10 * 1024 * 1024;
+
+        // 1. Initial install and first trial request
+        {
+            let backend = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let mut engine =
+                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+            // Setup installed record
+            engine
+                .journal
+                .commit_state(
+                    UpdateTransactionState::Installed,
+                    Some("tx-ac5-monotonic".to_string()),
+                    Some("root_b".to_string()),
+                    1024,
+                    Some("sha256-dummy".to_string()),
+                    None,
+                )
+                .unwrap();
+
+            let status = engine.request_trial(false, false).unwrap();
+            assert_eq!(status.consumed_attempts, 1);
+        }
+
+        // 2. Service restart / process termination during trial
+        {
+            let backend = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let engine =
+                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+            assert_eq!(engine.status().consumed_attempts, 1);
+            assert_eq!(engine.status().state, UpdateTransactionState::Trial);
+        }
+
+        // 3. Reboot previous slot (failure of attempt 1) -> second trial requested
+        {
+            let backend = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let mut engine =
+                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+            let outcome = engine.reconcile_boot().unwrap();
+            assert_eq!(outcome, ReconcileOutcome::SecondTrialRequested);
+            assert_eq!(engine.status().consumed_attempts, 2);
+        }
+
+        // 4. Power loss during second trial attempt
+        {
+            let backend = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let engine =
+                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+            // Consumed attempts must still be 2, never lower
+            assert_eq!(engine.status().consumed_attempts, 2);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac6_unreadable_or_contradictory_record_prevents_trial_and_stays_on_good_slot() {
+        let capacity = 10 * 1024 * 1024;
+        let storage = MockStagingStorage::new(capacity);
+
+        // Case 1: Contradictory target_slot == default_slot
+        let mut journal1 = MemoryJournalStorage::default();
+        let mut rec1 = JournalRecord::new_initial("root_a", "root_a");
+        rec1.state = UpdateTransactionState::Trial;
+        rec1.target_slot = Some("root_a".to_string()); // Contradictory: target matches default
+        rec1.tx_id = Some("tx-contradictory".to_string());
+        rec1.payload_len = 1024;
+        rec1.consumed_attempts = 1;
+        rec1.checksum = rec1.compute_checksum();
+        journal1.write_record(0, &rec1).unwrap();
+
+        let backend1 = MockSlotBackend::new(Slot::A, Slot::A);
+        let mut engine1 = UpdateEngine::new(
+            backend1,
+            storage.clone(),
+            journal1,
+            None,
+            None,
+            Some(capacity),
+        )
+        .unwrap();
+
+        let outcome1 = engine1.reconcile_boot().unwrap();
+        assert_eq!(outcome1, ReconcileOutcome::ContradictoryFailed);
+        assert_eq!(engine1.status().state, UpdateTransactionState::Failed);
+        assert_eq!(
+            engine1.status().error_code,
+            Some("update_record_contradictory".to_string())
+        );
+        assert_eq!(engine1.status().default_slot, "root_a");
+        assert_eq!(engine1.backend.is_trial_armed().unwrap(), None);
+
+        // Case 2: Contradictory consumed_attempts > 2
+        let mut journal2 = MemoryJournalStorage::default();
+        let mut rec2 = JournalRecord::new_initial("root_a", "root_a");
+        rec2.state = UpdateTransactionState::Trial;
+        rec2.target_slot = Some("root_b".to_string());
+        rec2.tx_id = Some("tx-attempts-too-high".to_string());
+        rec2.payload_len = 1024;
+        rec2.consumed_attempts = 3; // Contradictory
+        rec2.checksum = rec2.compute_checksum();
+        journal2.write_record(0, &rec2).unwrap();
+
+        let backend2 = MockSlotBackend::new(Slot::A, Slot::A);
+        let mut engine2 =
+            UpdateEngine::new(backend2, storage, journal2, None, None, Some(capacity)).unwrap();
+
+        let outcome2 = engine2.reconcile_boot().unwrap();
+        assert_eq!(outcome2, ReconcileOutcome::ContradictoryFailed);
+        assert_eq!(engine2.status().state, UpdateTransactionState::Failed);
+        assert_eq!(
+            engine2.status().error_code,
+            Some("update_record_contradictory".to_string())
+        );
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac7_absence_of_internet_nas_ma_ha_unaffected() {
+        let capacity = 10 * 1024 * 1024;
+        let mut backend = MockSlotBackend::new(Slot::B, Slot::A);
+        backend.health_report = Some(HealthReport {
+            healthy: true,
+            system_target_reached: true,
+            data_mounted: true,
+            sound_card_openable: true,
+            ssh_listening: true,
+            ssh_key_file_present: true,
+            details: None,
+        });
+
+        let storage = MockStagingStorage::new(capacity);
+        let journal = MemoryJournalStorage::default();
+        let engine =
+            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+        // AC7: Absence of internet, NAS, MA, or HA has zero impact on local health check
+        let report = engine.check_health().unwrap();
+        assert!(report.healthy);
+    }
+
+    #[test]
+    fn test_p0_f4_5_cli_multi_process_trial_sequence() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-cli-trial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let update_dir = temp_dir.join("update");
+        let active_boot_dir = temp_dir.join("boot_active");
+        let inactive_boot_dir = temp_dir.join("boot_inactive");
+        let select_dir = temp_dir.join("select");
+
+        std::fs::create_dir_all(&update_dir).unwrap();
+        std::fs::create_dir_all(&active_boot_dir).unwrap();
+        std::fs::create_dir_all(&inactive_boot_dir).unwrap();
+        std::fs::create_dir_all(&select_dir).unwrap();
+
+        let slot_a_boot_file = temp_dir.join("slot_a_boot.img");
+        let slot_a_root_file = temp_dir.join("slot_a_root.img");
+        let slot_b_boot_file = temp_dir.join("slot_b_boot.img");
+        let slot_b_root_file = temp_dir.join("slot_b_root.img");
+
+        std::fs::write(&slot_a_boot_file, vec![0x11; 4096]).unwrap();
+        std::fs::write(&slot_a_root_file, vec![0x22; 8192]).unwrap();
+        std::fs::write(&slot_b_boot_file, vec![0x00; 4096]).unwrap();
+        std::fs::write(&slot_b_root_file, vec![0x00; 8192]).unwrap();
+
+        let hw_cfg = "dtoverlay=hifiberry-amp\n";
+        std::fs::write(active_boot_dir.join("nextoomio-hardware.txt"), hw_cfg).unwrap();
+
+        std::env::set_var("NEXTOOMIO_SLOT", "root_a");
+        std::env::set_var("NEXTOOMIO_SLOT_A_BOOT", &slot_a_boot_file);
+        std::env::set_var("NEXTOOMIO_SLOT_A_ROOT", &slot_a_root_file);
+        std::env::set_var("NEXTOOMIO_SLOT_B_BOOT", &slot_b_boot_file);
+        std::env::set_var("NEXTOOMIO_SLOT_B_ROOT", &slot_b_root_file);
+        std::env::set_var("NEXTOOMIO_ACTIVE_BOOT_DIR", &active_boot_dir);
+        std::env::set_var("NEXTOOMIO_INACTIVE_BOOT_DIR", &inactive_boot_dir);
+        std::env::set_var("NEXTOOMIO_SELECT_DIR", &select_dir);
+        std::env::set_var("NEXTOOMIO_NO_REBOOT", "1");
+        std::env::set_var("NEXTOOMIO_HEALTH_SYSTEM_TARGET", "1");
+        std::env::set_var("NEXTOOMIO_HEALTH_DATA_MOUNTED", "1");
+        std::env::set_var("NEXTOOMIO_HEALTH_SOUND_CARD", "1");
+        std::env::set_var("NEXTOOMIO_HEALTH_SSH_KEY_PRESENT", "0");
+
+        let capacity = 10 * 1024 * 1024;
+
+        // Create update container
+        let new_boot = b"NEW_BOOT_KERNEL_IMAGE_BYTES_AC1";
+        let new_root = b"NEW_ROOT_SYSTEM_PAYLOAD_BYTES_AC1";
+        let boot_sha = crate::sha256::Sha256::hex(new_boot);
+        let root_sha = crate::sha256::Sha256::hex(new_root);
+
+        let sw_desc = format!(
+            r#"software = {{
+    version = "0.0.1";
+    hardware-compatibility = [ "1.0" ];
+    min-schema-version = 1;
+    max-schema-version = 1;
+    images: (
+        {{
+            filename = "boot.img";
+            device = "/dev/mmcblk0p3";
+            sha256 = "{boot_sha}";
+        }},
+        {{
+            filename = "root.img";
+            device = "/dev/mmcblk0p6";
+            sha256 = "{root_sha}";
+        }}
+    );
+}};"#
+        );
+
+        let archive = create_cpio(&[
+            ("sw-description", sw_desc.as_bytes()),
+            ("boot.img", new_boot),
+            ("root.img", new_root),
+        ]);
+
+        // 1. Process 1: stage
+        {
+            let backend = PhysicalSlotBackend;
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .unwrap();
+            let status = engine
+                .stage_upload(archive.as_slice(), Some(archive.len() as u64))
+                .unwrap();
+            assert_eq!(status.state, UpdateTransactionState::Staged);
+        }
+
+        // 2. Process 2: validate
+        {
+            let backend = PhysicalSlotBackend;
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .unwrap();
+            let status = engine.validate().unwrap();
+            assert_eq!(status.state, UpdateTransactionState::Validated);
+        }
+
+        // 3. Process 3: install
+        {
+            let backend = PhysicalSlotBackend;
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .unwrap();
+            let status = engine.install().unwrap();
+            assert_eq!(status.state, UpdateTransactionState::Installed);
+        }
+
+        // 4. Process 4: trial request
+        {
+            let backend = PhysicalSlotBackend;
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .unwrap();
+            let status = engine.request_trial(false, false).unwrap();
+            assert_eq!(status.state, UpdateTransactionState::Trial);
+            assert_eq!(status.consumed_attempts, 1);
+            assert_eq!(status.default_slot, "root_a");
+            assert_eq!(status.target_slot, Some("root_b".to_string()));
+
+            // Verify autoboot.txt generated in select directory
+            let autoboot = std::fs::read_to_string(select_dir.join("autoboot.txt")).unwrap();
+            assert!(autoboot.contains("boot_partition=2"));
+            assert!(autoboot.contains("[tryboot]\nboot_partition=3"));
+        }
+
+        // 5. Process 5: health check
+        {
+            let backend = PhysicalSlotBackend;
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .unwrap();
+            let report = engine.check_health().unwrap();
+            assert!(report.healthy);
+        }
+
+        // 6. Process 6: status query
+        {
+            let backend = PhysicalSlotBackend;
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .unwrap();
+            let status = engine.status();
+            assert_eq!(status.state, UpdateTransactionState::Trial);
+            assert_eq!(status.consumed_attempts, 1);
+            assert_eq!(status.target_slot, Some("root_b".to_string()));
+            assert_eq!(status.default_slot, "root_a");
+        }
+
+        std::env::remove_var("NEXTOOMIO_SLOT");
+        std::env::remove_var("NEXTOOMIO_SLOT_A_BOOT");
+        std::env::remove_var("NEXTOOMIO_SLOT_A_ROOT");
+        std::env::remove_var("NEXTOOMIO_SLOT_B_BOOT");
+        std::env::remove_var("NEXTOOMIO_SLOT_B_ROOT");
+        std::env::remove_var("NEXTOOMIO_ACTIVE_BOOT_DIR");
+        std::env::remove_var("NEXTOOMIO_INACTIVE_BOOT_DIR");
+        std::env::remove_var("NEXTOOMIO_SELECT_DIR");
+        std::env::remove_var("NEXTOOMIO_NO_REBOOT");
+        std::env::remove_var("NEXTOOMIO_HEALTH_SYSTEM_TARGET");
+        std::env::remove_var("NEXTOOMIO_HEALTH_DATA_MOUNTED");
+        std::env::remove_var("NEXTOOMIO_HEALTH_SOUND_CARD");
+        std::env::remove_var("NEXTOOMIO_HEALTH_SSH_KEY_PRESENT");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

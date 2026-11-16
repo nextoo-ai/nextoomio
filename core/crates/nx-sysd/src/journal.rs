@@ -270,6 +270,17 @@ pub struct JournalController<S: JournalStorage> {
     latest_record: JournalRecord,
 }
 
+/// Outcome of boot reconciliation across durable boundaries (AR-01, AC4..AC6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    Unchanged,
+    TruncatedFailed,
+    TrialInProgress,
+    SecondTrialRequested,
+    TrialExhausted,
+    ContradictoryFailed,
+}
+
 impl<S: JournalStorage> JournalController<S> {
     pub fn load_or_init(
         mut storage: S,
@@ -313,7 +324,8 @@ impl<S: JournalStorage> JournalController<S> {
         &self.latest_record
     }
 
-    pub fn commit_state(
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_state_with_attempts(
         &mut self,
         next_state: UpdateTransactionState,
         tx_id: Option<String>,
@@ -321,6 +333,7 @@ impl<S: JournalStorage> JournalController<S> {
         payload_len: u64,
         payload_sha256: Option<String>,
         error_code: Option<String>,
+        consumed_attempts: u32,
     ) -> Result<JournalRecord, String> {
         let next_slot_idx = 1 - self.active_slot_idx;
         let next_gen = self.latest_record.generation + 1;
@@ -336,7 +349,7 @@ impl<S: JournalStorage> JournalController<S> {
             payload_len,
             payload_sha256,
             error_code,
-            consumed_attempts: self.latest_record.consumed_attempts,
+            consumed_attempts,
             checksum: 0,
         };
         rec.checksum = rec.compute_checksum();
@@ -348,9 +361,62 @@ impl<S: JournalStorage> JournalController<S> {
         Ok(rec)
     }
 
-    /// Reconciles state after reboot: if upload was interrupted while receiving (AC4)
-    /// or install was interrupted while installing (AC5), marks transaction failed.
-    pub fn reconcile_boot(&mut self) -> Result<(), String> {
+    pub fn commit_state(
+        &mut self,
+        next_state: UpdateTransactionState,
+        tx_id: Option<String>,
+        target_slot: Option<String>,
+        payload_len: u64,
+        payload_sha256: Option<String>,
+        error_code: Option<String>,
+    ) -> Result<JournalRecord, String> {
+        self.commit_state_with_attempts(
+            next_state,
+            tx_id,
+            target_slot,
+            payload_len,
+            payload_sha256,
+            error_code,
+            self.latest_record.consumed_attempts,
+        )
+    }
+
+    /// Reconciles state after reboot: handles interrupted uploads/installs (AC5 of P0-F4.4),
+    /// interrupted commits (D-026), trial attempt progression / two-attempt limits (AC4, AC5),
+    /// and contradictory records (AC6).
+    pub fn reconcile_boot(&mut self, running_slot: &str) -> Result<ReconcileOutcome, String> {
+        // 1. Contradiction check (AC6)
+        if let Some(target) = &self.latest_record.target_slot {
+            if (self.latest_record.state == UpdateTransactionState::Trial
+                || self.latest_record.state == UpdateTransactionState::Installing
+                || self.latest_record.state == UpdateTransactionState::Installed)
+                && target == &self.latest_record.default_slot
+            {
+                self.commit_state(
+                    UpdateTransactionState::Failed,
+                    self.latest_record.tx_id.clone(),
+                    None,
+                    self.latest_record.payload_len,
+                    None,
+                    Some("update_record_contradictory".to_string()),
+                )?;
+                return Ok(ReconcileOutcome::ContradictoryFailed);
+            }
+        }
+
+        if self.latest_record.consumed_attempts > 2 {
+            self.commit_state(
+                UpdateTransactionState::Failed,
+                self.latest_record.tx_id.clone(),
+                None,
+                self.latest_record.payload_len,
+                None,
+                Some("update_record_contradictory".to_string()),
+            )?;
+            return Ok(ReconcileOutcome::ContradictoryFailed);
+        }
+
+        // 2. Interrupted receiving or installing (AC5 of P0-F4.4)
         if self.latest_record.state == UpdateTransactionState::Receiving
             || self.latest_record.state == UpdateTransactionState::Installing
         {
@@ -362,7 +428,114 @@ impl<S: JournalStorage> JournalController<S> {
                 None,
                 Some("update_truncated".to_string()),
             )?;
+            return Ok(ReconcileOutcome::TruncatedFailed);
         }
-        Ok(())
+
+        // 3. Interrupted commit (D-026)
+        if self.latest_record.state == UpdateTransactionState::Committing {
+            if let Some(target) = &self.latest_record.target_slot {
+                if running_slot == target {
+                    self.commit_state(
+                        UpdateTransactionState::Committed,
+                        self.latest_record.tx_id.clone(),
+                        self.latest_record.target_slot.clone(),
+                        self.latest_record.payload_len,
+                        self.latest_record.payload_sha256.clone(),
+                        None,
+                    )?;
+                    return Ok(ReconcileOutcome::Unchanged);
+                }
+            }
+            self.commit_state(
+                UpdateTransactionState::Failed,
+                None,
+                None,
+                0,
+                None,
+                Some("update_truncated".to_string()),
+            )?;
+            return Ok(ReconcileOutcome::TruncatedFailed);
+        }
+
+        // 4. Trial boot reconciliation (AC1, AC4, AC5)
+        if self.latest_record.state == UpdateTransactionState::Trial {
+            if let Some(target) = &self.latest_record.target_slot {
+                if running_slot == target {
+                    // Running on trial target slot: trial is in progress
+                    let target_str = target.clone();
+                    let tx_id = self.latest_record.tx_id.clone();
+                    let payload_len = self.latest_record.payload_len;
+                    let payload_sha = self.latest_record.payload_sha256.clone();
+                    let attempts = self.latest_record.consumed_attempts;
+
+                    let next_slot_idx = 1 - self.active_slot_idx;
+                    let next_gen = self.latest_record.generation + 1;
+                    let mut rec = JournalRecord {
+                        format_version: 1,
+                        generation: next_gen,
+                        tx_id,
+                        state: UpdateTransactionState::Trial,
+                        active_slot: running_slot.to_string(),
+                        default_slot: self.latest_record.default_slot.clone(),
+                        target_slot: Some(target_str),
+                        payload_len,
+                        payload_sha256: payload_sha,
+                        error_code: None,
+                        consumed_attempts: attempts,
+                        checksum: 0,
+                    };
+                    rec.checksum = rec.compute_checksum();
+                    self.storage.write_record(next_slot_idx, &rec)?;
+                    self.active_slot_idx = next_slot_idx;
+                    self.latest_record = rec;
+
+                    return Ok(ReconcileOutcome::TrialInProgress);
+                } else if running_slot == self.latest_record.default_slot {
+                    // Booted previous slot: trial failed
+                    if self.latest_record.consumed_attempts < 2 {
+                        // First attempt failed: request exactly one more trial (attempt 2)
+                        let target_str = target.clone();
+                        let tx_id = self.latest_record.tx_id.clone();
+                        let payload_len = self.latest_record.payload_len;
+                        let payload_sha = self.latest_record.payload_sha256.clone();
+
+                        self.commit_state_with_attempts(
+                            UpdateTransactionState::Trial,
+                            tx_id,
+                            Some(target_str),
+                            payload_len,
+                            payload_sha,
+                            None,
+                            2, // durably record attempt 2 before reboot (AC1, AC5)
+                        )?;
+                        return Ok(ReconcileOutcome::SecondTrialRequested);
+                    } else {
+                        // Second attempt failed: state is failed, previous slot stays selected (AC4)
+                        self.commit_state_with_attempts(
+                            UpdateTransactionState::Failed,
+                            self.latest_record.tx_id.clone(),
+                            None,
+                            self.latest_record.payload_len,
+                            None,
+                            Some("update_trial_exhausted".to_string()),
+                            self.latest_record.consumed_attempts,
+                        )?;
+                        return Ok(ReconcileOutcome::TrialExhausted);
+                    }
+                }
+            } else {
+                self.commit_state(
+                    UpdateTransactionState::Failed,
+                    self.latest_record.tx_id.clone(),
+                    None,
+                    self.latest_record.payload_len,
+                    None,
+                    Some("update_record_contradictory".to_string()),
+                )?;
+                return Ok(ReconcileOutcome::ContradictoryFailed);
+            }
+        }
+
+        Ok(ReconcileOutcome::Unchanged)
     }
 }

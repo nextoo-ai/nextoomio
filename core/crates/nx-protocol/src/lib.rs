@@ -178,6 +178,12 @@ pub enum ErrorCode {
     UpdateBusy,
     UpdateTruncated,
     UpdateCorruptedArtifact,
+    UpdateTrialFailed,
+    UpdateTrialExhausted,
+    UpdateTrialDeadlineExceeded,
+    UpdateHealthCheckFailed,
+    UpdateRecordContradictory,
+    UpdateJournalCorrupted,
 }
 
 impl ErrorCode {
@@ -205,6 +211,12 @@ impl ErrorCode {
             Self::UpdateBusy => "update_busy",
             Self::UpdateTruncated => "update_truncated",
             Self::UpdateCorruptedArtifact => "update_corrupted_artifact",
+            Self::UpdateTrialFailed => "update_trial_failed",
+            Self::UpdateTrialExhausted => "update_trial_exhausted",
+            Self::UpdateTrialDeadlineExceeded => "update_trial_deadline_exceeded",
+            Self::UpdateHealthCheckFailed => "update_health_check_failed",
+            Self::UpdateRecordContradictory => "update_record_contradictory",
+            Self::UpdateJournalCorrupted => "update_journal_corrupted",
         }
     }
 }
@@ -244,16 +256,20 @@ impl UpdateTransactionState {
                 | (Receiving, Failed)
                 | (Staged, Validated)
                 | (Staged, Failed)
+                | (Staged, Idle)
                 | (Validated, Installing)
                 | (Validated, Failed)
+                | (Validated, Idle)
                 | (Installing, Installed)
                 | (Installing, Failed)
                 | (Installed, Trial)
                 | (Installed, Failed)
+                | (Installed, Idle)
                 | (Trial, Trial)
                 | (Trial, Committing)
                 | (Trial, Failed)
                 | (Committing, Committed)
+                | (Committing, Failed)
         )
     }
 }
@@ -323,5 +339,20 @@ mod tests {
 
         let json = serde_json::to_string(&ErrorCode::UpdateCorruptedArtifact).unwrap();
         assert_eq!(json, "\"update_corrupted_artifact\"");
+    }
+
+    #[test]
+    fn committing_can_transition_to_failed_d026() {
+        use UpdateTransactionState::*;
+        assert!(Committing.can_transition_to(Committed));
+        assert!(Committing.can_transition_to(Failed));
+        assert!(Installed.can_transition_to(Trial));
+        assert!(Trial.can_transition_to(Trial));
+        assert!(Trial.can_transition_to(Committing));
+        assert!(Trial.can_transition_to(Failed));
+        // Discarding unwanted images:
+        assert!(Staged.can_transition_to(Idle));
+        assert!(Validated.can_transition_to(Idle));
+        assert!(Installed.can_transition_to(Idle));
     }
 }

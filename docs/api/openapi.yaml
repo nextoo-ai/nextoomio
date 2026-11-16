@@ -122,6 +122,45 @@ paths:
                 $ref: '#/components/schemas/UpdateStatus'
         '400':
           $ref: '#/components/responses/ApiErrorResponse'
+  /update/trial:
+    post:
+      summary: Request trial boot of the installed system slot (UPD-06, AR-01)
+      operationId: requestTrialUpdate
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                remote_confirm:
+                  type: boolean
+                  default: false
+                auto_reboot:
+                  type: boolean
+                  default: true
+      responses:
+        '200':
+          description: Trial armed and attempt recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateStatus'
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
+  /update/health-check:
+    get:
+      summary: Check system health prerequisites for update trial acceptance (UPD-06, AR-01)
+      operationId: checkUpdateHealth
+      responses:
+        '200':
+          description: Local health check evaluation report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthReport'
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
 components:
   schemas:
     UpdateStatus:
@@ -132,6 +171,7 @@ components:
         - default_slot
         - payload_length
         - reserved_capacity
+        - consumed_attempts
       properties:
         state:
           type: string
@@ -148,9 +188,33 @@ components:
           type: integer
         reserved_capacity:
           type: integer
+        consumed_attempts:
+          type: integer
+          minimum: 0
         error_code:
           type: [string, 'null']
         message:
+          type: [string, 'null']
+    HealthReport:
+      type: object
+      required:
+        - healthy
+        - system_target_reached
+        - data_mounted
+        - sound_card_openable
+        - ssh_listening
+      properties:
+        healthy:
+          type: boolean
+        system_target_reached:
+          type: boolean
+        data_mounted:
+          type: boolean
+        sound_card_openable:
+          type: boolean
+        ssh_listening:
+          type: boolean
+        details:
           type: [string, 'null']
     CommandScope:
       type: string

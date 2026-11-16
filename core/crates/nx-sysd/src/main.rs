@@ -22,6 +22,9 @@ fn print_usage() {
         nx-sysd update stage --file <path> [--declared-length <bytes>] [--dir <path>]\n  \
         nx-sysd update validate [--dir <path>] [--hardware <id>] [--schema <n>]\n  \
         nx-sysd update install [--dir <path>] [--hardware <id>] [--schema <n>] [--capacity <bytes>]\n  \
+        nx-sysd update trial [--dir <path>] [--remote-confirm] [--no-reboot] [--json]\n  \
+        nx-sysd update health-check [--dir <path>] [--json]\n  \
+        nx-sysd update trial-watchdog [--dir <path>] [--deadline <secs>] [--poll-interval <ms>]\n  \
         nx-sysd update status [--dir <path>] [--json]\n  \
         nx-sysd update abort [--dir <path>]\n"
     );
@@ -87,6 +90,10 @@ fn handle_update(args: &[String]) -> ExitCode {
     let mut file_path = None;
     let mut declared_length = None;
     let mut json_output = false;
+    let mut remote_confirm = false;
+    let mut no_reboot = false;
+    let mut deadline_secs = 120u64;
+    let mut poll_interval_ms = 1000u64;
 
     let mut i = 1;
     while i < args.len() {
@@ -163,6 +170,45 @@ fn handle_update(args: &[String]) -> ExitCode {
             "--json" => {
                 json_output = true;
                 i += 1;
+            }
+            "--remote-confirm" => {
+                remote_confirm = true;
+                i += 1;
+            }
+            "--no-reboot" => {
+                no_reboot = true;
+                i += 1;
+            }
+            "--deadline" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --deadline");
+                    return ExitCode::from(1);
+                }
+                match args[i + 1].parse::<u64>() {
+                    Ok(d) => deadline_secs = d,
+                    Err(e) => {
+                        eprintln!("Error: invalid value for --deadline '{}': {e}", args[i + 1]);
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 2;
+            }
+            "--poll-interval" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --poll-interval");
+                    return ExitCode::from(1);
+                }
+                match args[i + 1].parse::<u64>() {
+                    Ok(p) => poll_interval_ms = p,
+                    Err(e) => {
+                        eprintln!(
+                            "Error: invalid value for --poll-interval '{}': {e}",
+                            args[i + 1]
+                        );
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 2;
             }
             unknown => {
                 eprintln!("Error: unrecognized argument '{unknown}'");
@@ -282,6 +328,88 @@ fn handle_update(args: &[String]) -> ExitCode {
                     status.error_code = Some(err.error_code_str().to_string());
                     status.message = Some(err.to_string());
                     let _ = serde_json::to_string_pretty(&status).map(|j| eprintln!("{j}"));
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "trial" => {
+            let mut engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+
+            match engine.request_trial(remote_confirm, !no_reboot) {
+                Ok(status) => {
+                    if json_output {
+                        match serde_json::to_string_pretty(&status) {
+                            Ok(j) => println!("{j}"),
+                            Err(e) => eprintln!("Serialization error: {e}"),
+                        }
+                    } else {
+                        println!("Trial boot armed, rebooting");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Trial request failed: {err}");
+                    let mut status = engine.status();
+                    status.error_code = Some(err.error_code_str().to_string());
+                    status.message = Some(err.to_string());
+                    let _ = serde_json::to_string_pretty(&status).map(|j| eprintln!("{j}"));
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "health-check" => {
+            let engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+
+            match engine.check_health() {
+                Ok(report) => {
+                    if json_output {
+                        match serde_json::to_string_pretty(&report) {
+                            Ok(j) => println!("{j}"),
+                            Err(e) => eprintln!("Serialization error: {e}"),
+                        }
+                    } else {
+                        println!("Healthy: {}", report.healthy);
+                        if let Some(ref d) = report.details {
+                            println!("Details: {d}");
+                        }
+                    }
+                    if report.healthy {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Health check error: {err}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "trial-watchdog" => {
+            let mut engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+
+            match engine.run_trial_watchdog(deadline_secs, poll_interval_ms) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("Trial watchdog error: {err}");
                     ExitCode::from(1)
                 }
             }
