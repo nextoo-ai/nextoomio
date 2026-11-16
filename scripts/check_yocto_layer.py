@@ -91,6 +91,15 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
+        root / "meta-nextoomio/recipes-core/images/nextoomio-image-broken-hang.bb",
+        root / "meta-nextoomio/recipes-core/images/nextoomio-image-broken-health.bb",
+        root / "meta-nextoomio/recipes-core/images/nextoomio-image-broken-network.bb",
+        root / "kas/test-broken-hang.yml",
+        root / "kas/test-broken-health.yml",
+        root / "kas/test-broken-network.yml",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/nextoomio-test-faults_0.0.1.bb",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-hang-early.sh",
+        root / "scripts/bench/test_broken_images.py",
     ]
 
     for path in required_files:
@@ -629,6 +638,88 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if not re.search(r"\|\s*OpenSSH\s*\|\s*v0\.0\.1\s*\|", arch_text):
             errors.append("ARCHITECTURE.md section 10 register must record OpenSSH row (DoD item 4)")
 
+    # P0-F4.7: Broken test images and documented build options (AC6, isolation invariant)
+    broken_images = {
+        "hang": ("nextoomio-image-broken-hang.bb", "test-broken-hang.yml", "nextoomio-test-faults-hang"),
+        "health": ("nextoomio-image-broken-health.bb", "test-broken-health.yml", None),
+        "network": ("nextoomio-image-broken-network.bb", "test-broken-network.yml", None),
+    }
+    for mode, (img_name, kas_name, fault_pkg) in broken_images.items():
+        img_path = root / f"meta-nextoomio/recipes-core/images/{img_name}"
+        if not img_path.is_file():
+            errors.append(f"P0-F4.7: Missing broken image recipe: {img_name}")
+        else:
+            txt = img_path.read_text(encoding="utf-8")
+            if "require nextoomio-image.bb" not in txt:
+                errors.append(f"{img_name} must require nextoomio-image.bb")
+            if fault_pkg and fault_pkg not in txt:
+                errors.append(f"{img_name} must include '{fault_pkg}'")
+            if mode == "hang":
+                if "ROOTFS_POSTPROCESS_COMMAND" not in txt or "/sbin/init" not in txt:
+                    errors.append(f"{img_name} must override /sbin/init via ROOTFS_POSTPROCESS_COMMAND")
+            elif mode == "health":
+                if "pipewire.service" not in txt or "nextoomio-audio-profile.service" not in txt:
+                    errors.append(f"{img_name} must mask required health check services")
+            elif mode == "network":
+                if "NetworkManager.service" not in txt or "sshd.service" not in txt:
+                    errors.append(f"{img_name} must mask NetworkManager and sshd services")
+
+        kas_path = root / f"kas/{kas_name}"
+        if not kas_path.is_file():
+            errors.append(f"P0-F4.7: Missing broken image kas build option: {kas_name}")
+        else:
+            txt = kas_path.read_text(encoding="utf-8")
+            target = img_name.replace(".bb", "")
+            if f"target: {target}" not in txt:
+                errors.append(f"{kas_name} must set target to '{target}'")
+
+    # Invariant: base image must NOT include fault packages
+    if image_bb.is_file():
+        image_text = image_bb.read_text(encoding="utf-8")
+        if "nextoomio-test-faults" in image_text:
+            errors.append(
+                "nextoomio-image.bb must not include nextoomio-test-faults; "
+                "broken images must not be reachable from the normal image configuration (P0-F4.7)"
+            )
+
+    # D-060: Validate Yocto 6.0 UNPACKDIR / WORKDIR conventions in recipes and bbappends (AC2)
+    # In Yocto 6.0 local file:// sources are unpacked into ${UNPACKDIR}, S must be set
+    # relative to ${UNPACKDIR}, and a recipe does not assign UNPACKDIR.
+    # Pattern 1: S = "${WORKDIR}...
+    # Pattern 2: Any assignment to UNPACKDIR
+    # Pattern 3: ${WORKDIR}/ used as the source of a file:// item
+    meta_dir = root / "meta-nextoomio"
+    if meta_dir.is_dir():
+        for recipe_path in sorted(meta_dir.rglob("*")):
+            if not recipe_path.is_file() or recipe_path.suffix not in (".bb", ".bbappend"):
+                continue
+            rel_path = recipe_path.relative_to(root)
+            for line_idx, line in enumerate(recipe_path.read_text(encoding="utf-8").splitlines(), start=1):
+                clean_line = line.strip()
+                if clean_line.startswith("#"):
+                    continue
+                if re.search(r'^\s*S\s*[:+?]?=\s*["\']?\$\{WORKDIR\}', line):
+                    errors.append(
+                        f"{rel_path} line {line_idx}: S must not be set relative to ${{WORKDIR}} in Yocto 6.0; "
+                        f"set S relative to ${{UNPACKDIR}} instead"
+                    )
+                elif re.search(r'^\s*UNPACKDIR\b.*=', line):
+                    errors.append(
+                        f"{rel_path} line {line_idx}: recipe must not assign UNPACKDIR in Yocto 6.0; "
+                        f"local file:// sources are unpacked into ${{UNPACKDIR}} automatically"
+                    )
+                elif (
+                    re.search(r'\binstall\b(?!\s+(?:-[a-zA-Z]*d|--directory))\b[^\n]*\$\{WORKDIR\}/', line)
+                    or re.search(r'\b(?:cp|cat|mv|sed)\b[^\n]*\$\{WORKDIR\}/', line)
+                    or re.search(r'\b(?:sdir|src|srcdir|source_dir)\s*[:+?]?=\s*["\']?\$\{WORKDIR\}', line, re.IGNORECASE)
+                    or re.search(r'\|\|\s*sdir=["\']?\$\{WORKDIR\}', line)
+                    or "file://${WORKDIR}" in line
+                ):
+                    errors.append(
+                        f"{rel_path} line {line_idx}: ${{WORKDIR}}/ must not be used as the source of a file:// item in Yocto 6.0; "
+                        f"use ${{UNPACKDIR}}/ instead"
+                    )
+
     return errors
 
 
@@ -686,6 +777,15 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
+        "meta-nextoomio/recipes-core/images/nextoomio-image-broken-hang.bb",
+        "meta-nextoomio/recipes-core/images/nextoomio-image-broken-health.bb",
+        "meta-nextoomio/recipes-core/images/nextoomio-image-broken-network.bb",
+        "kas/test-broken-hang.yml",
+        "kas/test-broken-health.yml",
+        "kas/test-broken-network.yml",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/nextoomio-test-faults_0.0.1.bb",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-hang-early.sh",
+        "scripts/bench/test_broken_images.py",
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
     ]
@@ -855,6 +955,78 @@ def run_self_tests() -> int:
         assert any("derived invalid overlay line" in e or "must not use 'grep -A'" in e for e in errs), f"Expected derivation failure: {errs}"
         ap_bb_path.write_text(orig_ap_bb, encoding="utf-8")
         print("  test_check_fails_when_do_compile_derives_invalid_overlay: OK")
+
+        # 18. P0-F4.7 AC6: Fail when broken image recipe is missing
+        broken_hang_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image-broken-hang.bb"
+        orig_hang_bb = broken_hang_bb.read_text(encoding="utf-8")
+        broken_hang_bb.write_text("# missing require\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must require nextoomio-image.bb" in e for e in errs), f"Expected missing require failure: {errs}"
+        broken_hang_bb.write_text(orig_hang_bb, encoding="utf-8")
+        print("  test_check_fails_when_broken_image_recipe_invalid: OK")
+
+        # 19. P0-F4.7 AC6: Fail when broken kas build option has wrong target
+        broken_kas = tmp_root / "kas/test-broken-hang.yml"
+        orig_broken_kas = broken_kas.read_text(encoding="utf-8")
+        broken_kas.write_text("header:\n  version: 14\ntarget: wrong-target\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("test-broken-hang.yml must set target" in e for e in errs), f"Expected kas wrong target failure: {errs}"
+        broken_kas.write_text(orig_broken_kas, encoding="utf-8")
+        print("  test_check_fails_when_broken_kas_target_wrong: OK")
+
+        # 20. P0-F4.7: Fail when base image includes test fault packages (isolation violation)
+        img_bb_path = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_img_bb = img_bb_path.read_text(encoding="utf-8")
+        img_bb_path.write_text(orig_img_bb + '\nIMAGE_INSTALL:append = " nextoomio-test-faults-hang"\n', encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("nextoomio-image.bb must not include nextoomio-test-faults" in e for e in errs), f"Expected isolation failure: {errs}"
+        img_bb_path.write_text(orig_img_bb, encoding="utf-8")
+        print("  test_check_fails_when_base_image_violates_isolation: OK")
+
+        # 21. D-060 AC2: Fail when recipe sets S = "${WORKDIR}/..." (Pattern 1)
+        ap_bb = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb"
+        orig_ap_bb = ap_bb.read_text(encoding="utf-8")
+        ap_bb.write_text(orig_ap_bb.replace('S = "${UNPACKDIR}"', 'S = "${WORKDIR}/sources"'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any(
+            "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb line 19:" in e
+            and "S must not be set relative to ${WORKDIR}" in e
+            for e in errs
+        ), f"Expected S = ${{WORKDIR}} failure naming file and line: {errs}"
+        ap_bb.write_text(orig_ap_bb, encoding="utf-8")
+        print("  test_check_fails_when_recipe_sets_s_to_workdir: OK")
+
+        # 22. D-060 AC2: Fail when recipe assigns UNPACKDIR (Pattern 2)
+        ssh_keys_bb = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/nextoomio-ssh-keys_0.0.1.bb"
+        orig_ssh_keys_bb = ssh_keys_bb.read_text(encoding="utf-8")
+        ssh_keys_bb.write_text(orig_ssh_keys_bb.replace('S = "${UNPACKDIR}"', 'S = "${UNPACKDIR}"\nUNPACKDIR = "${S}"'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any(
+            "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/nextoomio-ssh-keys_0.0.1.bb line 15:" in e
+            and "recipe must not assign UNPACKDIR" in e
+            for e in errs
+        ), f"Expected UNPACKDIR assignment failure naming file and line: {errs}"
+        ssh_keys_bb.write_text(orig_ssh_keys_bb, encoding="utf-8")
+        print("  test_check_fails_when_recipe_assigns_unpackdir: OK")
+
+        # 23. D-060 AC2: Fail when recipe or bbappend uses ${WORKDIR}/ as source of file:// item (Pattern 3)
+        avahi_bbappend = tmp_root / "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend"
+        orig_avahi_bbappend = avahi_bbappend.read_text(encoding="utf-8")
+        avahi_bbappend.write_text(orig_avahi_bbappend.replace('${UNPACKDIR}/avahi-daemon.conf', '${WORKDIR}/avahi-daemon.conf'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any(
+            "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend line 12:" in e
+            and "${WORKDIR}/ must not be used as the source of a file:// item" in e
+            for e in errs
+        ), f"Expected ${{WORKDIR}}/ source failure naming file and line: {errs}"
+
+        # Verify legitimate ${WORKDIR} uses (e.g. B = "${WORKDIR}/build", cd ${WORKDIR}) are NOT flagged
+        avahi_bbappend.write_text(orig_avahi_bbappend + '\nB = "${WORKDIR}/build"\n', encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert not any("avahi_%.bbappend" in e for e in errs), f"Legitimate ${{WORKDIR}}/build was falsely flagged: {errs}"
+
+        avahi_bbappend.write_text(orig_avahi_bbappend, encoding="utf-8")
+        print("  test_check_fails_when_recipe_uses_workdir_for_file_source: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0

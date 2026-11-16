@@ -38,10 +38,9 @@ jobs:
           python3 scripts/check_yocto_layer.py --test
           python3 scripts/check_yocto_layer.py
 
-      - name: Verify bench deploy tooling and self-tests
+      - name: Verify bench tooling and self-tests
         run: |
-          python3 scripts/bench/deploy.py --test
-
+          make check-bench
 
   rust-core:
     name: Rust Core & License Gate
