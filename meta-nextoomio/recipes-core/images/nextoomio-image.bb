@@ -15,8 +15,9 @@ IMAGE_FSTYPES = "wic.bz2 wic.bmap ext4.gz"
 # Depend on rpi-autoboot and nextoomio-audio-profile deploy tasks for boot partitions (D-005, D-011)
 do_image_wic[depends] += "rpi-autoboot:do_deploy nextoomio-audio-profile:do_deploy"
 
-# Size budget guard (AR-08: root slot is 3 GiB = 3,145,728 KiB)
-IMAGE_ROOTFS_MAXSIZE = "2800000"
+# Size budget guard (ARCHITECTURE.md section 3.6, AR-08: root slot is 3 GiB = 3,145,728 KiB, AC2)
+# BitBake image.bbclass terminates the build naming the limit if rootfs exceeds this budget
+IMAGE_ROOTFS_MAXSIZE ?= "3145728"
 
 IMAGE_INSTALL:append = " \
     packagegroup-core-boot \

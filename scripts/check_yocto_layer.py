@@ -258,6 +258,12 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "selector partition must hold only the boot-selection file (D-005)"
             )
 
+        if not re.search(r"^\s*INCOMPATIBLE_LICENSE\b", conf_text, re.MULTILINE):
+            errors.append(
+                "meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must be configured "
+                "to reject unaccepted licenses (AC4)"
+            )
+
     autoboot_bb = root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb"
     if autoboot_bb.is_file():
         autoboot_text = autoboot_bb.read_text(encoding="utf-8")
@@ -283,6 +289,11 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append(
                 "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
                 "must include 'nextoomio-audio-profile' (D-011, D-012, P0-F6.1)"
+            )
+        if not re.search(r"^\s*IMAGE_ROOTFS_MAXSIZE\b", image_text, re.MULTILINE):
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_ROOTFS_MAXSIZE "
+                "must be configured to enforce the root slot size budget (AC2)"
             )
 
     # Wic layout verification (ARCHITECTURE.md section 3.6, AC2, AC4, AC5)
@@ -1027,6 +1038,24 @@ def run_self_tests() -> int:
 
         avahi_bbappend.write_text(orig_avahi_bbappend, encoding="utf-8")
         print("  test_check_fails_when_recipe_uses_workdir_for_file_source: OK")
+
+        # 24. AC2: Fail when IMAGE_ROOTFS_MAXSIZE is missing from nextoomio-image.bb
+        image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_image_bb = image_bb.read_text(encoding="utf-8")
+        image_bb.write_text(re.sub(r"^\s*IMAGE_ROOTFS_MAXSIZE\b[^\n]*\n", "", orig_image_bb, flags=re.MULTILINE), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_ROOTFS_MAXSIZE must be configured" in e for e in errs), f"Expected size budget guard error: {errs}"
+        image_bb.write_text(orig_image_bb, encoding="utf-8")
+        print("  test_check_fails_when_image_rootfs_maxsize_missing: OK")
+
+        # 25. AC4: Fail when INCOMPATIBLE_LICENSE is missing from nextoomio.conf
+        distro_conf = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
+        orig_distro_conf = distro_conf.read_text(encoding="utf-8")
+        distro_conf.write_text(re.sub(r"^\s*INCOMPATIBLE_LICENSE\b[^\n]*\n", "", orig_distro_conf, flags=re.MULTILINE), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected license gate error: {errs}"
+        distro_conf.write_text(orig_distro_conf, encoding="utf-8")
+        print("  test_check_fails_when_incompatible_license_missing: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0
