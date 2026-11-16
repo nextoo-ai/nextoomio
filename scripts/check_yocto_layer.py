@@ -11,10 +11,42 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def derive_hardware_boot_include_from_recipe(
+    recipe_path: pathlib.Path,
+    profile_path: pathlib.Path,
+    profile_id: str,
+) -> tuple[str, str | None]:
+    """Execute recipe do_compile derivation logic against profile_path and return (generated_include, error)."""
+    recipe_text = recipe_path.read_text(encoding="utf-8")
+    m = re.search(r"do_compile\s*\(\)\s*\{(.*?)\n\}", recipe_text, re.DOTALL)
+    if not m:
+        return "", "do_compile function not found in recipe"
+
+    compile_body = m.group(1)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_p = pathlib.Path(tmp_dir)
+        script = f"""
+        S="{profile_path.parent}"
+        B="{tmp_p}"
+        NEXTOOMIO_AUDIO_PROFILE="{profile_id}"
+        {compile_body}
+        """
+        proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+        if proc.returncode != 0:
+            return "", f"do_compile execution failed (exit code {proc.returncode}): {proc.stderr.strip()}"
+
+        out_file = tmp_p / "nextoomio-hardware.txt"
+        if not out_file.is_file():
+            return "", "do_compile did not generate nextoomio-hardware.txt"
+
+        return out_file.read_text(encoding="utf-8"), None
 
 
 def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
@@ -31,8 +63,12 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
         root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb",
         root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend",
+        root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend",
         root / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile.service",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile-setup.sh",
         root / "kas/base.yml",
         root / "kas/rpi4-64.yml",
         root / "kas/ci-hosted.yml",
@@ -80,6 +116,11 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "kas/rpi4-64.yml: tryboot_a_b must not be set in RPI_EXTRA_CONFIG/config.txt; "
                 "tryboot_a_b is a property of autoboot.txt (CQ-R2)"
             )
+        if re.search(r"dtoverlay\s*=", rpi4_text) or "hifiberry-amp" in rpi4_text:
+            errors.append(
+                "kas/rpi4-64.yml: sound card overlay must not be hardcoded in build configuration; "
+                "overlay must be derived from the hardware profile (D-011)"
+            )
 
     profile_path = root / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
     if profile_path.is_file():
@@ -90,6 +131,20 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("Reference display_name must be 'HiFiBerry Amp' (Volumio-aligned)")
         if profile.get("default_logical_volume_percent") != 30:
             errors.append("Default logical volume must be 30% per SPECIFICATION.md section 5.1")
+        if profile.get("fixed_hardware_mixer_percent") != 30:
+            errors.append(
+                "Reference fixed_hardware_mixer_percent must be 30% (safe level for direct speaker drive, D-012, ARCHITECTURE.md section 5.3)"
+            )
+        if profile.get("fixed_hardware_mixer_percent") == 100:
+            errors.append(
+                "Reference fixed_hardware_mixer_percent must NOT be 100% (unattenuated output risk on bench, D-012)"
+            )
+        if profile.get("alsa_mixer_control") != "Master":
+            errors.append("Reference alsa_mixer_control must be 'Master' per ARCHITECTURE.md section 9.2")
+        if profile.get("dtoverlay") != "hifiberry-amp":
+            errors.append("Reference dtoverlay must be 'hifiberry-amp' per ARCHITECTURE.md section 9.2")
+        if profile.get("alsa_card_id") != "sndrpihifiberry":
+            errors.append("Reference alsa_card_id must be 'sndrpihifiberry' to identify sound card in ALSA (AC1, AC5)")
 
     if (root / "meta-nextoomio/wic").exists():
         errors.append(
@@ -182,6 +237,18 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "for Wic bootimg-partition plugin to read partition-specific boot files"
             )
 
+        m_boot_a = re.search(r'IMAGE_BOOT_FILES_label-boot_a\s*=\s*["\']([^"\']+)["\']', conf_text)
+        if not m_boot_a or "nextoomio-hardware.txt" not in m_boot_a.group(1):
+            errors.append(
+                "meta-nextoomio/conf/distro/nextoomio.conf: IMAGE_BOOT_FILES_label-boot_a must include "
+                "'nextoomio-hardware.txt' to install derived hardware overlay into slot A boot partition (D-011)"
+            )
+        if m_select and "nextoomio-hardware.txt" in m_select.group(1):
+            errors.append(
+                "IMAGE_BOOT_FILES_label-select must NOT contain 'nextoomio-hardware.txt'; "
+                "selector partition must hold only the boot-selection file (D-005)"
+            )
+
     autoboot_bb = root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb"
     if autoboot_bb.is_file():
         autoboot_text = autoboot_bb.read_text(encoding="utf-8")
@@ -197,6 +264,16 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append(
                 "meta-nextoomio/recipes-core/images/nextoomio-image.bb: do_image_wic[depends] "
                 "must depend on 'rpi-autoboot:do_deploy' to ensure autoboot.txt is staged prior to Wic execution"
+            )
+        if "nextoomio-audio-profile:do_deploy" not in image_text:
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: do_image_wic[depends] "
+                "must depend on 'nextoomio-audio-profile:do_deploy' to stage hardware boot include (D-011)"
+            )
+        if "nextoomio-audio-profile" not in image_text:
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
+                "must include 'nextoomio-audio-profile' (D-011, D-012, P0-F6.1)"
             )
 
     # Wic layout verification (ARCHITECTURE.md section 3.6, AC2, AC4, AC5)
@@ -461,6 +538,90 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 ".github/workflows/yocto-build.yml: artifact upload must publish package manifest (*.manifest, AC4)"
             )
 
+    # D-011: Validate rpi-config include configuration for hardware profile overlay
+    rpi_config_bbappend = root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend"
+    if rpi_config_bbappend.is_file():
+        cfg_text = rpi_config_bbappend.read_text(encoding="utf-8")
+        if "include nextoomio-hardware.txt" not in cfg_text:
+            errors.append(
+                "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend must configure 'include nextoomio-hardware.txt' "
+                "in RPI_EXTRA_CONFIG to include dynamic hardware overlay (D-011)"
+            )
+        if "dtoverlay=hifiberry-amp" in cfg_text:
+            errors.append(
+                "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend must not hardcode sound-card overlay directly; "
+                "overlay must be derived from hardware profile into nextoomio-hardware.txt (D-011)"
+            )
+
+    # P0-F6.1 / D-011 / D-012: Validate nextoomio-audio-profile recipe, service, and setup script
+    ap_bb = root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb"
+    if ap_bb.is_file():
+        ap_text = ap_bb.read_text(encoding="utf-8")
+        if "inherit" not in ap_text or "deploy" not in ap_text:
+            errors.append("nextoomio-audio-profile_0.0.1.bb must inherit deploy (D-011)")
+        if "inherit" not in ap_text or "systemd" not in ap_text:
+            errors.append("nextoomio-audio-profile_0.0.1.bb must inherit systemd (D-012, AC2)")
+        if "nextoomio-hardware.txt" not in ap_text:
+            errors.append("nextoomio-audio-profile_0.0.1.bb must generate and deploy nextoomio-hardware.txt (D-011)")
+        if "hardware-profile.json" not in ap_text:
+            errors.append("nextoomio-audio-profile_0.0.1.bb must install hardware-profile.json to /etc/nextoomio/ (D-011)")
+        if "SYSTEMD_SERVICE:${PN}" not in ap_text or "nextoomio-audio-profile.service" not in ap_text:
+            errors.append("nextoomio-audio-profile_0.0.1.bb must declare SYSTEMD_SERVICE:${PN} = 'nextoomio-audio-profile.service'")
+        if "grep -A" in ap_text:
+            errors.append(
+                "nextoomio-audio-profile_0.0.1.bb: must not use 'grep -A' to parse JSON profile; "
+                "use python3 -c / json (CQ-R1, CQ-R2)"
+            )
+        if "python3" not in ap_text or "json" not in ap_text:
+            errors.append(
+                "nextoomio-audio-profile_0.0.1.bb: do_compile must use python3 and json to parse hardware profile (CQ-R1)"
+            )
+
+        # CQ-R1 / CQ-R2 / CQ-R4 / CQ-M7: Test actual derivation of nextoomio-hardware.txt from reference profile
+        if profile_path.is_file():
+            include_text, err = derive_hardware_boot_include_from_recipe(ap_bb, profile_path, "hifiberry-amp")
+            if err:
+                errors.append(f"nextoomio-audio-profile_0.0.1.bb: failed to derive boot include: {err}")
+            else:
+                overlay_lines = [line.strip() for line in include_text.splitlines() if line.strip().startswith("dtoverlay=")]
+                if not overlay_lines:
+                    errors.append(
+                        "nextoomio-audio-profile_0.0.1.bb: derived nextoomio-hardware.txt missing 'dtoverlay=' entry"
+                    )
+                else:
+                    for ol in overlay_lines:
+                        if ol != "dtoverlay=hifiberry-amp":
+                            errors.append(
+                                f"nextoomio-audio-profile_0.0.1.bb: derived invalid overlay line '{ol}'; "
+                                f"expected 'dtoverlay=hifiberry-amp' for hifiberry-amp profile (CQ-R1, CQ-R2)"
+                            )
+
+    ap_service = root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile.service"
+    if ap_service.is_file():
+        svc_text = ap_service.read_text(encoding="utf-8")
+        if not re.search(r"^After=.*\bsound\.target\b", svc_text, re.MULTILINE):
+            errors.append("nextoomio-audio-profile.service must specify After=... sound.target")
+        if not re.search(r"^Before=.*\bpipewire\.service\b", svc_text, re.MULTILINE):
+            errors.append("nextoomio-audio-profile.service must specify Before=pipewire.service (AC2)")
+        if "/usr/sbin/nextoomio-audio-profile-setup" not in svc_text:
+            errors.append("nextoomio-audio-profile.service must execute /usr/sbin/nextoomio-audio-profile-setup")
+
+    ap_script = root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile-setup.sh"
+    if ap_script.is_file():
+        sh_text = ap_script.read_text(encoding="utf-8")
+        if "/etc/nextoomio/hardware-profile.json" not in sh_text:
+            errors.append("nextoomio-audio-profile-setup.sh must check /etc/nextoomio/hardware-profile.json (D-011)")
+        if "amixer" not in sh_text:
+            errors.append("nextoomio-audio-profile-setup.sh must use amixer to configure mixer level (AC2, D-012)")
+        if "amixer -c" not in sh_text:
+            errors.append("nextoomio-audio-profile-setup.sh must address sound card explicitly via 'amixer -c' (AC1, AC2)")
+        if "alsa_card_id" not in sh_text:
+            errors.append("nextoomio-audio-profile-setup.sh must read alsa_card_id from hardware profile (AC1, AC5)")
+        if "/run/nextoomio/diagnostics/audio.json" not in sh_text:
+            errors.append("nextoomio-audio-profile-setup.sh must record diagnostics to /run/nextoomio/diagnostics/audio.json")
+        if "/run/nextoomio/diagnostics/audio.txt" not in sh_text:
+            errors.append("nextoomio-audio-profile-setup.sh must record diagnostics text to /run/nextoomio/diagnostics/audio.txt")
+
     # Component register check in ARCHITECTURE.md section 10
     arch_doc = root / "ARCHITECTURE.md"
     if arch_doc.is_file():
@@ -497,8 +658,12 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend",
+        "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend",
         "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile.service",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile-setup.sh",
         "kas/base.yml",
         "kas/rpi4-64.yml",
         "kas/ci-hosted.yml",
@@ -606,6 +771,91 @@ def run_self_tests() -> int:
         setup_sh.write_text(orig_setup_sh, encoding="utf-8")
         print("  test_check_fails_when_diagnostics_text_missing: OK")
 
+        # 10. AC5 / D-011: Fail when kas/rpi4-64.yml hardcodes dtoverlay
+        kas_rpi4 = tmp_root / "kas/rpi4-64.yml"
+        orig_kas_rpi4 = kas_rpi4.read_text(encoding="utf-8")
+        kas_rpi4.write_text(orig_kas_rpi4 + '\n    RPI_EXTRA_CONFIG:append = "\\ndtoverlay=hifiberry-amp\\n"\n', encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("kas/rpi4-64.yml: sound card overlay must not be hardcoded" in e for e in errs), f"Expected kas overlay failure: {errs}"
+        kas_rpi4.write_text(orig_kas_rpi4, encoding="utf-8")
+        print("  test_check_fails_when_kas_hardcodes_overlay: OK")
+
+        # 11. AC5 / D-012: Fail when hifiberry-amp.json fixed_hardware_mixer_percent is 100
+        prof_file = tmp_root / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
+        orig_prof = prof_file.read_text(encoding="utf-8")
+        prof_file.write_text(orig_prof.replace('"fixed_hardware_mixer_percent": 30', '"fixed_hardware_mixer_percent": 100'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("fixed_hardware_mixer_percent must NOT be 100%" in e for e in errs), f"Expected mixer percent 100 failure: {errs}"
+        prof_file.write_text(orig_prof, encoding="utf-8")
+        print("  test_check_fails_when_fixed_mixer_percent_is_100: OK")
+
+        # 12. AC5 / D-011: Fail when rpi-config_%.bbappend is missing nextoomio-hardware.txt include
+        cfg_bbappend = tmp_root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend"
+        orig_cfg_bbappend = cfg_bbappend.read_text(encoding="utf-8")
+        cfg_bbappend.write_text("# missing include\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("include nextoomio-hardware.txt" in e for e in errs), f"Expected rpi-config include failure: {errs}"
+        cfg_bbappend.write_text(orig_cfg_bbappend, encoding="utf-8")
+        print("  test_check_fails_when_rpi_config_missing_hardware_include: OK")
+
+        # 13. AC5 / D-011: Fail when distro conf boot_a files missing nextoomio-hardware.txt
+        dist_conf = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
+        orig_dist_conf = dist_conf.read_text(encoding="utf-8")
+        dist_conf.write_text(orig_dist_conf.replace(" nextoomio-hardware.txt", ""), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_BOOT_FILES_label-boot_a must include 'nextoomio-hardware.txt'" in e for e in errs), f"Expected boot_a hardware.txt failure: {errs}"
+        dist_conf.write_text(orig_dist_conf, encoding="utf-8")
+        print("  test_check_fails_when_boot_a_missing_hardware_txt: OK")
+
+        # 14. AC5 / D-011: Fail when nextoomio-image.bb missing nextoomio-audio-profile in IMAGE_INSTALL
+        img_bb_path = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_img_bb = img_bb_path.read_text(encoding="utf-8")
+        img_bb_path.write_text(orig_img_bb.replace("nextoomio-audio-profile", "ignored-pkg"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_INSTALL must include 'nextoomio-audio-profile'" in e for e in errs), f"Expected audio profile in IMAGE_INSTALL failure: {errs}"
+        img_bb_path.write_text(orig_img_bb, encoding="utf-8")
+        print("  test_check_fails_when_image_missing_audio_profile: OK")
+
+        # 15. AC1 / AC5: Fail when hifiberry-amp.json is missing alsa_card_id
+        prof_file = tmp_root / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
+        orig_prof = prof_file.read_text(encoding="utf-8")
+        prof_file.write_text(orig_prof.replace('"alsa_card_id": "sndrpihifiberry",\n', ''), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("Reference alsa_card_id must be 'sndrpihifiberry'" in e for e in errs), f"Expected alsa_card_id failure: {errs}"
+        prof_file.write_text(orig_prof, encoding="utf-8")
+        print("  test_check_fails_when_profile_missing_alsa_card_id: OK")
+
+        # 16. AC1 / AC2: Fail when nextoomio-audio-profile-setup.sh does not use amixer -c
+        ap_sh_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile-setup.sh"
+        orig_ap_sh = ap_sh_path.read_text(encoding="utf-8")
+        ap_sh_path.write_text(orig_ap_sh.replace("amixer -c", "amixer"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must address sound card explicitly via 'amixer -c'" in e for e in errs), f"Expected amixer -c failure: {errs}"
+        ap_sh_path.write_text(orig_ap_sh, encoding="utf-8")
+        print("  test_check_fails_when_audio_setup_omits_card_flag: OK")
+
+        # 17. CQ-R1 / CQ-R2 / CQ-R4 / CQ-M7: Fail when do_compile generates invalid dtoverlay line (e.g. grep -A bug)
+        ap_bb_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb"
+        orig_ap_bb = ap_bb_path.read_text(encoding="utf-8")
+        bad_do_compile = '''do_compile() {
+    if [ -n "${NEXTOOMIO_AUDIO_PROFILE}" ] && [ -f "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" ]; then
+        OVERLAY=$(grep -o '"dtoverlay"[^,]*' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | sed -e 's/"dtoverlay"[[:space:]]*:[[:space:]]*"//' -e 's/"//' | tr -d '[:space:]')
+        PARAMS=$(grep -A 5 '"dtoverlay_params"' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | grep '"' | sed -e 's/.*"\\(.*\\)".*/\\1/' | tr '\\n' ',' | sed 's/,$//')
+        if [ -n "$PARAMS" ]; then
+            echo "dtoverlay=${OVERLAY},${PARAMS}" > "${B}/nextoomio-hardware.txt"
+        else
+            echo "dtoverlay=${OVERLAY}" > "${B}/nextoomio-hardware.txt"
+        fi
+    fi
+}'''
+        m_dc = re.search(r"do_compile\s*\(\)\s*\{.*?\n\}", orig_ap_bb, re.DOTALL)
+        assert m_dc, "do_compile pattern not found in test"
+        ap_bb_path.write_text(orig_ap_bb[:m_dc.start()] + bad_do_compile + orig_ap_bb[m_dc.end():], encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("derived invalid overlay line" in e or "must not use 'grep -A'" in e for e in errs), f"Expected derivation failure: {errs}"
+        ap_bb_path.write_text(orig_ap_bb, encoding="utf-8")
+        print("  test_check_fails_when_do_compile_derives_invalid_overlay: OK")
+
     print("OK: all AC5 automated self-tests passed.")
     return 0
 
@@ -620,7 +870,7 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2 rules validated.")
+    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2/P0-F6.1 rules validated.")
     return 0
 
 

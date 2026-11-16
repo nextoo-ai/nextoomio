@@ -12,8 +12,8 @@ IMAGE_FEATURES:remove = "debug-tweaks ssh-server-dropbear package-management"
 WKS_FILE = "nextoomio-ab.wks.in"
 IMAGE_FSTYPES = "wic.bz2 wic.bmap ext4.gz"
 
-# Depend on rpi-autoboot deploy task for selector partition population (D-005)
-do_image_wic[depends] += "rpi-autoboot:do_deploy"
+# Depend on rpi-autoboot and nextoomio-audio-profile deploy tasks for boot partitions (D-005, D-011)
+do_image_wic[depends] += "rpi-autoboot:do_deploy nextoomio-audio-profile:do_deploy"
 
 # Size budget guard (AR-08: root slot is 3 GiB = 3,145,728 KiB)
 IMAGE_ROOTFS_MAXSIZE = "2800000"
@@ -36,4 +36,5 @@ IMAGE_INSTALL:append = " \
     openssh-sshd \
     openssh-keygen \
     nextoomio-ssh-keys \
+    nextoomio-audio-profile \
 "

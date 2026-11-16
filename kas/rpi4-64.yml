@@ -8,6 +8,4 @@ machine: raspberrypi4-64
 
 local_conf_header:
   nextoomio-rpi4-reference: |
-    # Default reference audio overlay (hifiberry-amp for HiFiBerry Amp+)
-    RPI_EXTRA_CONFIG:append = "\ndtoverlay=hifiberry-amp\n"
     DISABLE_OVERSCAN = "1"
