@@ -95,7 +95,7 @@ jobs:
             -e DL_DIR=/work/yocto-cache/downloads \
             -e SSTATE_DIR=/work/yocto-cache/sstate-cache \
             ghcr.io/siemens/kas/kas:4.5 \
-            kas shell /work/kas/ci-hosted.yml -c "bitbake-layers show-layers && bitbake -p nextoomio-image nextoomio-update-image"
+            kas shell /work/kas/ci-hosted.yml -c "bitbake-layers show-layers && bitbake -p nextoomio-image"
 
       - name: Build full nextoomio Yocto image (full-image)
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')

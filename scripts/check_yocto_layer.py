@@ -93,8 +93,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
         root / "meta-nextoomio/classes/image_types_nextoomio.bbclass",
         root / "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend",
-        root / "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb",
-        root / "meta-nextoomio/recipes-support/swupdate/files/sw-description",
+        root / "meta-nextoomio/recipes-support/swupdate/files/sw-description.in",
         root / "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg",
         root / "meta-nextoomio/recipes-support/swupdate/files/hwrevision",
     ]
@@ -636,10 +635,6 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "meta-nextoomio/conf/distro/nextoomio.conf: IMAGE_CLASSES must append "
                 "'image_types_nextoomio' to enable .swu update file generation (P0-F4.2, D-008)"
             )
-        if "SWUPDATE_IMAGES" not in conf_text:
-            errors.append(
-                "meta-nextoomio/conf/distro/nextoomio.conf: SWUPDATE_IMAGES must be defined"
-            )
 
     if image_bb.is_file():
         img_text = image_bb.read_text(encoding="utf-8")
@@ -678,26 +673,52 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         for limit_check in ("BOOT_EXPANDED_SIZE", "ROOT_EXPANDED_SIZE", "SWU_SIZE"):
             if limit_check not in class_text:
                 errors.append(f"image_types_nextoomio.bbclass must check {limit_check} against slot/staging limit (AC3)")
+        cmd_match = re.search(r"IMAGE_CMD:swu\s*\(\)\s*\{([\s\S]*?)\n\}", class_text)
+        if cmd_match:
+            body = cmd_match.group(1)
+            for line in body.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    if not line.startswith((" ", "\t")):
+                        errors.append(
+                            f"image_types_nextoomio.bbclass: line inside IMAGE_CMD:swu has no leading indentation (column 0): '{line}'. "
+                            "BitBake requires function body lines to be indented to prevent early function termination and parse errors."
+                        )
+        if re.search(r"mcopy[^\n]*\|\|\s*true", class_text) or re.search(r"mmd[^\n]*\|\|\s*true", class_text):
+            errors.append(
+                "image_types_nextoomio.bbclass must not use '|| true' on mcopy or mmd (silent boot assembly failure forbidden, CQ-R2)"
+            )
+        for req_boot in ("Image", "bcm2711-rpi-4-b.dtb", "cmdline.txt", "config.txt"):
+            if req_boot not in class_text:
+                errors.append(f"image_types_nextoomio.bbclass must check presence of required boot file '{req_boot}' with bbfatal (CQ-R2)")
+        if "SWUPDATE_DESCRIPTION_TEMPLATE" not in class_text or "sed" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must use SWUPDATE_DESCRIPTION_TEMPLATE and sed to populate sw-description")
 
-    sw_desc = root / "meta-nextoomio/recipes-support/swupdate/files/sw-description"
+    distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
+    if distro_conf.is_file():
+        d_text = distro_conf.read_text(encoding="utf-8")
+        if "SWUPDATE_IMAGES" in d_text:
+            errors.append("meta-nextoomio/conf/distro/nextoomio.conf must not set SWUPDATE_IMAGES (single producer via image_types_nextoomio, CQ-R14)")
+
+    sw_desc = root / "meta-nextoomio/recipes-support/swupdate/files/sw-description.in"
     if sw_desc.is_file():
         desc_text = sw_desc.read_text(encoding="utf-8")
-        if not re.search(r'version\s*=\s*["\']0\.0\.1-dev["\']', desc_text):
-            errors.append("sw-description must declare version matching DISTRO_VERSION ('0.0.1-dev') (AC1, AC4)")
-        if "hardware-compatibility" not in desc_text or "raspberrypi4-64" not in desc_text:
-            errors.append("sw-description must declare hardware-compatibility containing 'raspberrypi4-64' (AC1)")
+        if "@DISTRO_VERSION@" not in desc_text and not re.search(r'version\s*=\s*["\']0\.0\.1-dev["\']', desc_text):
+            errors.append("sw-description.in must declare version using @DISTRO_VERSION@ (AC1, AC4)")
+        if "hardware-compatibility" not in desc_text or ("@HW_COMPATIBILITY@" not in desc_text and "raspberrypi4-64" not in desc_text):
+            errors.append("sw-description.in must declare hardware-compatibility containing @HW_COMPATIBILITY@ or 'raspberrypi4-64' (AC1)")
         if "config-schema-range" not in desc_text:
-            errors.append("sw-description must declare readable config-schema-range (AC1)")
+            errors.append("sw-description.in must declare readable config-schema-range (AC1)")
         if "sha256" not in desc_text:
-            errors.append("sw-description must declare sha256 checksums for artifacts (AC1)")
+            errors.append("sw-description.in must declare sha256 checksums for artifacts (AC1)")
         if "copy1" not in desc_text or "copy2" not in desc_text:
-            errors.append("sw-description must configure dual-slot selections copy1 and copy2 (AC1)")
+            errors.append("sw-description.in must configure dual-slot selections copy1 and copy2 (AC1)")
         if "/dev/mmcblk0p2" not in desc_text or "/dev/mmcblk0p5" not in desc_text:
-            errors.append("sw-description copy1 must target slot A partitions (/dev/mmcblk0p2, /dev/mmcblk0p5)")
+            errors.append("sw-description.in copy1 must target slot A partitions (/dev/mmcblk0p2, /dev/mmcblk0p5)")
         if "/dev/mmcblk0p3" not in desc_text or "/dev/mmcblk0p6" not in desc_text:
-            errors.append("sw-description copy2 must target slot B partitions (/dev/mmcblk0p3, /dev/mmcblk0p6)")
+            errors.append("sw-description.in copy2 must target slot B partitions (/dev/mmcblk0p3, /dev/mmcblk0p6)")
         if re.search(r'signature\s*=\s*true', desc_text, re.IGNORECASE):
-            errors.append("sw-description must NOT require signature verification (UPD-03, AC2)")
+            errors.append("sw-description.in must NOT require signature verification (UPD-03, AC2)")
 
     sw_bbappend = root / "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend"
     if sw_bbappend.is_file():
@@ -714,29 +735,23 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("hwrevision must specify 'raspberrypi4-64 1.0' matching hardware-compatibility declaration")
 
     update_img_bb = root / "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb"
-    if update_img_bb.is_file():
-        up_text = update_img_bb.read_text(encoding="utf-8")
-        if "inherit swupdate" not in up_text:
-            errors.append("nextoomio-update-image.bb must inherit swupdate")
-        if "IMAGE_DEPENDS" not in up_text or "nextoomio-image" not in up_text:
-            errors.append("nextoomio-update-image.bb must declare IMAGE_DEPENDS = 'nextoomio-image'")
-        if "SWUPDATE_IMAGES" not in up_text or "nextoomio-image" not in up_text:
-            errors.append("nextoomio-update-image.bb must declare SWUPDATE_IMAGES containing 'nextoomio-image'")
-        if 'SWUPDATE_SIGNING = ""' not in up_text:
-            errors.append("nextoomio-update-image.bb must set SWUPDATE_SIGNING = \"\" (UPD-03, AC2)")
+    if update_img_bb.exists():
+        errors.append("meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb must be removed (competing producer, CQ-R14)")
 
     kas_base = root / "kas/base.yml"
     if kas_base.is_file():
         kas_text = kas_base.read_text(encoding="utf-8")
-        if "nextoomio-update-image" not in kas_text:
-            errors.append("kas/base.yml: target must include nextoomio-update-image")
+        if "nextoomio-image" not in kas_text:
+            errors.append("kas/base.yml: target must include nextoomio-image")
+        if "nextoomio-update-image" in kas_text:
+            errors.append("kas/base.yml: target must not include nextoomio-update-image (CQ-R14)")
 
     if yocto_wf.is_file():
         wf_text = yocto_wf.read_text(encoding="utf-8")
         if "*.swu" not in wf_text:
             errors.append(".github/workflows/yocto-build.yml: artifact upload must publish *.swu update file (AC5)")
-        if "bitbake -p nextoomio-image nextoomio-update-image" not in wf_text:
-            errors.append(".github/workflows/yocto-build.yml: parse-only check must parse nextoomio-image and nextoomio-update-image")
+        if "bitbake -p nextoomio-image" not in wf_text or "bitbake -p nextoomio-image nextoomio-update-image" in wf_text:
+            errors.append(".github/workflows/yocto-build.yml: parse-only check must parse nextoomio-image (and not nextoomio-update-image)")
 
     # Component register check in ARCHITECTURE.md section 10
     arch_doc = root / "ARCHITECTURE.md"
@@ -804,8 +819,7 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
         "meta-nextoomio/classes/image_types_nextoomio.bbclass",
         "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend",
-        "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb",
-        "meta-nextoomio/recipes-support/swupdate/files/sw-description",
+        "meta-nextoomio/recipes-support/swupdate/files/sw-description.in",
         "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg",
         "meta-nextoomio/recipes-support/swupdate/files/hwrevision",
         ".github/workflows/yocto-build.yml",
@@ -987,8 +1001,8 @@ def run_self_tests() -> int:
         img_bb_p.write_text(orig_img_bb_p, encoding="utf-8")
         print("  test_check_fails_when_image_fstypes_missing_swu: OK")
 
-        # 19. AC1: Fail when sw-description is missing hardware-compatibility
-        sw_desc_p = tmp_root / "meta-nextoomio/recipes-support/swupdate/files/sw-description"
+        # 19. AC1: Fail when sw-description.in is missing hardware-compatibility
+        sw_desc_p = tmp_root / "meta-nextoomio/recipes-support/swupdate/files/sw-description.in"
         orig_sw_desc = sw_desc_p.read_text(encoding="utf-8")
         sw_desc_p.write_text(orig_sw_desc.replace('hardware-compatibility', 'ignored_hw'), encoding="utf-8")
         errs = validate_layer(tmp_root)
@@ -996,14 +1010,14 @@ def run_self_tests() -> int:
         sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
         print("  test_check_fails_when_sw_description_missing_hardware_compatibility: OK")
 
-        # 20. AC1: Fail when sw-description is missing config-schema-range
+        # 20. AC1: Fail when sw-description.in is missing config-schema-range
         sw_desc_p.write_text(orig_sw_desc.replace('config-schema-range', 'ignored_schema'), encoding="utf-8")
         errs = validate_layer(tmp_root)
         assert any("config-schema-range" in e for e in errs), f"Expected config-schema-range failure: {errs}"
         sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
         print("  test_check_fails_when_sw_description_missing_config_schema_range: OK")
 
-        # 21. AC1: Fail when sw-description is missing sha256 checksums
+        # 21. AC1: Fail when sw-description.in is missing sha256 checksums
         sw_desc_p.write_text(orig_sw_desc.replace('sha256', 'md5'), encoding="utf-8")
         errs = validate_layer(tmp_root)
         assert any("sha256 checksums" in e for e in errs), f"Expected sha256 failure: {errs}"
@@ -1043,6 +1057,33 @@ def run_self_tests() -> int:
         assert any("image_types_nextoomio" in e for e in errs), f"Expected image_types_nextoomio failure: {errs}"
         dist_p.write_text(orig_dist_p, encoding="utf-8")
         print("  test_check_fails_when_distro_conf_missing_swupdate_class: OK")
+
+        # 26. CQ-R4 / Point 5: Fail when IMAGE_CMD:swu contains unindented line (column 0)
+        unindented_class = orig_class.replace('    BOOT_ARTIFACT=', 'BOOT_ARTIFACT=')
+        class_p.write_text(unindented_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("no leading indentation" in e for e in errs), f"Expected column 0 indentation failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_image_cmd_has_unindented_line: OK")
+
+        # 27. CQ-R2 / Point 3: Fail when boot assembly uses || true
+        true_class = orig_class.replace(
+            'mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/',
+            'mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/ || true'
+        )
+        class_p.write_text(true_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("|| true" in e for e in errs), f"Expected || true failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_boot_assembly_ignores_errors: OK")
+
+        # 28. CQ-R14 / Point 2: Fail when competing nextoomio-update-image.bb recipe is present
+        competing_bb = tmp_root / "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb"
+        competing_bb.write_text("inherit swupdate\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("competing producer" in e for e in errs), f"Expected competing recipe failure: {errs}"
+        competing_bb.unlink()
+        print("  test_check_fails_when_competing_update_image_recipe_present: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0

@@ -6,7 +6,6 @@ header:
 distro: nextoomio
 target:
   - nextoomio-image
-  - nextoomio-update-image
 
 repos:
   nextoomio:
