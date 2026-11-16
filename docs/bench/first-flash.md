@@ -89,23 +89,23 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
 3. **Identify the Wic image and block map:**
 
    The downloaded artifact archive preserves the directory structure under `build/**/deploy/` published by `actions/upload-artifact@v4`:
-   - Flashable Wic image and block map: `images/raspberrypi4-64/*.wic.bz2` and `images/raspberrypi4-64/*.wic.bmap`
-   - Rootfs package manifests and SPDX SBOM: `images/raspberrypi4-64/*.manifest` and `images/raspberrypi4-64/*.spdx.tar.zst`
-   - License manifest: `licenses/**/license.manifest`
+   - Flashable Wic image and block map: `build/tmp/deploy/images/raspberrypi4-64/*.wic.bz2` and `build/tmp/deploy/images/raspberrypi4-64/*.wic.bmap`
+   - Rootfs package manifests and SPDX SBOM: `build/tmp/deploy/images/raspberrypi4-64/*.manifest` and `build/tmp/deploy/images/raspberrypi4-64/*.spdx.tar.zst`
+   - License manifest: `build/tmp/deploy/licenses/**/license.manifest`
 
-   *(Note: The exact subdirectory layout inside the downloaded zip artifact was derived from the path patterns in `.github/workflows/yocto-build.yml` and cannot be definitively confirmed on a downloaded artifact until a full image build on `main` completes.)*
+   *(Note: The exact subdirectory layout inside the downloaded zip artifact was observed by the Architect on 2026-11-16 from full-image CI run 43832700635; all published files reside under `build/tmp/deploy/`.)*
 
    > [!IMPORTANT]
    > Keep both the `*.wic.bz2` image and its matching `*.wic.bmap` block map in the same directory. When invoked, `bmaptool copy` looks for the matching `.wic.bmap` file in the same directory as the image.
 
-   In BitBake/OpenEmbedded builds, image files are named with a build timestamp (for example, `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bz2` and matching `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bmap`, or symlink `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2`).
+   In BitBake/OpenEmbedded builds, image files are named with a build timestamp (for example, `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bz2` and matching `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bmap`, or canonical link `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2`).
 
    Change into the image directory and identify your exact filename:
    ```bash
-   cd images/raspberrypi4-64
+   cd build/tmp/deploy/images/raspberrypi4-64
    ls -la nextoomio-image-raspberrypi4-64*
    ```
-   In the flashing commands in Section 3.3, substitute your actual filename (e.g. `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bz2`) for `<IMAGE_FILE>`.
+   In the flashing commands in Section 3.3, substitute your actual filename (e.g. `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2` or `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bz2`) for `<IMAGE_FILE>`.
 
 ### 3.2 Identifying the Target MicroSD Card Node
 

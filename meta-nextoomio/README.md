@@ -19,4 +19,4 @@ OpenEmbedded / Yocto layer for the **nextoomio** audio operating system (`AD-01`
 
 ## License
 
-Layer metadata is licensed under the MIT License (`COPYING.MIT`). Original nextoomio daemons and WebUI recipes build Apache-2.0 sources from `../core` and `../webui`.
+Layer metadata is licensed under the MIT License (`COPYING.MIT`). Original nextoomio components build Apache-2.0 sources from `../core` (`nx-sysd` in Phase 0; core and audio services in v0.0.1) and `../webui` (v0.0.1).
