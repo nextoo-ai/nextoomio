@@ -708,7 +708,13 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                         f"{rel_path} line {line_idx}: recipe must not assign UNPACKDIR in Yocto 6.0; "
                         f"local file:// sources are unpacked into ${{UNPACKDIR}} automatically"
                     )
-                elif "${WORKDIR}/" in line or re.search(r'\$\{WORKDIR\}', line):
+                elif (
+                    re.search(r'\binstall\b(?!\s+(?:-[a-zA-Z]*d|--directory))\b[^\n]*\$\{WORKDIR\}/', line)
+                    or re.search(r'\b(?:cp|cat|mv|sed)\b[^\n]*\$\{WORKDIR\}/', line)
+                    or re.search(r'\b(?:sdir|src|srcdir|source_dir)\s*[:+?]?=\s*["\']?\$\{WORKDIR\}', line, re.IGNORECASE)
+                    or re.search(r'\|\|\s*sdir=["\']?\$\{WORKDIR\}', line)
+                    or "file://${WORKDIR}" in line
+                ):
                     errors.append(
                         f"{rel_path} line {line_idx}: ${{WORKDIR}}/ must not be used as the source of a file:// item in Yocto 6.0; "
                         f"use ${{UNPACKDIR}}/ instead"
@@ -1013,6 +1019,12 @@ def run_self_tests() -> int:
             and "${WORKDIR}/ must not be used as the source of a file:// item" in e
             for e in errs
         ), f"Expected ${{WORKDIR}}/ source failure naming file and line: {errs}"
+
+        # Verify legitimate ${WORKDIR} uses (e.g. B = "${WORKDIR}/build", cd ${WORKDIR}) are NOT flagged
+        avahi_bbappend.write_text(orig_avahi_bbappend + '\nB = "${WORKDIR}/build"\n', encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert not any("avahi_%.bbappend" in e for e in errs), f"Legitimate ${{WORKDIR}}/build was falsely flagged: {errs}"
+
         avahi_bbappend.write_text(orig_avahi_bbappend, encoding="utf-8")
         print("  test_check_fails_when_recipe_uses_workdir_for_file_source: OK")
 
