@@ -1282,10 +1282,16 @@ software = {{
         assert_eq!(status.active_slot, "root_a");
         assert_eq!(status.default_slot, "root_a");
 
-        // AC5: Trial boot cannot be requested from failed/interrupted install
-        let install_err = reboot_engine.begin_install().expect_err(
-            "trial boot or install of incomplete slot cannot be requested after interrupted install",
-        );
+        // AC5: State is not installed; active and default slot remain unchanged (previous slot)
+        assert_eq!(status.active_slot, "root_a");
+        assert_eq!(status.default_slot, "root_a");
+
+        // Verify subsequent install request from Failed state is refused.
+        // Note: Trial-boot request path and bootloader switch are introduced in P0-F4.5 (#21);
+        // hardware-level trial boot prevention of the incomplete slot is deferred to bench verification.
+        let install_err = reboot_engine
+            .begin_install()
+            .expect_err("subsequent install must be refused when transaction is in Failed state");
         assert!(matches!(
             install_err,
             UpdateEngineError::InvalidStateTransition {
@@ -1293,6 +1299,98 @@ software = {{
                 to: UpdateTransactionState::Installing
             }
         ));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_p0_f4_4_install_refuses_artifact_when_device_mismatches_target_slot() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-device-mismatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let capacity = 10 * 1024 * 1024;
+        // Active slot is Slot A, so target slot is Slot B (boot /dev/mmcblk0p3, root /dev/mmcblk0p6)
+        let backend = MockSlotBackend::new(Slot::A, Slot::A);
+        let storage = FileStagingStorage::new(&temp_dir, capacity);
+        let journal = FileJournalStorage::new(&temp_dir);
+
+        let mut engine = UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some("1.0".to_string()),
+            Some(1),
+            Some(capacity),
+        )
+        .unwrap();
+
+        // Create an sw-description where images are declared ONLY for Slot A devices (/dev/mmcblk0p2, /dev/mmcblk0p5)
+        let boot_data = b"boot-content";
+        let root_data = b"root-content";
+        let boot_sha = Sha256::hex(boot_data);
+        let root_sha = Sha256::hex(root_data);
+
+        let sw_desc = format!(
+            r#"
+software =
+{{
+    version = "0.0.1-test";
+    description = "Test update package";
+    hardware-compatibility: [ "1.0" ];
+    config-schema-range = "1..1";
+
+    stable = {{
+        copy1 = {{
+            images: (
+                {{
+                    filename = "nextoomio-boot.vfat.gz";
+                    device = "/dev/mmcblk0p2";
+                    type = "raw";
+                    compressed = "zlib";
+                    sha256 = "{boot_sha}";
+                    installed-directly = true;
+                }},
+                {{
+                    filename = "nextoomio-image.rootfs.ext4.gz";
+                    device = "/dev/mmcblk0p5";
+                    type = "raw";
+                    compressed = "zlib";
+                    sha256 = "{root_sha}";
+                    installed-directly = true;
+                }}
+            );
+        }};
+    }};
+}};
+"#
+        );
+
+        let swu_bytes = create_cpio(&[
+            ("sw-description", sw_desc.as_bytes()),
+            ("nextoomio-boot.vfat.gz", boot_data),
+            ("nextoomio-image.rootfs.ext4.gz", root_data),
+        ]);
+
+        engine
+            .stage_upload(Cursor::new(&swu_bytes), Some(swu_bytes.len() as u64))
+            .unwrap();
+        engine.validate().unwrap();
+
+        // Attempting to install must fail with InvalidFormat because neither image declares target Slot B devices (/dev/mmcblk0p3, /dev/mmcblk0p6)
+        let err = engine.install().expect_err(
+            "install must fail when sw-description does not declare target slot device",
+        );
+        match err {
+            UpdateEngineError::InvalidFormat(msg) => {
+                assert!(
+                    msg.contains("/dev/mmcblk0p3"),
+                    "error message should indicate missing target device: {msg}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -255,6 +255,174 @@ impl SlotBackend for MockSlotBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn mount_vfat(dev: &Path, target: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_dev = CString::new(dev.as_os_str().as_bytes())
+        .map_err(|e| format!("invalid device path: {e}"))?;
+    let c_target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| format!("invalid mount point path: {e}"))?;
+    let c_fstype = CString::new("vfat").map_err(|e| format!("invalid filesystem type: {e}"))?;
+
+    extern "C" {
+        fn mount(
+            special_file: *const std::os::raw::c_char,
+            dir: *const std::os::raw::c_char,
+            fstype: *const std::os::raw::c_char,
+            rwflag: std::os::raw::c_ulong,
+            data: *const std::os::raw::c_void,
+        ) -> std::os::raw::c_int;
+    }
+
+    // SAFETY:
+    // 1. `c_dev`, `c_target`, and `c_fstype` are valid null-terminated C strings that remain valid for the duration of the call.
+    // 2. `data` is NULL, which is valid for standard vfat mount.
+    let ret = unsafe {
+        mount(
+            c_dev.as_ptr(),
+            c_target.as_ptr(),
+            c_fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        // Fall back to external mount utility if direct syscall failed (e.g. loop setup or user namespace)
+        let output = std::process::Command::new("mount")
+            .arg("-t")
+            .arg("vfat")
+            .arg(dev)
+            .arg(target)
+            .output()
+            .map_err(|e| format!("mount syscall failed ({err}) and exec mount failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "failed to mount {} at {} (vfat): syscall {err}; util: {stderr}",
+                dev.display(),
+                target.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_vfat(dev: &Path, target: &Path) -> Result<(), String> {
+    let output = std::process::Command::new("mount")
+        .arg("-t")
+        .arg("vfat")
+        .arg(dev)
+        .arg(target)
+        .output()
+        .map_err(|e| format!("failed to execute mount: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to mount {} at {}: {stderr}",
+            dev.display(),
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_target(target: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| format!("invalid unmount target path: {e}"))?;
+
+    extern "C" {
+        fn umount2(
+            target: *const std::os::raw::c_char,
+            flags: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+    }
+
+    // SAFETY: `c_target` is a valid null-terminated C string valid for the duration of the call.
+    let ret = unsafe { umount2(c_target.as_ptr(), 0) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        let output = std::process::Command::new("umount")
+            .arg(target)
+            .output()
+            .map_err(|e| format!("umount syscall failed ({err}) and exec umount failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "failed to unmount {}: syscall {err}; util: {stderr}",
+                target.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unmount_target(target: &Path) -> Result<(), String> {
+    let output = std::process::Command::new("umount")
+        .arg(target)
+        .output()
+        .map_err(|e| format!("failed to execute umount: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to unmount {}: {stderr}", target.display()));
+    }
+    Ok(())
+}
+
+/// Scoped RAII mount guard ensuring boot partition is unmounted when dropped (AC4).
+struct ScopedBootMount {
+    mount_dir: PathBuf,
+    needs_unmount: bool,
+}
+
+impl ScopedBootMount {
+    fn open(dev: &Path, default_mount_dir: &Path) -> Result<Self, String> {
+        if let Ok(dir) = std::env::var("NEXTOOMIO_INACTIVE_BOOT_DIR") {
+            let p = PathBuf::from(dir);
+            fs::create_dir_all(&p)
+                .map_err(|e| format!("cannot create dir {}: {e}", p.display()))?;
+            return Ok(Self {
+                mount_dir: p,
+                needs_unmount: false,
+            });
+        }
+
+        fs::create_dir_all(default_mount_dir).map_err(|e| {
+            format!(
+                "cannot create mount point {}: {e}",
+                default_mount_dir.display()
+            )
+        })?;
+
+        mount_vfat(dev, default_mount_dir)?;
+
+        Ok(Self {
+            mount_dir: default_mount_dir.to_path_buf(),
+            needs_unmount: true,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.mount_dir
+    }
+}
+
+impl Drop for ScopedBootMount {
+    fn drop(&mut self) {
+        if self.needs_unmount {
+            let _ = unmount_target(&self.mount_dir);
+        }
+    }
+}
+
 /// Physical slot backend reading from Linux kernel cmdline, mount tables, and block devices.
 #[derive(Debug, Clone, Default)]
 pub struct PhysicalSlotBackend;
@@ -452,16 +620,24 @@ impl SlotBackend for PhysicalSlotBackend {
 
     fn get_sound_card_selection(&self, slot: Slot) -> Result<Option<String>, String> {
         let active = self.get_active_slot()?;
-        let boot_dir = if slot == active {
-            std::env::var("NEXTOOMIO_ACTIVE_BOOT_DIR")
+        if slot == active {
+            let boot_dir = std::env::var("NEXTOOMIO_ACTIVE_BOOT_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/boot"))
-        } else {
-            std::env::var("NEXTOOMIO_INACTIVE_BOOT_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/run/nextoomio/boot_inactive"))
-        };
-        let hw_file = boot_dir.join("nextoomio-hardware.txt");
+                .unwrap_or_else(|_| PathBuf::from("/boot"));
+            let hw_file = boot_dir.join("nextoomio-hardware.txt");
+            return if hw_file.exists() {
+                fs::read_to_string(&hw_file)
+                    .map(Some)
+                    .map_err(|e| format!("cannot read {}: {e}", hw_file.display()))
+            } else {
+                Ok(None)
+            };
+        }
+
+        let dev_path = self.get_device_path(slot, PartitionType::Boot);
+        let default_mount_dir = PathBuf::from("/run/nextoomio/mnt_boot_inactive");
+        let mount_guard = ScopedBootMount::open(&dev_path, &default_mount_dir)?;
+        let hw_file = mount_guard.path().join("nextoomio-hardware.txt");
         if hw_file.exists() {
             fs::read_to_string(&hw_file)
                 .map(Some)
@@ -473,18 +649,30 @@ impl SlotBackend for PhysicalSlotBackend {
 
     fn set_sound_card_selection(&mut self, slot: Slot, content: &str) -> Result<(), String> {
         let active = self.get_active_slot()?;
-        let boot_dir = if slot == active {
-            std::env::var("NEXTOOMIO_ACTIVE_BOOT_DIR")
+        if slot == active {
+            let boot_dir = std::env::var("NEXTOOMIO_ACTIVE_BOOT_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/boot"))
-        } else {
-            std::env::var("NEXTOOMIO_INACTIVE_BOOT_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/run/nextoomio/boot_inactive"))
-        };
-        fs::create_dir_all(&boot_dir)
-            .map_err(|e| format!("cannot create dir {}: {e}", boot_dir.display()))?;
-        let hw_file = boot_dir.join("nextoomio-hardware.txt");
+                .unwrap_or_else(|_| PathBuf::from("/boot"));
+            fs::create_dir_all(&boot_dir)
+                .map_err(|e| format!("cannot create dir {}: {e}", boot_dir.display()))?;
+            let hw_file = boot_dir.join("nextoomio-hardware.txt");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&hw_file)
+                .map_err(|e| format!("cannot open {}: {e}", hw_file.display()))?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| format!("cannot write {}: {e}", hw_file.display()))?;
+            file.sync_all()
+                .map_err(|e| format!("sync error {}: {e}", hw_file.display()))?;
+            return Ok(());
+        }
+
+        let dev_path = self.get_device_path(slot, PartitionType::Boot);
+        let default_mount_dir = PathBuf::from("/run/nextoomio/mnt_boot_inactive");
+        let mount_guard = ScopedBootMount::open(&dev_path, &default_mount_dir)?;
+        let hw_file = mount_guard.path().join("nextoomio-hardware.txt");
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)

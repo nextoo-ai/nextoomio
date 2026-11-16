@@ -1,6 +1,6 @@
 //! Update engine coordinating staging, validation, state machine, and storage.
 //!
-//! Enforces UPD-04, UPD-05, AR-01, AR-08, and all acceptance criteria AC1..AC6.
+//! Enforces SYS-05, UPD-04, UPD-05, AR-01, AR-08, and all update staging and installation acceptance criteria.
 
 use crate::cpio::{
     read_entry_bytes, read_next_cpio_header, skip_entry_data, stream_and_hash_entry_data, CpioError,
@@ -287,7 +287,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// 7. Reads back inactive partitions and verifies written artifact SHA-256 checksums (AC2).
     /// 8. Copies running sound-card selection (nextoomio-hardware.txt) into the newly written boot slot (AC4).
     /// 9. Commits 'installed' state only upon complete verification (AC2).
-    /// 10. Resets staging payload metadata while retaining preallocated extents (AC6).
+    /// 10. Resets staging payload metadata while retaining preallocated extents.
     pub fn install(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
         self.begin_install()?;
 
@@ -382,56 +382,27 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         let target_boot_device = target_slot.boot_device();
         let target_root_device = target_slot.root_device();
 
-        let boot_img_decl = sw_desc
+        let boot_decl = sw_desc
             .images
             .iter()
-            .find(|img| {
-                img.device == target_boot_device
-                    || img.device.ends_with(target_boot_device)
-                    || (img.device.is_empty() && img.filename.to_lowercase().contains("boot"))
-                    || img
-                        .filename
-                        .to_lowercase()
-                        .contains(&format!("{}_boot", target_slot.name()))
-            })
-            .or_else(|| {
-                sw_desc
-                    .images
-                    .iter()
-                    .find(|img| img.filename.to_lowercase().contains("boot"))
-            })
-            .cloned();
+            .find(|img| img.device == target_boot_device)
+            .cloned()
+            .ok_or_else(|| {
+                UpdateEngineError::InvalidFormat(format!(
+                    "missing boot artifact declared for target device '{target_boot_device}' in sw-description"
+                ))
+            })?;
 
-        let root_img_decl = sw_desc
+        let root_decl = sw_desc
             .images
             .iter()
-            .find(|img| {
-                img.device == target_root_device
-                    || img.device.ends_with(target_root_device)
-                    || (img.device.is_empty() && img.filename.to_lowercase().contains("root"))
-                    || img
-                        .filename
-                        .to_lowercase()
-                        .contains(&format!("{}_root", target_slot.name()))
-            })
-            .or_else(|| {
-                sw_desc
-                    .images
-                    .iter()
-                    .find(|img| img.filename.to_lowercase().contains("root"))
-            })
-            .cloned();
-
-        let boot_decl = boot_img_decl.ok_or_else(|| {
-            UpdateEngineError::InvalidFormat(format!(
-                "missing boot artifact declaration for target slot '{target_slot}' in sw-description"
-            ))
-        })?;
-        let root_decl = root_img_decl.ok_or_else(|| {
-            UpdateEngineError::InvalidFormat(format!(
-                "missing root artifact declaration for target slot '{target_slot}' in sw-description"
-            ))
-        })?;
+            .find(|img| img.device == target_root_device)
+            .cloned()
+            .ok_or_else(|| {
+                UpdateEngineError::InvalidFormat(format!(
+                    "missing root artifact declared for target device '{target_root_device}' in sw-description"
+                ))
+            })?;
 
         // Step 3: Stream entries and write ONLY inactive slot partitions (AC1)
         let mut wrote_boot = false;
@@ -451,83 +422,41 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
                 Err(e) => return Err(UpdateEngineError::InvalidFormat(e.to_string())),
             };
 
-            if header.name == boot_decl.filename && !wrote_boot {
-                struct BoundedReader<'a, R: Read> {
-                    inner: &'a mut R,
-                    remaining: u64,
-                }
-                impl<'a, R: Read> Read for BoundedReader<'a, R> {
-                    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                        if self.remaining == 0 {
-                            return Ok(0);
-                        }
-                        let to_read = (self.remaining as usize).min(buf.len());
-                        let n = self.inner.read(&mut buf[..to_read])?;
-                        self.remaining -= n as u64;
-                        Ok(n)
-                    }
-                }
-
-                let mut entry_reader = BoundedReader {
-                    inner: &mut reader,
-                    remaining: header.filesize,
-                };
-
-                self.backend
-                    .write_partition(
-                        target_slot,
-                        PartitionType::Boot,
-                        &mut entry_reader,
-                        header.filesize,
-                    )
-                    .map_err(UpdateEngineError::Storage)?;
-
-                boot_artifact_size = header.filesize;
-                wrote_boot = true;
-
-                let pad = (4 - (header.filesize % 4)) % 4;
-                if pad > 0 {
-                    let mut p = [0u8; 4];
-                    let _ = reader.read_exact(&mut p[..pad as usize]);
-                }
+            let target_part = if header.name == boot_decl.filename && !wrote_boot {
+                Some(PartitionType::Boot)
             } else if header.name == root_decl.filename && !wrote_root {
-                struct BoundedReader<'a, R: Read> {
-                    inner: &'a mut R,
-                    remaining: u64,
-                }
-                impl<'a, R: Read> Read for BoundedReader<'a, R> {
-                    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                        if self.remaining == 0 {
-                            return Ok(0);
-                        }
-                        let to_read = (self.remaining as usize).min(buf.len());
-                        let n = self.inner.read(&mut buf[..to_read])?;
-                        self.remaining -= n as u64;
-                        Ok(n)
-                    }
-                }
+                Some(PartitionType::Root)
+            } else {
+                None
+            };
 
-                let mut entry_reader = BoundedReader {
-                    inner: &mut reader,
-                    remaining: header.filesize,
-                };
+            if let Some(part) = target_part {
+                let mut entry_reader = (&mut reader).take(header.filesize);
 
                 self.backend
-                    .write_partition(
-                        target_slot,
-                        PartitionType::Root,
-                        &mut entry_reader,
-                        header.filesize,
-                    )
+                    .write_partition(target_slot, part, &mut entry_reader, header.filesize)
                     .map_err(UpdateEngineError::Storage)?;
 
-                root_artifact_size = header.filesize;
-                wrote_root = true;
+                match part {
+                    PartitionType::Boot => {
+                        boot_artifact_size = header.filesize;
+                        wrote_boot = true;
+                    }
+                    PartitionType::Root => {
+                        root_artifact_size = header.filesize;
+                        wrote_root = true;
+                    }
+                }
 
                 let pad = (4 - (header.filesize % 4)) % 4;
                 if pad > 0 {
                     let mut p = [0u8; 4];
-                    let _ = reader.read_exact(&mut p[..pad as usize]);
+                    reader.read_exact(&mut p[..pad as usize]).map_err(|e| {
+                        UpdateEngineError::InvalidFormat(format!(
+                            "failed to read CPIO padding after {}: {e}",
+                            header.name
+                        ))
+                    })?;
                 }
             } else {
                 skip_entry_data(&mut reader, header.filesize)
@@ -628,7 +557,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             )
             .map_err(UpdateEngineError::Storage)?;
 
-        // Cleanup staging payload metadata while retaining reservation (AC6, AR-08)
+        // Cleanup staging payload metadata while retaining preallocated reservation
         let _ = self.storage.cleanup();
 
         Ok(())
@@ -1030,13 +959,13 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             )
             .map_err(UpdateEngineError::Storage)?;
 
-        // Staging cleanup resets payload metadata without unlinking or shrinking the reservation (AC6)
+        // Staging cleanup resets payload metadata without unlinking or shrinking the reservation
         self.storage.cleanup().map_err(UpdateEngineError::Storage)?;
 
         Ok(())
     }
 
-    /// Aborts or resets any active/failed update transaction to Idle without reducing reservation (AC6).
+    /// Aborts or resets any active/failed update transaction to Idle without reducing reservation.
     pub fn abort(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
         self.journal
             .commit_state(UpdateTransactionState::Idle, None, None, 0, None, None)
