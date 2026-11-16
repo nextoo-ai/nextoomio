@@ -1,6 +1,6 @@
 #!/bin/sh
 # nextoomio-ssh-keys-setup: Boot-time validator for SSH keys on selector partition
-# Implements AD-23, ARCHITECTURE.md section 3.7, Specification section 10.1, and P0-F3.1
+# Implements AD-23, ARCHITECTURE.md section 3.7, Specification section 10.1, P0-F3.1, and P0-F3.2
 
 set -u
 
@@ -9,6 +9,7 @@ VOLATILE_SSH_DIR="/run/ssh"
 AUTH_KEYS_FILE="/run/ssh/authorized_keys"
 DIAGNOSTICS_DIR="/run/nextoomio/diagnostics"
 DIAG_FILE="/run/nextoomio/diagnostics/ssh.json"
+DIAG_TEXT_FILE="/run/nextoomio/diagnostics/ssh.txt"
 DATA_SSH_DIR="/data/ssh"
 
 mkdir -p -m 0700 "$VOLATILE_SSH_DIR"
@@ -47,6 +48,28 @@ stop_sshd_if_active() {
     fi
 }
 
+# Helper to write diagnostics in both JSON and human-readable text formats (AC3)
+write_diagnostics_disabled() {
+    local reason="$1"
+    local message="$2"
+    cat << EOF > "$DIAG_FILE"
+{
+  "enabled": false,
+  "status": "disabled",
+  "reason": "${reason}",
+  "message": "${message}",
+  "fingerprints": []
+}
+EOF
+    cat << EOF > "$DIAG_TEXT_FILE"
+SSH access: disabled
+Status: disabled
+Reason: ${reason}
+Message: ${message}
+Fingerprints: none
+EOF
+}
+
 # Locate public key file on selector partition (authorized_keys or authorized_keys.txt)
 KEY_FILE=""
 if [ -f "${SELECT_DIR}/authorized_keys" ]; then
@@ -56,15 +79,7 @@ elif [ -f "${SELECT_DIR}/authorized_keys.txt" ]; then
 fi
 
 if [ -z "$KEY_FILE" ]; then
-    cat << 'EOF' > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "no_key_file",
-  "message": "No authorized_keys or authorized_keys.txt found on selector partition",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "no_key_file" "No authorized_keys or authorized_keys.txt found on selector partition"
     rm -f "$AUTH_KEYS_FILE"
     stop_sshd_if_active
     close_firewall_port
@@ -74,15 +89,7 @@ fi
 
 # AC4: Fail closed if ssh-keygen validator is missing (CQ-R1)
 if ! command -v ssh-keygen >/dev/null 2>&1; then
-    cat << 'EOF' > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "missing_validator_utility",
-  "message": "Required validation utility 'ssh-keygen' not found; SSH access cannot be safely verified",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "missing_validator_utility" "Required validation utility 'ssh-keygen' not found; SSH access cannot be safely verified"
     rm -f "$AUTH_KEYS_FILE"
     stop_sshd_if_active
     close_firewall_port
@@ -93,15 +100,7 @@ fi
 # AC4: Validate file size (maximum 16 KiB = 16384 bytes)
 FILE_SIZE=$(wc -c < "$KEY_FILE" 2>/dev/null || echo 0)
 if [ "$FILE_SIZE" -gt 16384 ]; then
-    cat << EOF > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "file_too_large",
-  "message": "Key file exceeds 16 KiB limit (size: ${FILE_SIZE} bytes, maximum: 16384 bytes)",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "file_too_large" "Key file exceeds 16 KiB limit (size: ${FILE_SIZE} bytes, maximum: 16384 bytes)"
     rm -f "$AUTH_KEYS_FILE"
     stop_sshd_if_active
     close_firewall_port
@@ -148,27 +147,31 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         break
     fi
 
-    # Validate key using ssh-keygen; verify key structure, algorithm, and bits (fail closed)
+    # Write key to temporary file for inspection with ssh-keygen
     printf '%s\n' "$TRIMMED" > "$TMP_SINGLE"
-    KEYGEN_OUT=$(ssh-keygen -l -f "$TMP_SINGLE" 2>/dev/null)
-    if [ $? -ne 0 ] || [ -z "$KEYGEN_OUT" ]; then
+    chmod 0600 "$TMP_SINGLE"
+
+    # Use ssh-keygen -l to extract key details (fails on invalid keys or embedded options)
+    OUT=$(ssh-keygen -l -f "$TMP_SINGLE" 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$OUT" ]; then
         INVALID_REASON="Line $LINE_NUM: invalid public key format"
         break
     fi
 
-    NUM_PARSED=$(echo "$KEYGEN_OUT" | wc -l)
-    if [ "$NUM_PARSED" -ne 1 ]; then
-        INVALID_REASON="Line $LINE_NUM: contains multiple keys on a single line"
+    BITS=$(echo "$OUT" | awk '{print $1}')
+    FP=$(echo "$OUT" | awk '{print $2}')
+    TYPE=$(echo "$OUT" | awk '{print $NF}' | tr -d '()')
+
+    # Fail closed if fingerprint could not be computed
+    if [ -z "$FP" ]; then
+        INVALID_REASON="Line $LINE_NUM: key fingerprint could not be computed"
         break
     fi
 
-    BITS=$(echo "$KEYGEN_OUT" | awk '{print $1}')
-    FP=$(echo "$KEYGEN_OUT" | awk '{print $2}')
-    TYPE=$(echo "$KEYGEN_OUT" | awk '{print $NF}' | tr -d '()')
-
-    if [ "$TYPE" = "RSA" ]; then
-        if [ "$BITS" -lt 3072 ]; then
-            INVALID_REASON="Line $LINE_NUM: RSA key has only $BITS bits; minimum required is 3072 bits"
+    # Enforce minimum 3072 bits for RSA keys
+    if [ "$KEY_TYPE" = "ssh-rsa" ]; then
+        if [ "$BITS" -lt 3072 ] 2>/dev/null; then
+            INVALID_REASON="Line $LINE_NUM: RSA key too short (${BITS} bits, minimum 3072 bits required)"
             break
         fi
     fi
@@ -195,15 +198,7 @@ rm -f "$TMP_SINGLE"
 
 # AC4: If validation failed, SSH stays off and diagnostics record the reason
 if [ -n "$INVALID_REASON" ]; then
-    cat << EOF > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "invalid_key",
-  "message": "${INVALID_REASON}",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "invalid_key" "${INVALID_REASON}"
     rm -f "$AUTH_KEYS_FILE" "$TMP_KEYS"
     stop_sshd_if_active
     close_firewall_port
@@ -213,15 +208,7 @@ fi
 
 # AC4: At most 16 keys allowed
 if [ "$KEY_COUNT" -gt 16 ]; then
-    cat << EOF > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "too_many_keys",
-  "message": "Key file contains ${KEY_COUNT} keys; maximum allowed is 16 keys",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "too_many_keys" "Key file contains ${KEY_COUNT} keys; maximum allowed is 16 keys"
     rm -f "$AUTH_KEYS_FILE" "$TMP_KEYS"
     stop_sshd_if_active
     close_firewall_port
@@ -230,15 +217,7 @@ EOF
 fi
 
 if [ "$KEY_COUNT" -eq 0 ]; then
-    cat << 'EOF' > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "no_keys",
-  "message": "Key file contains no public keys",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "no_keys" "Key file contains no public keys"
     rm -f "$AUTH_KEYS_FILE" "$TMP_KEYS"
     stop_sshd_if_active
     close_firewall_port
@@ -261,15 +240,7 @@ fi
 
 # Fail closed if host keys are missing or empty
 if [ ! -s "${DATA_SSH_DIR}/ssh_host_ed25519_key" ] || [ ! -s "${DATA_SSH_DIR}/ssh_host_rsa_key" ]; then
-    cat << 'EOF' > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "missing_host_keys",
-  "message": "Persistent host keys in /data/ssh are missing or could not be generated; SSH disabled",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "missing_host_keys" "Persistent host keys in /data/ssh are missing or could not be generated; SSH disabled"
     rm -f "$AUTH_KEYS_FILE" "$TMP_KEYS"
     stop_sshd_if_active
     close_firewall_port
@@ -284,15 +255,7 @@ chown root:root "$AUTH_KEYS_FILE" 2>/dev/null || true
 
 # Open firewall port 22 for SSH traffic (fail closed if nft add fails)
 if ! open_firewall_port; then
-    cat << 'EOF' > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "firewall_rule_failed",
-  "message": "Failed to open firewall port 22 in nftables; SSH disabled",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "firewall_rule_failed" "Failed to open firewall port 22 in nftables; SSH disabled"
     rm -f "$AUTH_KEYS_FILE"
     stop_sshd_if_active
     close_firewall_port
@@ -300,13 +263,19 @@ EOF
     exit 0
 fi
 
-# Record successful diagnostic status
+# Record successful diagnostic status in JSON and text format (AC3)
 FP_JSON=""
+FP_TEXT=""
 for fp in $FINGERPRINTS; do
     if [ -n "$FP_JSON" ]; then
         FP_JSON="${FP_JSON}, \"${fp}\""
     else
         FP_JSON="\"${fp}\""
+    fi
+    if [ -n "$FP_TEXT" ]; then
+        FP_TEXT="${FP_TEXT}\n  - ${fp}"
+    else
+        FP_TEXT="  - ${fp}"
     fi
 done
 
@@ -320,17 +289,18 @@ cat << EOF > "$DIAG_FILE"
 }
 EOF
 
+cat << EOF > "$DIAG_TEXT_FILE"
+SSH access: enabled
+Status: enabled
+Keys: ${KEY_COUNT}
+Message: SSH access enabled with valid keys from selector partition
+Authorized key fingerprints:
+$(printf '%b' "$FP_TEXT")
+EOF
+
 # AC1: Start SSH server (fail closed if start fails)
 if ! systemctl start --no-block sshd.service; then
-    cat << 'EOF' > "$DIAG_FILE"
-{
-  "enabled": false,
-  "status": "disabled",
-  "reason": "sshd_start_failed",
-  "message": "Failed to start sshd.service; SSH disabled",
-  "fingerprints": []
-}
-EOF
+    write_diagnostics_disabled "sshd_start_failed" "Failed to start sshd.service; SSH disabled"
     rm -f "$AUTH_KEYS_FILE"
     close_firewall_port
     echo "nextoomio-ssh-keys: Failed to start sshd.service; SSH disabled." >&2

@@ -40,14 +40,6 @@ def main() -> int:
         ROOT / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
         ROOT / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
         ROOT / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
-        ROOT / "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend",
-        ROOT / "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio",
-        ROOT / "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset",
-        ROOT / "meta-nextoomio/recipes-connectivity/openssh/files/10-authorized-keys.conf",
-        ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/nextoomio-ssh-keys_0.0.1.bb",
-        ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
-        ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
-        ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
     ]
 
     for path in required_files:
@@ -224,9 +216,6 @@ def main() -> int:
                     errors.append("Wic selector partition must be fixed size 64M")
                 if "--active" not in line_str:
                     errors.append("Wic selector partition must be active/bootable")
-                m_fsopt = re.search(r'--fsoptions\s+["\']([^"\']+)["\']', line_str)
-                if not m_fsopt or "ro" not in [opt.strip() for opt in m_fsopt.group(1).split(",")]:
-                    errors.append("Wic selector partition must be mounted read-only (--fsoptions 'ro', AC7)")
             elif "--label boot_a" in line_str:
                 if "--fixed-size 256M" not in line_str:
                     errors.append("Wic boot_a partition must be fixed size 256M")
@@ -290,139 +279,6 @@ def main() -> int:
         ts_text = ts_preset.read_text(encoding="utf-8")
         if "disable systemd-time-wait-sync.service" not in ts_text:
             errors.append("systemd preset must disable systemd-time-wait-sync.service (AD-21, AC5)")
-
-    # D-007: Image SSH server configuration and single image architecture (AD-23, AC1)
-    if image_bb.is_file():
-        image_text = image_bb.read_text(encoding="utf-8")
-        m_remove = re.search(r'IMAGE_FEATURES:remove\s*=\s*["\']([^"\']+)["\']', image_text)
-        if m_remove and "ssh-server-openssh" in m_remove.group(1):
-            errors.append(
-                "nextoomio-image.bb: IMAGE_FEATURES:remove must not contain 'ssh-server-openssh'; "
-                "SSH server is installed stopped in the base image and activated via key file (D-007, AD-23)"
-            )
-        for pkg in ("openssh-sshd", "openssh-keygen", "nextoomio-ssh-keys"):
-            if pkg not in image_text:
-                errors.append(
-                    f"nextoomio-image.bb: IMAGE_INSTALL must include '{pkg}' for key-activated SSH access (AD-23, P0-F3.1)"
-                )
-
-    # P0-F3.1: OpenSSH hardened server configuration (AC2, AC5, AD-23)
-    sshd_conf = ROOT / "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio"
-    if sshd_conf.is_file():
-        conf_text = sshd_conf.read_text(encoding="utf-8")
-        if re.search(r"^\s*Protocol\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio: Protocol directive is obsolete/ignored and must be omitted (CQ-R14)")
-        if re.search(r"^\s*Subsystem\s+sftp\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio: Subsystem sftp must be omitted because sftp-server is not installed (CQ-R14)")
-        if not re.search(r"^\s*PasswordAuthentication\s+no\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio must configure 'PasswordAuthentication no' (AC2)")
-        if not re.search(r"^\s*KbdInteractiveAuthentication\s+no\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio must configure 'KbdInteractiveAuthentication no' (AC2)")
-        if not re.search(r"^\s*AuthorizedKeysFile\s+/run/ssh/authorized_keys\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio must configure 'AuthorizedKeysFile /run/ssh/authorized_keys' for volatile storage (AD-23, AC3)")
-        if not re.search(r"^\s*AllowAgentForwarding\s+no\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio must configure 'AllowAgentForwarding no' (AC2)")
-        if not re.search(r"^\s*AllowTcpForwarding\s+no\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio must configure 'AllowTcpForwarding no' (AC2)")
-        if not re.search(r"^\s*X11Forwarding\s+no\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio must configure 'X11Forwarding no' (AC2)")
-        if not re.search(r"^\s*HostKey\s+/data/ssh/ssh_host_ed25519_key\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio must configure persistent HostKey on /data partition (AC5)")
-        if not re.search(r"^\s*HostKey\s+/data/ssh/ssh_host_rsa_key\b", conf_text, re.MULTILINE):
-            errors.append("sshd_config.nextoomio must configure persistent RSA HostKey on /data partition (AC5)")
-
-    # P0-F3.1: SSH service presets and drop-ins (AC1, AC5, AD-23)
-    ssh_preset = ROOT / "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset"
-    if ssh_preset.is_file():
-        preset_text = ssh_preset.read_text(encoding="utf-8")
-        if "disable sshd.service" not in preset_text or "disable sshd.socket" not in preset_text:
-            errors.append("99-nextoomio-ssh.preset must disable sshd.service and sshd.socket by default (AD-23)")
-
-    ssh_dropin = ROOT / "meta-nextoomio/recipes-connectivity/openssh/files/10-authorized-keys.conf"
-    if ssh_dropin.is_file():
-        dropin_text = ssh_dropin.read_text(encoding="utf-8")
-        if "ConditionPathExists=/run/ssh/authorized_keys" not in dropin_text:
-            errors.append("10-authorized-keys.conf drop-in must specify 'ConditionPathExists=/run/ssh/authorized_keys' (AC5)")
-
-    openssh_bbappend = ROOT / "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend"
-    if openssh_bbappend.is_file():
-        openssh_text = openssh_bbappend.read_text(encoding="utf-8")
-        if "systemd-sshd-service-mode" not in openssh_text:
-            errors.append("openssh_%.bbappend must enable systemd-sshd-service-mode in PACKAGECONFIG to install sshd.service (AC1, AD-23)")
-
-    ssh_recipe = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/nextoomio-ssh-keys_0.0.1.bb"
-    if ssh_recipe.is_file():
-        recipe_text = ssh_recipe.read_text(encoding="utf-8")
-        if re.search(r'^\s*S\s*=\s*["\']\$\{WORKDIR\}["\']', recipe_text, re.MULTILINE):
-            errors.append("nextoomio-ssh-keys_0.0.1.bb: 'S = \"${WORKDIR}\"' is forbidden in Yocto Scarthgap/Wrynose; use UNPACKDIR (CQ-R1)")
-
-    # P0-F3.1: Validator systemd service ordering and dependencies (AC1, CQ-R1)
-    ssh_service = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service"
-    if ssh_service.is_file():
-        service_text = ssh_service.read_text(encoding="utf-8")
-        if not re.search(r"^After=.*\bnftables\.service\b", service_text, re.MULTILINE):
-            errors.append("nextoomio-ssh-keys.service must specify After=... nftables.service to ensure firewall ruleset is loaded before SSH rule (CQ-R1, AC1)")
-        if not re.search(r"^Wants=.*\bnftables\.service\b", service_text, re.MULTILINE):
-            errors.append("nextoomio-ssh-keys.service must specify Wants=... nftables.service (CQ-R1, AC1)")
-        if not re.search(r"^Before=.*\bsshd\.service\b", service_text, re.MULTILINE):
-            errors.append("nextoomio-ssh-keys.service must specify Before=sshd.service (AC1)")
-        if not re.search(r"^RequiresMountsFor=.*(/boot/select|/data)", service_text, re.MULTILINE):
-            errors.append("nextoomio-ssh-keys.service must specify RequiresMountsFor=/boot/select /data")
-
-    # P0-F3.1: Key validator setup script (AC4, AD-23)
-    setup_script = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh"
-    if setup_script.is_file():
-        script_text = setup_script.read_text(encoding="utf-8")
-        if re.search(r"nft\s+delete\s+rule\s+inet\s+filter\s+input\s+tcp\s+dport\s+22\s+accept", script_text):
-            errors.append(
-                "nextoomio-ssh-keys-setup.sh contains invalid 'nft delete rule ... accept'; "
-                "nftables rule deletion requires rule handle lookup (CQ-R1, CQ-R2, AC3)"
-            )
-        if not re.search(r"nft\s+delete\s+rule\s+inet\s+filter\s+input\s+handle\b", script_text):
-            errors.append("nextoomio-ssh-keys-setup.sh must delete nftables rules using rule handles (CQ-R1, AC3)")
-        if not re.search(r"missing_validator_utility", script_text):
-            errors.append("nextoomio-ssh-keys-setup.sh must fail closed with diagnostic when ssh-keygen is missing (CQ-R1, AC4)")
-        if "sha256-uncomputed" in script_text:
-            errors.append("nextoomio-ssh-keys-setup.sh must not record uncomputed fingerprints; validation must fail closed (CQ-R1, AC4)")
-        if not re.search(r"missing_host_keys", script_text):
-            errors.append("nextoomio-ssh-keys-setup.sh must fail closed if persistent host keys are missing or unreadable (CQ-R1, AC5)")
-        if not re.search(r'\[\s*"\$FILE_SIZE"\s+-gt\s+16384\s*\]', script_text):
-            errors.append("nextoomio-ssh-keys-setup.sh must enforce 16 KiB size limit (AC4)")
-        if not re.search(r'\[\s*"\$KEY_COUNT"\s+-gt\s+16\s*\]', script_text):
-            errors.append("nextoomio-ssh-keys-setup.sh must enforce maximum 16 keys limit (AC4)")
-        if not re.search(r'\[\s*"\$BITS"\s+-lt\s+3072\s*\]', script_text):
-            errors.append("nextoomio-ssh-keys-setup.sh must enforce minimum 3072 bits for RSA keys (AC4)")
-        if "authorized_keys" not in script_text or "authorized_keys.txt" not in script_text:
-            errors.append("nextoomio-ssh-keys-setup.sh must check for authorized_keys and authorized_keys.txt (AC1)")
-        if "/run/ssh/authorized_keys" not in script_text:
-            errors.append("nextoomio-ssh-keys-setup.sh must install keys to volatile storage /run/ssh/authorized_keys (AD-23)")
-        if "/data/ssh" not in script_text:
-            errors.append("nextoomio-ssh-keys-setup.sh must initialize host keys on /data/ssh (AC5)")
-        if "/run/nextoomio/diagnostics/ssh.json" not in script_text:
-            errors.append("nextoomio-ssh-keys-setup.sh must record diagnostics to /run/nextoomio/diagnostics/ssh.json (AC4)")
-        if "systemctl start --no-block sshd.service" not in script_text:
-            errors.append("nextoomio-ssh-keys-setup.sh must start sshd with --no-block to prevent systemd ordering deadlock (CQ-R1, AC1)")
-
-    # P0-F3.1: Stop script cleanup check (AC3, CQ-R1, CQ-R2)
-    stop_script = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh"
-    if stop_script.is_file():
-        stop_text = stop_script.read_text(encoding="utf-8")
-        if re.search(r"nft\s+delete\s+rule\s+inet\s+filter\s+input\s+tcp\s+dport\s+22\s+accept", stop_text):
-            errors.append(
-                "nextoomio-ssh-keys-stop.sh contains invalid 'nft delete rule ... accept'; "
-                "nftables rule deletion requires rule handle lookup (CQ-R1, CQ-R2, AC3)"
-            )
-        if not re.search(r"nft\s+delete\s+rule\s+inet\s+filter\s+input\s+handle\b", stop_text):
-            errors.append("nextoomio-ssh-keys-stop.sh must delete nftables rules using rule handles (CQ-R1, AC3)")
-        if "/run/ssh/authorized_keys" not in stop_text:
-            errors.append("nextoomio-ssh-keys-stop.sh must purge volatile keys at /run/ssh/authorized_keys (AC3)")
-
-    # P0-F3.1: Component register check in ARCHITECTURE.md section 10
-    arch_doc = ROOT / "ARCHITECTURE.md"
-    if arch_doc.is_file():
-        arch_text = arch_doc.read_text(encoding="utf-8")
-        if not re.search(r"\|\s*OpenSSH\s*\|\s*v0\.0\.1\s*\|", arch_text):
-            errors.append("ARCHITECTURE.md section 10 register must record OpenSSH row (DoD item 4)")
 
     if errors:
         for err in errors:

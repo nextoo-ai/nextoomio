@@ -1,5 +1,5 @@
 SUMMARY = "nextoomio boot-time SSH key validator and service manager"
-DESCRIPTION = "Validates developer public keys on selector partition, manages volatile authorized_keys, initializes persistent host keys on data partition, and activates sshd service (AD-23, ARCHITECTURE.md section 3.7, P0-F3.1)"
+DESCRIPTION = "Validates developer public keys on selector partition, manages volatile authorized_keys, initializes persistent host keys on data partition, and activates sshd service (AD-23, ARCHITECTURE.md section 3.7, P0-F3.1, P0-F3.2)"
 LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10"
 
@@ -11,8 +11,7 @@ SRC_URI = " \
     file://nextoomio-ssh-keys-stop.sh \
 "
 
-S = "${WORKDIR}/sources"
-UNPACKDIR = "${S}"
+S = "${UNPACKDIR}"
 
 do_install() {
     install -d ${D}${sbindir}

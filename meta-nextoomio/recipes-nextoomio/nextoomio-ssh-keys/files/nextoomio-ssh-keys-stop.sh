@@ -24,3 +24,11 @@ cat << 'EOF' > /run/nextoomio/diagnostics/ssh.json
   "fingerprints": []
 }
 EOF
+
+cat << 'EOF' > /run/nextoomio/diagnostics/ssh.txt
+SSH access: disabled
+Status: disabled
+Reason: service_stopped
+Message: SSH service stopped and volatile authorized_keys cleared
+Fingerprints: none
+EOF
