@@ -7,25 +7,6 @@ software =
     config-schema-min = "1";
     config-schema-max = "1";
 
-    images: (
-        {
-            filename = "@BOOT_PKG_FILE@";
-            device = "/dev/mmcblk0p2";
-            type = "raw";
-            compressed = "zlib";
-            sha256 = "@BOOT_SHA256@";
-            installed-directly = true;
-        },
-        {
-            filename = "@ROOT_PKG_FILE@";
-            device = "/dev/mmcblk0p5";
-            type = "raw";
-            compressed = "zlib";
-            sha256 = "@ROOT_SHA256@";
-            installed-directly = true;
-        }
-    );
-
     stable = {
         copy1 = {
             images: (

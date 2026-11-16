@@ -14,13 +14,12 @@ NEXTOOMIO_BOOT_SLOT_MAXSIZE ?= "268435456"
 NEXTOOMIO_ROOT_SLOT_MAXSIZE ?= "3221225472"
 NEXTOOMIO_STAGING_RESERVATION_MAXSIZE ?= "1073741824"
 NEXTOOMIO_CONFIG_SCHEMA_RANGE ?= "1..1"
-NEXTOOMIO_HW_COMPATIBILITY ?= "${MACHINE}"
+NEXTOOMIO_HW_REVISION ?= "1.0"
+NEXTOOMIO_HW_COMPATIBILITY ?= "${NEXTOOMIO_HW_REVISION}"
 
 # Path to sw-description template file (AC1, AC4)
 SWUPDATE_DESCRIPTION_TEMPLATE ?= "${META_NEXTOOMIO_DIR}/recipes-support/swupdate/files/sw-description.in"
-
-# Require no signing keys or signatures per UPD-03 and AC2
-SWUPDATE_SIGNING = ""
+do_image_swu[file-checksums] += "${SWUPDATE_DESCRIPTION_TEMPLATE}:True"
 
 do_image_swu[depends] += " \
     dosfstools-native:do_populate_sysroot \

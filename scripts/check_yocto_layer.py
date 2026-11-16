@@ -666,9 +666,21 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append(
                 "image_types_nextoomio.bbclass must enforce NEXTOOMIO_STAGING_RESERVATION_MAXSIZE = 1073741824 (1 GiB, AC3)"
             )
-        if "SWUPDATE_SIGNING" not in class_text or re.search(r'SWUPDATE_SIGNING\s*=\s*["\'](?!["\'])', class_text):
+        if "NEXTOOMIO_HW_REVISION" not in class_text or "1.0" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must declare NEXTOOMIO_HW_REVISION = '1.0' (AC1, ARCHITECTURE.md 3.6)")
+        if "NEXTOOMIO_HW_COMPATIBILITY" not in class_text or "${NEXTOOMIO_HW_REVISION}" not in class_text:
             errors.append(
-                "image_types_nextoomio.bbclass must set SWUPDATE_SIGNING = \"\" (signing disabled per UPD-03, AC2)"
+                "image_types_nextoomio.bbclass must set NEXTOOMIO_HW_COMPATIBILITY to revision variable "
+                "${NEXTOOMIO_HW_REVISION} (AC1, CQ-R1)"
+            )
+        if "sw-description.sig" in class_text:
+            errors.append("image_types_nextoomio.bbclass must not package sw-description.sig (unsigned updates per UPD-03, AC2)")
+        if "SWUPDATE_SIGNING" in class_text:
+            errors.append("image_types_nextoomio.bbclass must not set unused SWUPDATE_SIGNING (CQ-R14)")
+        if "do_image_swu[file-checksums]" not in class_text or "SWUPDATE_DESCRIPTION_TEMPLATE" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass: do_image_swu[file-checksums] must track SWUPDATE_DESCRIPTION_TEMPLATE "
+                "to re-run image creation on template edits (CQ-R1)"
             )
         for limit_check in ("BOOT_EXPANDED_SIZE", "ROOT_EXPANDED_SIZE", "SWU_SIZE"):
             if limit_check not in class_text:
@@ -705,8 +717,15 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         desc_text = sw_desc.read_text(encoding="utf-8")
         if "@DISTRO_VERSION@" not in desc_text and not re.search(r'version\s*=\s*["\']0\.0\.1-dev["\']', desc_text):
             errors.append("sw-description.in must declare version using @DISTRO_VERSION@ (AC1, AC4)")
-        if "hardware-compatibility" not in desc_text or ("@HW_COMPATIBILITY@" not in desc_text and "raspberrypi4-64" not in desc_text):
-            errors.append("sw-description.in must declare hardware-compatibility containing @HW_COMPATIBILITY@ or 'raspberrypi4-64' (AC1)")
+        if "hardware-compatibility" not in desc_text or "@HW_COMPATIBILITY@" not in desc_text:
+            errors.append("sw-description.in must declare hardware-compatibility containing @HW_COMPATIBILITY@ (AC1)")
+        idx_stable = desc_text.find("stable")
+        idx_images = desc_text.find("images:")
+        if (idx_images != -1 and (idx_stable == -1 or idx_images < idx_stable)) or desc_text.count("images:") > 2:
+            errors.append(
+                "meta-nextoomio/recipes-support/swupdate/files/sw-description.in: top-level images list "
+                "must be removed so images only apply inside stable.copy1 and stable.copy2 (CQ-R1, CQ-R14)"
+            )
         if "config-schema-range" not in desc_text:
             errors.append("sw-description.in must declare readable config-schema-range (AC1)")
         if "sha256" not in desc_text:
@@ -723,10 +742,19 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     sw_bbappend = root / "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend"
     if sw_bbappend.is_file():
         app_text = sw_bbappend.read_text(encoding="utf-8")
-        if 'SWUPDATE_SIGNING = ""' not in app_text:
-            errors.append("swupdate_%.bbappend must set SWUPDATE_SIGNING = \"\" (UPD-03, AC2)")
+        if "SWUPDATE_SIGNING" in app_text:
+            errors.append("swupdate_%.bbappend must not set unused SWUPDATE_SIGNING (CQ-R14)")
         if "swupdate.cfg" not in app_text or "hwrevision" not in app_text:
             errors.append("swupdate_%.bbappend must install swupdate.cfg and hwrevision")
+
+    sw_cfg = root / "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg"
+    if sw_cfg.is_file():
+        cfg_text = sw_cfg.read_text(encoding="utf-8")
+        if "identify" in cfg_text:
+            errors.append(
+                "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg: identify section must be omitted "
+                "because it is only for Hawkbit/REST identify values and unused (CQ-R14)"
+            )
 
     hwrev_file = root / "meta-nextoomio/recipes-support/swupdate/files/hwrevision"
     if hwrev_file.is_file():
@@ -1033,12 +1061,13 @@ def run_self_tests() -> int:
         class_p.write_text(orig_class, encoding="utf-8")
         print("  test_check_fails_when_size_limits_missing_or_altered: OK")
 
-        # 23. AC2: Fail when SWUPDATE_SIGNING is enabled
-        class_p.write_text(orig_class.replace('SWUPDATE_SIGNING = ""', 'SWUPDATE_SIGNING = "RSA"'), encoding="utf-8")
+        # 23. AC2: Fail when sw-description.sig signature file is packaged
+        sig_class = orig_class.replace('for f in sw-description', 'for f in sw-description sw-description.sig')
+        class_p.write_text(sig_class, encoding="utf-8")
         errs = validate_layer(tmp_root)
-        assert any("SWUPDATE_SIGNING" in e for e in errs), f"Expected SWUPDATE_SIGNING failure: {errs}"
+        assert any("sw-description.sig" in e for e in errs), f"Expected sw-description.sig failure: {errs}"
         class_p.write_text(orig_class, encoding="utf-8")
-        print("  test_check_fails_when_swupdate_signing_enabled: OK")
+        print("  test_check_fails_when_sw_description_sig_packaged: OK")
 
         # 24. AC5: Fail when *.swu artifact upload is missing from yocto-build.yml
         wf_p = tmp_root / ".github/workflows/yocto-build.yml"
@@ -1084,6 +1113,14 @@ def run_self_tests() -> int:
         assert any("competing producer" in e for e in errs), f"Expected competing recipe failure: {errs}"
         competing_bb.unlink()
         print("  test_check_fails_when_competing_update_image_recipe_present: OK")
+
+        # 29. CQ-R1 / Finding 2: Fail when sw-description.in has top-level images list
+        bad_sw_desc = orig_sw_desc.replace('stable = {', 'images: (\n        {\n            filename = "bad";\n        }\n    );\n\n    stable = {')
+        sw_desc_p.write_text(bad_sw_desc, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("top-level images list" in e for e in errs), f"Expected top-level images failure: {errs}"
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_has_top_level_images: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0
