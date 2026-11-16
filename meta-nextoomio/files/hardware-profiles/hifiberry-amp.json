@@ -5,7 +5,7 @@
   "dtoverlay": "hifiberry-amp",
   "dtoverlay_params": [],
   "alsa_mixer_control": "Master",
-  "fixed_hardware_mixer_percent": 100,
+  "fixed_hardware_mixer_percent": 30,
   "default_logical_volume_percent": 30,
   "sample_rate_hz": 48000,
   "sample_formats": ["S24_LE", "S32_LE"],
