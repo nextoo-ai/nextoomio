@@ -91,6 +91,11 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py",
+        root / "scripts/bench/tone-check.sh",
+        root / "scripts/bench/deploy.sh",
     ]
 
     for path in required_files:
@@ -274,6 +279,11 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append(
                 "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
                 "must include 'nextoomio-audio-profile' (D-011, D-012, P0-F6.1)"
+            )
+        if "nextoomio-tone-check" not in image_text:
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
+                "must include 'nextoomio-tone-check' (P0-F6.2)"
             )
 
     # Wic layout verification (ARCHITECTURE.md section 3.6, AC2, AC4, AC5)
@@ -622,6 +632,55 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if "/run/nextoomio/diagnostics/audio.txt" not in sh_text:
             errors.append("nextoomio-audio-profile-setup.sh must record diagnostics text to /run/nextoomio/diagnostics/audio.txt")
 
+    # P0-F6.2 / D-012: Validate nextoomio-tone-check recipe, script, and safe tone generation
+    tc_bb = root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb"
+    if tc_bb.is_file():
+        tc_text = tc_bb.read_text(encoding="utf-8")
+        if "generate-tone.py" not in tc_text:
+            errors.append("nextoomio-tone-check_0.0.1.bb must execute generate-tone.py to generate safe test tone (AC2, D-012)")
+        if "test-tone-48k-440hz.wav" not in tc_text:
+            errors.append("nextoomio-tone-check_0.0.1.bb must install test-tone-48k-440hz.wav (AC1, AC2)")
+        if "nextoomio-tone-check" not in tc_text:
+            errors.append("nextoomio-tone-check_0.0.1.bb must install nextoomio-tone-check command (AC1)")
+        if "alsa-utils" not in tc_text:
+            errors.append("nextoomio-tone-check_0.0.1.bb must declare RDEPENDS with alsa-utils (AC1)")
+
+    gen_tone = root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py"
+    if gen_tone.is_file():
+        gen_text = gen_tone.read_text(encoding="utf-8")
+        m_vol = re.search(r"MAX_LOGICAL_VOLUME_PCT\s*=\s*([0-9]+(?:\.[0-9]+)?)", gen_text)
+        if not m_vol or float(m_vol.group(1)) > 30.0:
+            errors.append("generate-tone.py must enforce 30% logical volume limit (linear gain <= 0.027, AC2, D-012)")
+        elif "0.027" not in gen_text:
+            errors.append("generate-tone.py must enforce cubic gain amplitude (linear gain <= 0.027, AC2, D-012)")
+
+    tc_sh = root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh"
+    if tc_sh.is_file():
+        tc_sh_text = tc_sh.read_text(encoding="utf-8")
+        if "sound_card_absent" not in tc_sh_text or "exit 2" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must detect absent sound card and exit with code 2 (AC3)")
+        if "playback_device_busy" not in tc_sh_text or "exit 3" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must detect busy playback device and exit with code 3 (AC3)")
+        if "trap" not in tc_sh_text or "cleanup" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must configure signal/exit cleanup trap (AC4)")
+        if "state:[[:space:]]*RUNNING" not in tc_sh_text and "state: RUNNING" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must verify stream RUNNING state from ALSA status file (AC1)")
+        if "hw_ptr" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must verify hardware position advancement via hw_ptr (AC1)")
+
+    # P0-F6.2 AC5: Validate deploy.sh and tone-check.sh bench scripts
+    bench_deploy = root / "scripts/bench/deploy.sh"
+    if bench_deploy.is_file():
+        deploy_text = bench_deploy.read_text(encoding="utf-8")
+        if "--tone-check" not in deploy_text:
+            errors.append("scripts/bench/deploy.sh must support --tone-check as optional post-deploy step (AC5)")
+
+    bench_tc = root / "scripts/bench/tone-check.sh"
+    if bench_tc.is_file():
+        btc_text = bench_tc.read_text(encoding="utf-8")
+        if "nextoomio-tone-check" not in btc_text:
+            errors.append("scripts/bench/tone-check.sh must invoke nextoomio-tone-check on bench host (AC1, AC5)")
+
     # Component register check in ARCHITECTURE.md section 10
     arch_doc = root / "ARCHITECTURE.md"
     if arch_doc.is_file():
@@ -686,6 +745,11 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py",
+        "scripts/bench/tone-check.sh",
+        "scripts/bench/deploy.sh",
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
     ]
@@ -856,6 +920,49 @@ def run_self_tests() -> int:
         ap_bb_path.write_text(orig_ap_bb, encoding="utf-8")
         print("  test_check_fails_when_do_compile_derives_invalid_overlay: OK")
 
+        # 18. AC1 / P0-F6.2: Fail when nextoomio-image.bb missing nextoomio-tone-check in IMAGE_INSTALL
+        img_bb_path = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_img_bb = img_bb_path.read_text(encoding="utf-8")
+        img_bb_path.write_text(orig_img_bb.replace("nextoomio-tone-check", "ignored-pkg"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_INSTALL must include 'nextoomio-tone-check'" in e for e in errs), f"Expected tone check in IMAGE_INSTALL failure: {errs}"
+        img_bb_path.write_text(orig_img_bb, encoding="utf-8")
+        print("  test_check_fails_when_image_missing_tone_check: OK")
+
+        # 19. AC2 / D-012: Fail when generate-tone.py omits safe 30% volume limit
+        gt_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py"
+        orig_gt = gt_path.read_text(encoding="utf-8")
+        gt_path.write_text(orig_gt.replace("MAX_LOGICAL_VOLUME_PCT = 30.0", "MAX_LOGICAL_VOLUME_PCT = 100.0").replace("0.027", "1.0"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("generate-tone.py must enforce 30% logical volume limit" in e for e in errs), f"Expected safe volume failure: {errs}"
+        gt_path.write_text(orig_gt, encoding="utf-8")
+        print("  test_check_fails_when_tone_generator_omits_safe_volume: OK")
+
+        # 20. AC3: Fail when nextoomio-tone-check.sh omits absent sound card detection or code 2
+        tc_sh_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh"
+        orig_tc_sh = tc_sh_path.read_text(encoding="utf-8")
+        tc_sh_path.write_text(orig_tc_sh.replace("sound_card_absent", "card_missing").replace("exit 2", "exit 1"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must detect absent sound card and exit with code 2" in e for e in errs), f"Expected absent card failure: {errs}"
+        tc_sh_path.write_text(orig_tc_sh, encoding="utf-8")
+        print("  test_check_fails_when_tone_check_omits_absent_card_detection: OK")
+
+        # 21. AC3: Fail when nextoomio-tone-check.sh omits busy device detection or code 3
+        tc_sh_path.write_text(orig_tc_sh.replace("playback_device_busy", "pcm_busy").replace("exit 3", "exit 1"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must detect busy playback device and exit with code 3" in e for e in errs), f"Expected busy device failure: {errs}"
+        tc_sh_path.write_text(orig_tc_sh, encoding="utf-8")
+        print("  test_check_fails_when_tone_check_omits_busy_device_detection: OK")
+
+        # 22. AC5: Fail when scripts/bench/deploy.sh omits --tone-check support
+        dep_path = tmp_root / "scripts/bench/deploy.sh"
+        orig_dep = dep_path.read_text(encoding="utf-8")
+        dep_path.write_text(orig_dep.replace("--tone-check", "--ignored-flag"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("deploy.sh must support --tone-check" in e for e in errs), f"Expected deploy tone-check failure: {errs}"
+        dep_path.write_text(orig_dep, encoding="utf-8")
+        print("  test_check_fails_when_deploy_omits_tone_check_option: OK")
+
     print("OK: all AC5 automated self-tests passed.")
     return 0
 
@@ -870,7 +977,7 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2/P0-F6.1 rules validated.")
+    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2/P0-F6.1/P0-F6.2 rules validated.")
     return 0
 
 
