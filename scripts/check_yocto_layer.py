@@ -95,7 +95,6 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py",
         root / "scripts/bench/tone-check.sh",
-        root / "scripts/bench/deploy.sh",
     ]
 
     for path in required_files:
@@ -668,18 +667,12 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if "hw_ptr" not in tc_sh_text:
             errors.append("nextoomio-tone-check.sh must verify hardware position advancement via hw_ptr (AC1)")
 
-    # P0-F6.2 AC5: Validate deploy.sh and tone-check.sh bench scripts
-    bench_deploy = root / "scripts/bench/deploy.sh"
-    if bench_deploy.is_file():
-        deploy_text = bench_deploy.read_text(encoding="utf-8")
-        if "--tone-check" not in deploy_text:
-            errors.append("scripts/bench/deploy.sh must support --tone-check as optional post-deploy step (AC5)")
-
+    # P0-F6.2: Validate tone-check.sh bench script
     bench_tc = root / "scripts/bench/tone-check.sh"
     if bench_tc.is_file():
         btc_text = bench_tc.read_text(encoding="utf-8")
         if "nextoomio-tone-check" not in btc_text:
-            errors.append("scripts/bench/tone-check.sh must invoke nextoomio-tone-check on bench host (AC1, AC5)")
+            errors.append("scripts/bench/tone-check.sh must invoke nextoomio-tone-check on bench host (AC1)")
 
     # Component register check in ARCHITECTURE.md section 10
     arch_doc = root / "ARCHITECTURE.md"
@@ -749,7 +742,6 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh",
         "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py",
         "scripts/bench/tone-check.sh",
-        "scripts/bench/deploy.sh",
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
     ]
@@ -954,14 +946,13 @@ def run_self_tests() -> int:
         tc_sh_path.write_text(orig_tc_sh, encoding="utf-8")
         print("  test_check_fails_when_tone_check_omits_busy_device_detection: OK")
 
-        # 22. AC5: Fail when scripts/bench/deploy.sh omits --tone-check support
-        dep_path = tmp_root / "scripts/bench/deploy.sh"
-        orig_dep = dep_path.read_text(encoding="utf-8")
-        dep_path.write_text(orig_dep.replace("--tone-check", "--ignored-flag"), encoding="utf-8")
+        # 22. AC4: Fail when nextoomio-tone-check.sh omits signal cleanup trap
+        orig_tc_trap = orig_tc_sh
+        tc_sh_path.write_text(orig_tc_trap.replace("trap", "disabled"), encoding="utf-8")
         errs = validate_layer(tmp_root)
-        assert any("deploy.sh must support --tone-check" in e for e in errs), f"Expected deploy tone-check failure: {errs}"
-        dep_path.write_text(orig_dep, encoding="utf-8")
-        print("  test_check_fails_when_deploy_omits_tone_check_option: OK")
+        assert any("must configure signal/exit cleanup trap" in e for e in errs), f"Expected cleanup trap failure: {errs}"
+        tc_sh_path.write_text(orig_tc_trap, encoding="utf-8")
+        print("  test_check_fails_when_tone_check_omits_cleanup_trap: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0

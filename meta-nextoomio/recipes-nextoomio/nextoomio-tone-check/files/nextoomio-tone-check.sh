@@ -5,7 +5,8 @@
 set -u
 
 PROFILE_FILE="/etc/nextoomio/hardware-profile.json"
-TONE_FILE="/usr/share/nextoomio/tone-check/test-tone-48k-440hz.wav"
+DEFAULT_TONE_FILE="/usr/share/nextoomio/tone-check/test-tone-48k-440hz.wav"
+TONE_FILE="$DEFAULT_TONE_FILE"
 PROC_ROOT="/proc"
 PLAY_CMD="aplay"
 CARD_OVERRIDE=""
@@ -16,7 +17,19 @@ DURATION_S="2.0"
 FREQUENCY_HZ="440"
 SAMPLE_RATE="48000"
 EXPECTED_FRAMES=96000
-MIN_ADVANCE_FRAMES=86400  # 90% threshold allowing for buffer drain latency
+
+# Justification of sampling tolerance (AC1, P0-F6.2):
+# - Expected tone duration: 2.000 s at 48,000 Hz = 96,000 frames.
+# - Fast polling interval: 0.1 s = 4,800 frames per poll.
+# - Start-up latency: aplay process spawn and ALSA substream trigger may consume
+#   up to one 0.1 s poll before state: RUNNING is observed (~4,800 frames).
+# - Drain latency: upon tone completion, playback process termination may occur
+#   within one 0.1 s poll after the last hardware frame (~4,800 frames).
+# - ALSA ring buffer period boundaries (typically 1024-2048 frames / 21-43 ms)
+#   quantize hw_ptr updates.
+# - Justified tolerance window: up to 2 polling intervals (9,600 frames / 10%).
+# - Minimum expected frame advance threshold: 96,000 - 9,600 = 86,400 frames.
+MIN_ADVANCE_FRAMES=86400
 
 usage() {
     cat << EOF
@@ -29,7 +42,6 @@ Options:
   --profile <file>    Hardware profile path (default: /etc/nextoomio/hardware-profile.json)
   --card <id>         Override ALSA sound card ID (default from profile: alsa_card_id)
   --device <pcm>      Override ALSA PCM device (default: plughw:<card>,0)
-  --tone-file <file>  WAV tone file to play (default: /usr/share/nextoomio/tone-check/test-tone-48k-440hz.wav)
   --proc-root <dir>   procfs root directory (default: /proc, for testing/mocking)
   --play-cmd <cmd>    Playback command (default: aplay, for testing/mocking)
   --json              Output structured JSON
@@ -41,7 +53,7 @@ Exit codes:
   2: Sound card absent (AC3)
   3: Playback device busy (AC3)
   4: Stream state or position failure (stream not RUNNING or position did not advance)
-  1: Other error (missing dependencies, unreadable files)
+  1: Other error (missing dependencies, unreadable files, invalid arguments)
 EOF
 }
 
@@ -54,14 +66,18 @@ while [ $# -gt 0 ]; do
             ;;
         --card)
             CARD_OVERRIDE="$2"
+            if ! echo "$CARD_OVERRIDE" | grep -qE '^[A-Za-z0-9_-]+$'; then
+                echo "nextoomio-tone-check: ERROR: Invalid card ID '${CARD_OVERRIDE}'. Must contain only [A-Za-z0-9_-]." >&2
+                exit 1
+            fi
             shift 2
             ;;
         --device)
             DEVICE_OVERRIDE="$2"
-            shift 2
-            ;;
-        --tone-file)
-            TONE_FILE="$2"
+            if ! echo "$DEVICE_OVERRIDE" | grep -qE '^[A-Za-z0-9_:,.-]+$'; then
+                echo "nextoomio-tone-check: ERROR: Invalid device '${DEVICE_OVERRIDE}'." >&2
+                exit 1
+            fi
             shift 2
             ;;
         --proc-root)
@@ -92,6 +108,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Safe JSON string escaping helper
+json_escape() {
+    printf '%s' "$1" | tr '\n\r\t' '   ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
 TMP_ERR=$(mktemp)
 PLAY_PID=""
 
@@ -117,6 +138,12 @@ fi
 
 if [ -z "$CARD_ID" ]; then
     CARD_ID="sndrpihifiberry"
+fi
+
+# Validate card ID format (Finding 5, CQ-R7)
+if ! echo "$CARD_ID" | grep -qE '^[A-Za-z0-9_-]+$'; then
+    echo "nextoomio-tone-check: ERROR: Invalid ALSA card ID '${CARD_ID}'." >&2
+    exit 1
 fi
 
 # AC3: Check whether sound card is present in procfs
@@ -190,10 +217,35 @@ EOF
     fi
 fi
 
-# Verify tone file exists
+# Resolve test tone file (AC2, D-012)
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+GEN_TONE="${SCRIPT_DIR}/generate-tone.py"
+if [ ! -f "$GEN_TONE" ]; then
+    GEN_TONE="${SCRIPT_DIR}/../recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py"
+fi
+
 if [ ! -f "$TONE_FILE" ]; then
-    echo "nextoomio-tone-check: ERROR: Tone file '${TONE_FILE}' not found." >&2
+    if [ -n "${NEXTOOMIO_TONE_FILE:-}" ] && [ -f "$NEXTOOMIO_TONE_FILE" ]; then
+        TONE_FILE="$NEXTOOMIO_TONE_FILE"
+    fi
+fi
+
+if [ ! -f "$TONE_FILE" ]; then
+    echo "nextoomio-tone-check: ERROR: Verified test tone file '${TONE_FILE}' not found." >&2
     exit 1
+fi
+
+# If using test override tone file, strictly verify it before playback (AC2, D-012, Finding 4)
+if [ "$TONE_FILE" != "$DEFAULT_TONE_FILE" ]; then
+    if [ -f "$GEN_TONE" ] && command -v python3 >/dev/null 2>&1; then
+        if ! python3 "$GEN_TONE" --check "$TONE_FILE" >/dev/null 2>&1; then
+            echo "nextoomio-tone-check: ERROR: Tone file '${TONE_FILE}' failed safe 30% volume check." >&2
+            exit 1
+        fi
+    else
+        echo "nextoomio-tone-check: ERROR: Cannot verify safe 30% volume limit for custom tone '${TONE_FILE}' (validator missing)." >&2
+        exit 1
+    fi
 fi
 
 PCM_DEVICE="$DEVICE_OVERRIDE"
@@ -212,14 +264,13 @@ PLAY_PID=$!
 RUNNING_SEEN=0
 HW_PTR_START=""
 HW_PTR_LATEST=""
+SAMPLE_COUNT=0
+ADVANCING_SAMPLES=0
 POLL_COUNT=0
-MAX_POLLS=60  # ~3 seconds max timeout for a 2s tone
+MAX_POLLS=60  # ~6.0s timeout with 0.1s sleep for 2.0s tone
 
 while [ "$POLL_COUNT" -lt "$MAX_POLLS" ]; do
-    if ! kill -0 "$PLAY_PID" 2>/dev/null; then
-        break
-    fi
-
+    # Sample status file while player is active
     if [ -f "$STATUS_FILE" ]; then
         if grep -q "^state:[[:space:]]*RUNNING" "$STATUS_FILE" 2>/dev/null; then
             RUNNING_SEEN=1
@@ -228,17 +279,20 @@ while [ "$POLL_COUNT" -lt "$MAX_POLLS" ]; do
                 if [ -z "$HW_PTR_START" ]; then
                     HW_PTR_START="$PTR_VAL"
                 fi
+                if [ -n "$HW_PTR_LATEST" ] && [ "$PTR_VAL" -gt "$HW_PTR_LATEST" ]; then
+                    ADVANCING_SAMPLES=$((ADVANCING_SAMPLES + 1))
+                fi
                 HW_PTR_LATEST="$PTR_VAL"
+                SAMPLE_COUNT=$((SAMPLE_COUNT + 1))
             fi
         fi
     fi
 
-    # Sleep 50ms using python3 or fallback to sleep 1
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "import time; time.sleep(0.05)" 2>/dev/null || sleep 1
-    else
-        sleep 1
+    if ! kill -0 "$PLAY_PID" 2>/dev/null; then
+        break
     fi
+
+    sleep 0.1 2>/dev/null || sleep 1
     POLL_COUNT=$((POLL_COUNT + 1))
 done
 
@@ -255,7 +309,7 @@ if [ "$PLAY_STATUS" -ne 0 ]; then
   "status": "failed",
   "reason": "playback_device_busy",
   "card_id": "${CARD_ID}",
-  "message": "ALSA playback device reports busy: $(cat "$TMP_ERR" 2>/dev/null | tr '\n' ' ')"
+  "message": "ALSA playback device reports busy"
 }
 EOF
         else
@@ -264,6 +318,7 @@ EOF
         fi
         exit 3
     elif [ "$RUNNING_SEEN" -ne 1 ]; then
+        CLEAN_ERR=$(json_escape "$(head -n 1 "$TMP_ERR" 2>/dev/null)")
         if [ "$OUTPUT_JSON" -eq 1 ]; then
             cat << EOF
 {
@@ -271,7 +326,7 @@ EOF
   "reason": "playback_failed",
   "card_id": "${CARD_ID}",
   "exit_code": ${PLAY_STATUS},
-  "message": "$(cat "$TMP_ERR" 2>/dev/null | tr '\n' ' ')"
+  "message": "ALSA playback failed: ${CLEAN_ERR}"
 }
 EOF
         else
@@ -301,13 +356,16 @@ if [ "$RUNNING_SEEN" -ne 1 ] || [ "$FRAMES_ADVANCED" -lt "$MIN_ADVANCE_FRAMES" ]
   "stream_running": $([ "$RUNNING_SEEN" -eq 1 ] && echo "true" || echo "false"),
   "expected_frames": ${EXPECTED_FRAMES},
   "observed_frames": ${FRAMES_ADVANCED},
+  "min_required_frames": ${MIN_ADVANCE_FRAMES},
+  "samples_collected": ${SAMPLE_COUNT},
   "message": "Stream did not reach RUNNING state or hardware position did not advance expected frames"
 }
 EOF
     else
         echo "nextoomio-tone-check: ERROR: Stream verification failed." >&2
         echo "  Stream was RUNNING: $([ "$RUNNING_SEEN" -eq 1 ] && echo "yes" || echo "no")" >&2
-        echo "  Frames advanced: ${FRAMES_ADVANCED} (expected: ~${EXPECTED_FRAMES})" >&2
+        echo "  Frames advanced: ${FRAMES_ADVANCED} (expected: ${EXPECTED_FRAMES}, min: ${MIN_ADVANCE_FRAMES})" >&2
+        echo "  Samples collected: ${SAMPLE_COUNT}" >&2
         echo "Result: FAIL (reason: stream_position_not_advancing)" >&2
     fi
     exit 4
