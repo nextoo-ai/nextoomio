@@ -48,25 +48,29 @@ EXIT_NETWORK_ERROR = 2
 EXIT_HTTP_ERROR = 3
 EXIT_ACTION_FAILED = 4
 
-SENSITIVE_PARAM_RE = re.compile(
-    r"(?i)(?<=[?&])(token|secret|password|passwd|api_key|key|auth|access_token)=([^&#\s]+)"
-)
 URL_CREDENTIALS_RE = re.compile(
     r"://([^/:@]+):(.*?)@(?=[^/@:\s]+(?::\d+)?(?:/|$|\s))"
+)
+URL_QUERY_RE = re.compile(
+    r"""(?i)([a-zA-Z][a-zA-Z0-9+.-]*://[^\s?'")>\]]+)\?[^\s#'")>\]]*"""
+)
+SENSITIVE_PARAM_RE = re.compile(
+    r"(?i)(?<=[?&])(token|secret|password|passwd|api_key|apikey|key|auth|access_token)=([^&#\s]+)"
 )
 BEARER_AUTH_RE = re.compile(
     r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*"
 )
 JSON_KEYVAL_RE = re.compile(
-    r"""(?i)["']?\b(token|secret|password|passwd|api_key|key|auth|access_token)["']?\s*[:=]\s*["']?([^"',\s}]+)["']?"""
+    r"""(?i)["']?\b(token|secret|password|passwd|api_key|apikey|key|auth|access_token)["']?\s*[:=]\s*["']?([^"',\s}]+)["']?"""
 )
 
 
 def redact_text(text: str) -> str:
-    """Redact embedded credentials, tokens, query parameters, and secrets."""
+    """Redact embedded credentials, URL query strings, sensitive parameters, and secrets."""
     if not text:
         return text
     t = URL_CREDENTIALS_RE.sub(r"://\1:***@", text)
+    t = URL_QUERY_RE.sub(r"\1?***", t)
     t = SENSITIVE_PARAM_RE.sub(r"\1=***", t)
     t = BEARER_AUTH_RE.sub(r"\1 ***", t)
     t = JSON_KEYVAL_RE.sub(r'"\1": "***"', t)

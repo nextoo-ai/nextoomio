@@ -202,7 +202,7 @@ def test_http_driver_mocked_requests() -> None:
 
 def test_shelly_and_tasmota_driver_configurations_ac3() -> None:
     """AC3: Works with different outlet types by changing only configuration."""
-    print("Testing Shelly Gen 1, Gen 2 and Tasmota drivers (AC3)...")
+    print("Testing Shelly Gen 1, Gen 2, Tasmota, and Home Assistant drivers (AC3)...")
     captured_requests: list[urllib.request.Request] = []
 
     def mock_urlopen(req: urllib.request.Request, timeout: float = 10.0) -> DummyHttpResponse:
@@ -221,6 +221,12 @@ def test_shelly_and_tasmota_driver_configurations_ac3() -> None:
         elif "/relay/0" in full_url:
             # Shelly Gen 1
             return DummyHttpResponse(200, b'{"ison": true}')
+        elif "/api/services/switch" in full_url:
+            # Home Assistant switch service
+            return DummyHttpResponse(200, b'{"message": "Turned on"}')
+        elif "/api/states/switch" in full_url:
+            # Home Assistant entity state
+            return DummyHttpResponse(200, b'{"entity_id": "switch.bench_outlet", "state": "on"}')
         return DummyHttpResponse(200, b"OK")
 
     with mock.patch("urllib.request.urlopen", side_effect=mock_urlopen):
@@ -248,6 +254,20 @@ def test_shelly_and_tasmota_driver_configurations_ac3() -> None:
         res3 = power.execute_power_action(d_tasmota, "off", quiet=True)
         assert res3["status"] == "success"
         assert "cmnd=Power1%20Off" in captured_requests[-1].full_url or "cmnd=Power1 Off" in captured_requests[-1].full_url
+
+        # Test 4: Home Assistant REST template (AC3)
+        example_cfg = json.loads((ROOT / "scripts" / "bench" / "outlet.example.json").read_text(encoding="utf-8"))
+        ha_cfg = example_cfg["_examples"]["home_assistant_rest"]
+        d_ha = power.create_driver(ha_cfg)
+        res4 = power.execute_power_action(d_ha, "on", quiet=True)
+        assert res4["status"] == "success"
+        assert "/api/services/switch/turn_on" in captured_requests[-1].full_url
+        assert captured_requests[-1].get_header("Authorization") == "Bearer sample-long-lived-access-token"
+        assert json.loads(captured_requests[-1].data.decode("utf-8")) == {"entity_id": "switch.bench_outlet"}
+
+        res4_status = power.execute_power_action(d_ha, "status", quiet=True)
+        assert res4_status["status"] == "success"
+        assert res4_status["state"] == "on"
 
     print("  test_shelly_and_tasmota_driver_configurations_ac3: PASSED")
 
@@ -331,6 +351,18 @@ def test_credential_redaction_cq_r6() -> None:
         except power.PowerError as exc:
             assert mismatch_secret not in exc.message, "Secret in mismatch body leaked in PowerError message!"
             assert mismatch_secret not in str(exc), "Secret leaked in PowerError string representation!"
+
+    # 4. URL query string redaction with unlisted parameter names (CQ-R4, CQ-R6)
+    unlisted_url = "http://h/cm?cmnd=x&apikey=ZZZ"
+    redacted_url = power.redact_text(unlisted_url)
+    assert "apikey" not in redacted_url, "Parameter name 'apikey' leaked!"
+    assert "ZZZ" not in redacted_url, "Value 'ZZZ' leaked!"
+    assert redacted_url == "http://h/cm?***", f"Unexpected redacted URL: {redacted_url}"
+
+    err_text = f"Failed to reach outlet at '{unlisted_url}': Connection timed out"
+    redacted_err = power.redact_text(err_text)
+    assert "ZZZ" not in redacted_err
+    assert "http://h/cm?***" in redacted_err
 
     print("  test_credential_redaction_cq_r6: PASSED")
 
