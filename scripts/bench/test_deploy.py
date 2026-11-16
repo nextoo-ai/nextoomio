@@ -28,6 +28,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from deploy import (
     DEFAULT_SSH_PORT,
     DEFAULT_SSH_USER,
+    SAFE_IDENTIFIER_PATTERN,
     DeployResult,
     Deployer,
     SshCommandResult,
@@ -35,6 +36,8 @@ from deploy import (
     SystemSshRunner,
     build_parser,
     format_text_report,
+    is_safe_identifier,
+    main,
     normalize_slot,
     opposite_slot,
     parse_arguments,
@@ -526,7 +529,9 @@ class TestDeployTool(unittest.TestCase):
         self.assertIn("ssh", base_args)
         self.assertIn("-p", base_args)
         self.assertIn("2222", base_args)
-        self.assertIn("benchuser@192.0.2.1", base_args)
+        self.assertIn("--", base_args)
+        dash_idx = base_args.index("--")
+        self.assertEqual(base_args[dash_idx + 1], "benchuser@192.0.2.1")
         self.assertIn("BatchMode=yes", " ".join(base_args))
 
         # Ensure no identity files (-i) or raw keys are hardcoded in the command
@@ -603,6 +608,72 @@ class TestDeployTool(unittest.TestCase):
         self.assertEqual(f, self.swu_file)
         self.assertEqual(args.timeout, 90.0)
         self.assertTrue(args.json)
+
+    def test_cq_r7_host_and_user_validation_rejects_option_injection(self) -> None:
+        """CQ-R7: Host and user values starting with '-' or containing unsafe characters are rejected."""
+        # 1. SystemSshRunner raises ValueError on invalid host or user
+        with self.assertRaises(ValueError):
+            SystemSshRunner(host="-oProxyCommand=calc")
+        with self.assertRaises(ValueError):
+            SystemSshRunner(host="bench-pi4", user="-oProxyCommand=calc")
+        with self.assertRaises(ValueError):
+            SystemSshRunner(host="-invalid-host")
+        with self.assertRaises(ValueError):
+            SystemSshRunner(host="bench;reboot")
+        with self.assertRaises(ValueError):
+            SystemSshRunner(host="bench-pi4", user="user name")
+        with self.assertRaises(ValueError):
+            SystemSshRunner(host="bench-pi4", user="user@domain")
+
+        # 2. main() exits status 2 when device starts with '-' or is invalid
+        buf = io.StringIO()
+        old_stderr = sys.stderr
+        try:
+            sys.stderr = buf
+            rc = main(["--device=-oProxyCommand=calc", "-f", str(self.swu_file)])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid device", buf.getvalue())
+
+            buf.seek(0)
+            buf.truncate(0)
+            rc = main(["-d", "bench;reboot", "-f", str(self.swu_file)])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid device", buf.getvalue())
+
+            # 3. main() exits status 2 when user starts with '-' or is invalid
+            buf.seek(0)
+            buf.truncate(0)
+            rc = main(["-u=-oProxyCommand=calc", "-d", "bench-pi4", "-f", str(self.swu_file)])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid user", buf.getvalue())
+
+            buf.seek(0)
+            buf.truncate(0)
+            rc = main(["-u", "user@evil", "-d", "bench-pi4", "-f", str(self.swu_file)])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid user", buf.getvalue())
+
+            # 4. main() exits status 2 when positional device starts with '-'
+            buf.seek(0)
+            buf.truncate(0)
+            rc = main(["--", "-invalid-device", str(self.swu_file)])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid device", buf.getvalue())
+
+            # 5. Option flag followed by -option also exits status 2
+            buf.seek(0)
+            buf.truncate(0)
+            rc = main(["-d", "-oProxyCommand=calc", "-f", str(self.swu_file)])
+            self.assertEqual(rc, 2)
+        finally:
+            sys.stderr = old_stderr
+
+        # 5. Verify '--' is passed before user@host in SSH arguments
+        runner = SystemSshRunner(host="bench-pi4", user="root")
+        args = runner._base_ssh_args()
+        self.assertIn("--", args)
+        idx = args.index("--")
+        self.assertEqual(args[idx + 1], "root@bench-pi4")
 
 
 def run_self_tests() -> int:

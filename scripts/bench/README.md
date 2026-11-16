@@ -26,6 +26,7 @@ The tool automates the Phase 0 remote deployment flow described in [ARCHITECTURE
 - **No credentials stored:** The deploy tool stores no passwords, tokens, or private keys on disk.
 - **No key material printed:** Standard output and error streams never display private keys or credential material.
 - **System SSH & agent integration:** Authentication uses the workstation's system `ssh` binary and active `ssh-agent` (`SSH_AUTH_SOCK`) with the bench key (OQ-14). Batch mode (`BatchMode=yes`) is enforced to prevent interactive password prompts.
+- **Option injection defense (CQ-R7):** Host and user parameters are strictly validated against `^[A-Za-z0-9][A-Za-z0-9._-]*$`, rejecting values starting with `-` or containing unsafe metacharacters (exit status 2 in `main`), and `--` is passed before the `user@host` argument.
 
 ### 2.2 Sequence of operations (AC1, AC2)
 

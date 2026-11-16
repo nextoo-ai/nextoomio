@@ -117,6 +117,17 @@ class SshRunner(abc.ABC):
         """Check if target SSH service is reachable and authenticates."""
 
 
+SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def is_safe_identifier(val: str) -> bool:
+    """Validate that host or user string contains only safe alphanumeric/dot/hyphen/underscore chars.
+
+    Rejects strings starting with '-' or containing shell/ssh option injection metacharacters (CQ-R7).
+    """
+    return bool(SAFE_IDENTIFIER_PATTERN.match(val))
+
+
 class SystemSshRunner(SshRunner):
     """Production SSH runner utilizing the system ssh binary and SSH agent.
 
@@ -124,6 +135,14 @@ class SystemSshRunner(SshRunner):
     """
 
     def __init__(self, host: str, user: str = DEFAULT_SSH_USER, port: int = DEFAULT_SSH_PORT):
+        if not is_safe_identifier(host):
+            raise ValueError(
+                f"Invalid host '{host}': must match pattern ^[A-Za-z0-9][A-Za-z0-9._-]*$"
+            )
+        if not is_safe_identifier(user):
+            raise ValueError(
+                f"Invalid user '{user}': must match pattern ^[A-Za-z0-9][A-Za-z0-9._-]*$"
+            )
         self.host = host
         self.user = user
         self.port = port
@@ -143,6 +162,7 @@ class SystemSshRunner(SshRunner):
             f"ConnectTimeout={int(connect_timeout)}",
             "-o",
             "ServerAliveInterval=15",
+            "--",
             f"{self.user}@{self.host}",
         ]
 
@@ -819,7 +839,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
-    args, device, update_file = parse_arguments(argv)
+    try:
+        args, device, update_file = parse_arguments(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
 
     if args.test:
         from test_deploy import run_self_tests
@@ -827,6 +850,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not device:
         sys.stderr.write("Error: device target must be specified via argument or -d/--device.\n")
+        return 2
+
+    if not is_safe_identifier(device):
+        sys.stderr.write(
+            f"Error: invalid device '{device}': host must match ^[A-Za-z0-9][A-Za-z0-9._-]*$\n"
+        )
+        return 2
+
+    if not is_safe_identifier(args.user):
+        sys.stderr.write(
+            f"Error: invalid user '{args.user}': user must match ^[A-Za-z0-9][A-Za-z0-9._-]*$\n"
+        )
         return 2
 
     if not update_file:
