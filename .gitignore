@@ -48,3 +48,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Bench outlet local configuration (P0-F7.1, AC3)
+/scripts/bench/outlet.json
+/scripts/bench/*.local.json
+/.outlet.json
