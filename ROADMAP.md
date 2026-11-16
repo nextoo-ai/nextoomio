@@ -4,7 +4,7 @@ Document version: **1.10**
 Date: **2026-11-13**  
 Status: **Plan only; no item is marked implemented or verified by this document.**  
 Functional rules: [SPECIFICATION.md](SPECIFICATION.md), version 1.15.  
-Architecture design: [ARCHITECTURE.md](ARCHITECTURE.md), version 0.10.  
+Architecture design: [ARCHITECTURE.md](ARCHITECTURE.md), version 0.11.  
 Agent and language rules: [AGENTS.md](AGENTS.md).
 
 ## 1. Goal and planning rules
