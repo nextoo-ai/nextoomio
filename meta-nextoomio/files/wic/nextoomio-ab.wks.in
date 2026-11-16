@@ -8,11 +8,11 @@
 #   6: root_b  (ext4, 3072 MiB)- Slot B read-only rootfs (inactive initially)
 #   7: data    (ext4, grown)   - /data/config/v<N>, /data/secrets/v<N>, /data/music, /data/update
 
-part /boot/select --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label select --active --align 4096 --fixed-size 64M --fsoptions "ro"
-part /boot        --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label boot_a --align 4096 --fixed-size 256M
+part /boot/select --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label select --active --align 4096 --fixed-size 64M --fsoptions "ro" --no-fstab-update
+part /boot/firmware --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label boot_a --align 4096 --fixed-size 256M --no-fstab-update
 part              --ondisk mmcblk0 --fstype=vfat --label boot_b --align 4096 --fixed-size 256M
 part /            --source rootfs            --ondisk mmcblk0 --fstype=ext4 --label root_a --align 4096 --fixed-size 3072M
 part              --ondisk mmcblk0 --fstype=ext4 --label root_b --align 4096 --fixed-size 3072M
-part /data        --ondisk mmcblk0 --fstype=ext4 --label data   --align 4096 --fixed-size 1536M
+part /data        --ondisk mmcblk0 --fstype=ext4 --label data   --align 4096 --size 1536M --no-fstab-update
 
 bootloader --ptable msdos --diskid 0x4e58544d

@@ -27,6 +27,7 @@ do_image_swu[depends] += " \
     virtual/kernel:do_deploy \
     rpi-config:do_deploy \
     rpi-cmdline:do_deploy \
+    bcm2835-bootfiles:do_deploy \
     nextoomio-audio-profile:do_deploy \
 "
 
@@ -59,14 +60,16 @@ IMAGE_CMD:swu () {
         mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/
     done
 
-    if [ -d "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles" ]; then
-        mcopy -i "${BOOT_ARTIFACT}" -s "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles/"* ::/
+    if [ ! -d "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles" ] || [ -z "$(ls -A "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles" 2>/dev/null)" ]; then
+        bbfatal "Firmware directory ${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles is missing or empty"
     fi
+    mcopy -i "${BOOT_ARTIFACT}" -s "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles/"* ::/
 
-    if [ -d "${DEPLOY_DIR_IMAGE}/overlays" ]; then
-        mmd -i "${BOOT_ARTIFACT}" ::/overlays
-        mcopy -i "${BOOT_ARTIFACT}" -s "${DEPLOY_DIR_IMAGE}/overlays/"* ::/overlays/
+    if [ ! -d "${DEPLOY_DIR_IMAGE}/overlays" ] || [ -z "$(ls -A "${DEPLOY_DIR_IMAGE}/overlays" 2>/dev/null)" ]; then
+        bbfatal "Device tree overlays directory ${DEPLOY_DIR_IMAGE}/overlays is missing or empty"
     fi
+    mmd -i "${BOOT_ARTIFACT}" ::/overlays
+    mcopy -i "${BOOT_ARTIFACT}" -s "${DEPLOY_DIR_IMAGE}/overlays/"* ::/overlays/
 
     gzip -9 -c "${BOOT_ARTIFACT}" > "${SWU_BUILD_DIR}/nextoomio-boot.vfat.gz"
     BOOT_PKG_FILE="nextoomio-boot.vfat.gz"

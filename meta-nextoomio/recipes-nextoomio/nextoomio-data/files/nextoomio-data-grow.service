@@ -1,0 +1,16 @@
+[Unit]
+Description=nextoomio Expand Persistent Data Partition on First Boot
+Documentation=file:///ARCHITECTURE.md#3.6
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=nextoomio-data-check.service systemd-fsck@dev-disk-by\x2dlabel-data.service data.mount local-fs-pre.target
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nextoomio-data-grow
+
+[Install]
+WantedBy=local-fs-pre.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=nextoomio Mount Active Boot Partition Read-Only
+Documentation=file:///ARCHITECTURE.md#3.5
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=local-fs.target
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nextoomio-boot-mount
+
+[Install]
+WantedBy=local-fs.target
