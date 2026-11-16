@@ -363,7 +363,17 @@ def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
     paths = changed_paths(cwd=cwd)
     if not paths:
         return None
-    refused = outside_role_paths(role, paths, extra_paths, cwd=cwd)
+    paths_to_judge = paths
+    merge_in_progress = run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=cwd, check=False).returncode == 0
+    if merge_in_progress:
+        run(["git", "add", "-A"], cwd=cwd)
+        paths = changed_paths(cwd=cwd)
+        ref = "origin/main" if run(["git", "rev-parse", "-q", "--verify", "origin/main"], cwd=cwd, check=False).returncode == 0 else "MERGE_HEAD"
+        paths_to_judge = [
+            p for p in paths
+            if run(["git", "diff", "--quiet", ref, "--", p], cwd=cwd, check=False).returncode != 0
+        ]
+    refused = outside_role_paths(role, paths_to_judge, extra_paths, cwd=cwd)
     if refused:
         run(["git", "stash", "push", "-u", "-m", f"pipeline: refused changes for issue {issue}"], cwd=cwd)
         run(["git", "switch", "main"], cwd=cwd)
@@ -491,7 +501,7 @@ def wait_for_ci(number, required_checks=None, issue=None, timeout=3600):
         if all_required_success and all_completed:
             return True
         time.sleep(20)
-    raise Stop(1, f"the required checks on pull request #{number} did not finish within {timeout // 60} minutes")
+    raise Stop(1, f"the checks on pull request #{number} did not finish within {timeout // 60} minutes")
 
 
 def latest_review(number, head):
@@ -1198,7 +1208,7 @@ def run_self_tests():
                 except Stop as exc:
                     timeout_raised = True
                     assert exc.status == 1, f"Expected Stop status 1 on timeout, got {exc.status}"
-                    assert "the required checks on pull request #173 did not finish within 1 minutes" in str(exc)
+                    assert "the checks on pull request #173 did not finish within 1 minutes" in str(exc)
                 assert timeout_raised, "wait_for_ci did not time out as before"
                 assert len(sleep_calls_timeout) > 0, "Expected sleep calls before timeout"
                 assert gh_mutations == [], f"AC2 violated: issue mutations occurred on check timeout: {gh_mutations}"
@@ -2686,7 +2696,7 @@ sys.exit(0)
             except Stop as exc:
                 timeout_raised_ac4 = True
                 assert exc.status == 1
-                assert "the required checks on pull request #247 did not finish" in str(exc)
+                assert "the checks on pull request #247 did not finish" in str(exc)
             assert timeout_raised_ac4, "wait_for_ci did not time out when non-required check stayed in progress"
 
             # Scenario 4c: Non-required check completes with FAILURE -> returns False (CI failure)
@@ -2750,8 +2760,16 @@ if role in ("developer", "devops"):
     # If conflict markers in common.txt, resolve them
     common_path = os.path.join(cwd, "common.txt")
     if os.path.exists(common_path):
-        with open(common_path, "w") as f:
-            f.write("resolved content: main + story\n")
+        with open(common_path, "r") as f:
+            c_text = f.read()
+        if "<<<<<<<" in c_text or "conflict" in c_text:
+            with open(common_path, "w") as f:
+                f.write("resolved content: main + story\n")
+    for f_clean in ("branch_clean.txt", "branch_clean2.txt"):
+        p_clean = os.path.join(cwd, f_clean)
+        if os.path.exists(p_clean):
+            with open(p_clean, "a") as f:
+                f.write("author address changes\n")
     print("PR-Title: D-062 Resolved conflicts\nPR-Summary: Author resolved merge conflicts")
 elif role == "reviewer":
     rev_flag = os.environ.get("D062_REVIEWER_FLAG")
@@ -2767,7 +2785,7 @@ sys.exit(0)
             tooling_dir=tmpdir,
             agent_run=mock_runner_d062,
             agent_token=d051_tooling.agent_token,
-            role_guard=d051_tooling.role_guard,
+            role_guard=tooling_root.role_guard,
             agents_dir=tooling_root.agents_dir,
         )
 
@@ -2830,10 +2848,14 @@ sys.exit(0)
                     return [json.loads(line) for line in f if line.strip()]
 
             # --- AC1: Open PR that conflicts with main ---
-            # 1. On origin main, modify common.txt
+            # 1. On origin main, add core file outside devops role paths and modify common.txt
+            os.makedirs(os.path.join(d062_origin, "core"), exist_ok=True)
+            with open(os.path.join(d062_origin, "core", "main_core.rs"), "w") as f:
+                f.write("pub fn core_from_main() {}\n")
             with open(os.path.join(d062_origin, "common.txt"), "w") as f:
                 f.write("main branch content\n")
-            subprocess.run(["git", "-C", d062_origin, "commit", "-q", "-a", "-m", "Commit on main"], check=True)
+            subprocess.run(["git", "-C", d062_origin, "add", "-A"], check=True)
+            subprocess.run(["git", "-C", d062_origin, "commit", "-q", "-m", "Commit on main with core and common"], check=True)
 
             # 2. Create PR branch from base with conflicting common.txt
             subprocess.run(["git", "-C", d062_origin, "branch", "-f", "ops/D-062-ac1-branch", "HEAD~1"], check=True)
@@ -2903,6 +2925,29 @@ sys.exit(0)
             assert "conflicts with main" in author_rec["task"]
             assert "state:blocked" not in gh_blocked_labels, f"Issue was blocked: {gh_blocked_labels}"
             print("test_d062_ac1_conflicting_pr_gives_author_round_with_merge_in_progress: OK")
+
+            # AC1 negative check: author modifies a file outside role paths during conflict resolution -> deliver blocks
+            subprocess.run(["git", "-C", d062_local, "switch", "-q", "-C", "ops/D-062-neg-branch", "HEAD~1"], check=True)
+            with open(os.path.join(d062_local, "common.txt"), "w") as f:
+                f.write("conflict branch content\n")
+            subprocess.run(["git", "-C", d062_local, "commit", "-q", "-a", "-m", "conflict"], check=True)
+            subprocess.run(["git", "-C", d062_local, "push", "-q", "-u", "origin", "ops/D-062-neg-branch"], check=True)
+            subprocess.run(["git", "-C", d062_local, "merge", "--no-edit", "origin/main"], check=False)
+            assert os.path.exists(os.path.join(d062_local, ".git", "MERGE_HEAD"))
+            with open(os.path.join(d062_local, "common.txt"), "w") as f:
+                f.write("resolved\n")
+            with open(os.path.join(d062_local, "core", "unauthorized.rs"), "w") as f:
+                f.write("bad code\n")
+            neg_blocked = False
+            try:
+                deliver("devops", 261, "Title", "ops/D-062-neg-branch", "PR-Summary: bad", ["common.txt"], 2610, cwd=d062_local)
+            except Stop as exc:
+                neg_blocked = True
+                assert exc.status == 2
+                assert "changed paths outside its role" in str(exc)
+            assert neg_blocked, "deliver did not block when author touched file outside role during conflict"
+            subprocess.run(["git", "-C", d062_local, "switch", "-q", "main"], check=True)
+            print("test_d062_ac1_unauthorized_path_during_conflict_blocks: OK")
 
             # --- AC2: Open PR behind main that merges cleanly ---
             # 1. On origin main, add main_clean.txt
@@ -2979,6 +3024,91 @@ sys.exit(0)
             assert head_ac2_final != head_ac2_init, "Merge commit was not pushed!"
             print("test_d062_ac2_clean_merge_pushes_without_author_round: OK")
 
+            # AC2 sub-scenario: PR with CHANGES_REQUESTED behind main that merges cleanly -> author round runs
+            with open(os.path.join(d062_origin, "main_clean2.txt"), "w") as f:
+                f.write("clean main 2\n")
+            subprocess.run(["git", "-C", d062_origin, "add", "main_clean2.txt"], check=True)
+            subprocess.run(["git", "-C", d062_origin, "commit", "-q", "-m", "Main clean 2 commit"], check=True)
+
+            subprocess.run(["git", "-C", d062_origin, "branch", "-f", "ops/D-062-ac2-cr-branch", "HEAD~1"], check=True)
+            subprocess.run(["git", "-C", d062_local, "fetch", "-q", "origin"], check=True)
+            subprocess.run(["git", "-C", d062_local, "switch", "-q", "-C", "ops/D-062-ac2-cr-branch", "origin/ops/D-062-ac2-cr-branch"], check=True)
+            with open(os.path.join(d062_local, "branch_clean2.txt"), "w") as f:
+                f.write("clean branch 2\n")
+            subprocess.run(["git", "-C", d062_local, "add", "branch_clean2.txt"], check=True)
+            subprocess.run(["git", "-C", d062_local, "commit", "-q", "-m", "Branch clean 2 commit"], check=True)
+            subprocess.run(["git", "-C", d062_local, "push", "-q", "-u", "origin", "ops/D-062-ac2-cr-branch"], check=True)
+            head_ac2_cr_init = subprocess.run(["git", "-C", d062_origin, "rev-parse", "ops/D-062-ac2-cr-branch"],
+                                              capture_output=True, text=True, check=True).stdout.strip()
+            subprocess.run(["git", "-C", d062_local, "switch", "-q", "main"], check=True)
+
+            gh_state_d062.issue_info[264] = {
+                "title": "D-062 AC2 changes requested issue",
+                "state": "OPEN",
+                "labels": [{"name": "state:ready"}, {"name": "area:tooling"}],
+                "body": "### Touches\n- `branch_clean2.txt`\n",
+            }
+            gh_state_d062.open_prs = [{
+                "number": 2640,
+                "headRefName": "ops/D-062-ac2-cr-branch",
+                "headRefOid": head_ac2_cr_init,
+                "author": {"login": "nextoomio-devops[bot]"},
+                "body": "Refs #264\n\nClean merge with CHANGES_REQUESTED",
+            }]
+
+            def pr_view_2640(num):
+                curr_head = subprocess.run(["git", "-C", d062_origin, "rev-parse", "ops/D-062-ac2-cr-branch"],
+                                           capture_output=True, text=True).stdout.strip()
+                if curr_head != head_ac2_cr_init:
+                    revs = subprocess.run(["git", "-C", d062_origin, "rev-list", f"{head_ac2_cr_init}..{curr_head}"],
+                                          capture_output=True, text=True).stdout.splitlines()
+                    if len(revs) >= 2:
+                        return {
+                            "state": "MERGED",
+                            "headRefOid": curr_head,
+                            "mergeStateStatus": "CLEAN",
+                            "mergeable": "MERGEABLE",
+                            "reviews": [{"author": {"login": "nextoomio-reviewer"}, "commit": {"oid": curr_head},
+                                        "state": "APPROVED", "body": "Completes-Story: yes"}],
+                            "statusCheckRollup": [{"name": "test-ci", "conclusion": "SUCCESS"}],
+                            "body": "Refs #264",
+                        }
+                    else:
+                        return {
+                            "state": "OPEN",
+                            "headRefOid": curr_head,
+                            "mergeStateStatus": "CLEAN",
+                            "mergeable": "MERGEABLE",
+                            "reviews": [{"author": {"login": "nextoomio-reviewer"}, "commit": {"oid": head_ac2_cr_init},
+                                        "state": "CHANGES_REQUESTED", "body": "Please address review"}],
+                            "statusCheckRollup": [{"name": "test-ci", "conclusion": "SUCCESS"}],
+                            "body": "Refs #264",
+                        }
+                return {
+                    "state": "OPEN",
+                    "headRefOid": head_ac2_cr_init,
+                    "mergeStateStatus": "CLEAN",
+                    "mergeable": "MERGEABLE",
+                    "reviews": [{"author": {"login": "nextoomio-reviewer"}, "commit": {"oid": head_ac2_cr_init},
+                                "state": "CHANGES_REQUESTED", "body": "Please address review"}],
+                    "statusCheckRollup": [{"name": "test-ci", "conclusion": "SUCCESS"}],
+                    "body": "Refs #264",
+                }
+            gh_state_d062.pr_views[2640] = pr_view_2640
+
+            if os.path.exists(mock_record_d062):
+                os.remove(mock_record_d062)
+
+            exit_ac2_cr = main(["264", "--role", "devops"], cwd=d062_local,
+                               run_dir=os.path.join(tmpdir, "d062_run_ac2_cr"))
+            assert exit_ac2_cr == 0, f"Expected exit 0 for AC2 CR, got {exit_ac2_cr}"
+            records_ac2_cr = get_d062_records()
+            assert len(records_ac2_cr) >= 2, f"Expected author then reviewer, got {records_ac2_cr}"
+            assert records_ac2_cr[0]["role"] == "devops", f"Author was not run first on clean merge with CHANGES_REQUESTED: {records_ac2_cr}"
+            assert "the review requested changes" in records_ac2_cr[0]["task"]
+            assert records_ac2_cr[1]["role"] == "reviewer"
+            print("test_d062_ac2_clean_merge_with_changes_requested_runs_author: OK")
+
             # --- AC3: Approved PR that conflicts with main ---
             with open(os.path.join(d062_origin, "common.txt"), "w") as f:
                 f.write("main conflict for ac3\n")
@@ -3048,6 +3178,93 @@ sys.exit(0)
             assert records_ac3[0]["merge_in_progress"] is True
             assert records_ac3[1]["role"] == "reviewer", f"Reviewer not started after author resolution: {records_ac3}"
             print("test_d062_ac3_approved_conflicting_pr_author_resolves_and_new_head_reviewed: OK")
+
+            # AC3 sub-scenario: Approved PR reported DIRTY by GitHub, but try_merge_main is UP_TO_DATE -> Stop(2)
+            gh_state_d062.issue_info[265] = {
+                "title": "D-062 AC3 up-to-date issue",
+                "state": "OPEN",
+                "labels": [{"name": "state:ready"}, {"name": "area:tooling"}],
+                "body": "### Touches\n- `common.txt`\n",
+            }
+            subprocess.run(["git", "-C", d062_local, "switch", "-q", "-C", "ops/D-062-ac3-uptodate", "origin/main"], check=True)
+            subprocess.run(["git", "-C", d062_local, "push", "-q", "-u", "origin", "ops/D-062-ac3-uptodate"], check=True)
+            head_ac3_uptodate = subprocess.run(["git", "-C", d062_origin, "rev-parse", "ops/D-062-ac3-uptodate"],
+                                               capture_output=True, text=True, check=True).stdout.strip()
+            subprocess.run(["git", "-C", d062_local, "switch", "-q", "main"], check=True)
+
+            gh_state_d062.open_prs = [{
+                "number": 2650,
+                "headRefName": "ops/D-062-ac3-uptodate",
+                "headRefOid": head_ac3_uptodate,
+                "author": {"login": "nextoomio-devops[bot]"},
+                "body": "Refs #265\n\nApproved but reported dirty",
+            }]
+            gh_state_d062.pr_views[2650] = lambda num: {
+                "state": "OPEN",
+                "headRefOid": head_ac3_uptodate,
+                "mergeStateStatus": "DIRTY",
+                "mergeable": "CONFLICTING",
+                "reviews": [{"author": {"login": "nextoomio-reviewer"}, "commit": {"oid": head_ac3_uptodate},
+                            "state": "APPROVED", "body": "Completes-Story: yes"}],
+                "statusCheckRollup": [{"name": "test-ci", "conclusion": "SUCCESS"}],
+                "body": "Refs #265",
+            }
+            old_wait_merge = wait_for_merge
+            try:
+                globals()["wait_for_merge"] = lambda num, timeout=900: False
+                exit_ac3_uptodate = main(["265", "--role", "devops"], cwd=d062_local,
+                                         run_dir=os.path.join(tmpdir, "d062_run_ac3_uptodate"))
+                assert exit_ac3_uptodate == 2, f"Expected exit 2 on UP_TO_DATE dirty PR, got {exit_ac3_uptodate}"
+            finally:
+                globals()["wait_for_merge"] = old_wait_merge
+            print("test_d062_ac3_post_approval_dirty_uptodate_stops_with_exit_2: OK")
+
+            # AC3 sub-scenario: Conflict rounds bounded by MAX_ROUNDS
+            subprocess.run(["git", "-C", d062_origin, "branch", "-f", "ops/D-062-conflict-limit", "HEAD~1"], check=True)
+            subprocess.run(["git", "-C", d062_local, "fetch", "-q", "origin"], check=True)
+            subprocess.run(["git", "-C", d062_local, "switch", "-q", "-C", "ops/D-062-conflict-limit", "origin/ops/D-062-conflict-limit"], check=True)
+            with open(os.path.join(d062_local, "common.txt"), "w") as f:
+                f.write("conflict content for limit test\n")
+            subprocess.run(["git", "-C", d062_local, "commit", "-q", "-a", "-m", "conflict for limit"], check=True)
+            subprocess.run(["git", "-C", d062_local, "push", "-q", "-u", "origin", "ops/D-062-conflict-limit"], check=True)
+            head_limit_init = subprocess.run(["git", "-C", d062_origin, "rev-parse", "ops/D-062-conflict-limit"],
+                                             capture_output=True, text=True, check=True).stdout.strip()
+            subprocess.run(["git", "-C", d062_local, "switch", "-q", "main"], check=True)
+
+            gh_state_d062.issue_info[266] = {
+                "title": "D-062 AC3 conflict limit issue",
+                "state": "OPEN",
+                "labels": [{"name": "state:ready"}, {"name": "area:tooling"}],
+                "body": "### Touches\n- `common.txt`\n",
+            }
+            gh_state_d062.open_prs = [{
+                "number": 2660,
+                "headRefName": "ops/D-062-conflict-limit",
+                "headRefOid": head_limit_init,
+                "author": {"login": "nextoomio-devops[bot]"},
+                "body": "Refs #266\n\nConflicting PR for limit test",
+            }]
+            gh_state_d062.pr_views[2660] = lambda num: {
+                "state": "OPEN",
+                "headRefOid": head_limit_init,
+                "mergeStateStatus": "DIRTY",
+                "mergeable": "CONFLICTING",
+                "reviews": [],
+                "statusCheckRollup": [{"name": "test-ci", "conclusion": "SUCCESS"}],
+                "body": "Refs #266",
+            }
+
+            gh_blocked_labels.clear()
+            old_max_rounds = MAX_ROUNDS
+            try:
+                globals()["MAX_ROUNDS"] = 0
+                exit_conflict_limit = main(["266", "--role", "devops"], cwd=d062_local,
+                                           run_dir=os.path.join(tmpdir, "d062_run_conflict_limit"))
+                assert exit_conflict_limit == 2, f"Expected exit 2 when conflict rounds exceeded, got {exit_conflict_limit}"
+                assert "state:blocked" in gh_blocked_labels, f"Expected issue blocked: {gh_blocked_labels}"
+            finally:
+                globals()["MAX_ROUNDS"] = old_max_rounds
+            print("test_d062_ac3_conflict_rounds_bounded_by_max_rounds: OK")
 
             # --- AC6: Offline coverage ---
             assert gh is mock_gh_d062
@@ -3124,6 +3341,7 @@ def main(argv=None, cwd=None, run_dir=None):
         branch = choose_branch(branch, pr=existing, cwd=cwd)
 
         rounds = 0
+        conflict_rounds = 0
         skip_author = False
         verdict = None
         review_body = ""
@@ -3136,13 +3354,22 @@ def main(argv=None, cwd=None, run_dir=None):
             run(["git", "switch", branch], cwd=cwd)
             merge_status = try_merge_main(branch, role, cwd=cwd)
             if merge_status == "CONFLICT":
+                conflict_rounds += 1
+                if conflict_rounds > MAX_ROUNDS:
+                    block(issue, f"pull request #{number} conflicted with main {conflict_rounds} times; "
+                                 "the Architect decides whether the story or the approach is wrong.")
                 task = conflict_author_task(number, issue)
                 skip_author = False
                 verdict = None
             elif merge_status == "CLEAN_MERGE":
-                skip_author = True
-                verdict = None
-                run(["git", "switch", "main"], cwd=cwd, check=False)
+                if verdict == "CHANGES_REQUESTED":
+                    task = round_author_task(number, issue, "the review requested changes")
+                    skip_author = False
+                    verdict = None
+                else:
+                    skip_author = True
+                    verdict = None
+                    run(["git", "switch", "main"], cwd=cwd, check=False)
             else:
                 if verdict == "APPROVED":
                     run(["git", "switch", "main"], cwd=cwd, check=False)
@@ -3209,6 +3436,10 @@ def main(argv=None, cwd=None, run_dir=None):
                 run(["git", "switch", branch], cwd=cwd)
                 merge_status = try_merge_main(branch, role, cwd=cwd)
                 if merge_status == "CONFLICT":
+                    conflict_rounds += 1
+                    if conflict_rounds > MAX_ROUNDS:
+                        block(issue, f"pull request #{number} conflicted with main {conflict_rounds} times; "
+                                     "the Architect decides whether the story or the approach is wrong.")
                     task = conflict_author_task(number, issue)
                     skip_author = False
                     verdict = None
@@ -3216,6 +3447,11 @@ def main(argv=None, cwd=None, run_dir=None):
                     skip_author = True
                     verdict = None
                     run(["git", "switch", "main"], cwd=cwd, check=False)
+                elif merge_status == "UP_TO_DATE":
+                    raise Stop(2, f"pull request #{number} is reported dirty/conflicting by GitHub, "
+                                  f"but is already up to date with origin/main")
+                else:
+                    raise Stop(2, f"unexpected merge status {merge_status} for pull request #{number}")
                 continue
             raise Stop(2, f"pull request #{number} is approved but GitHub has not merged it; check the rules on main")
         say(f"pull request #{number} merged")
