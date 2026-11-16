@@ -2495,4 +2495,36 @@ software =
             Some("update_record_contradictory".to_string())
         );
     }
+
+    #[test]
+    fn test_physical_watchdog_absent_node_returns_error() {
+        let mut backend = PhysicalSlotBackend;
+        let non_existent =
+            std::env::temp_dir().join(format!("nx-nonexistent-watchdog-{}", std::process::id()));
+        let _ = std::fs::remove_file(&non_existent);
+        std::env::set_var("NEXTOOMIO_WATCHDOG_DEV", &non_existent);
+
+        let err = backend.arm_watchdog(120).unwrap_err();
+        assert!(err.contains("watchdog device not found"));
+
+        std::env::remove_var("NEXTOOMIO_WATCHDOG_DEV");
+    }
+
+    #[test]
+    fn test_physical_watchdog_existing_file_arms_and_disarms() {
+        let mut backend = PhysicalSlotBackend;
+        let temp_watchdog =
+            std::env::temp_dir().join(format!("nx-test-watchdog-dev-{}", std::process::id()));
+        std::fs::write(&temp_watchdog, b"").unwrap();
+        std::env::set_var("NEXTOOMIO_WATCHDOG_DEV", &temp_watchdog);
+
+        assert!(backend.arm_watchdog(120).is_ok());
+        assert!(backend.disarm_watchdog().is_ok());
+
+        let content = std::fs::read(&temp_watchdog).unwrap();
+        assert_eq!(content, b"V");
+
+        std::env::remove_var("NEXTOOMIO_WATCHDOG_DEV");
+        let _ = std::fs::remove_file(&temp_watchdog);
+    }
 }

@@ -156,9 +156,14 @@ pub trait SlotBackend: Send + Sync {
     fn is_trial_armed(&self) -> Result<Option<Slot>, String>;
 
     /// Triggers tryboot-flagged reboot to boot the tryboot selector (AC1, AC4).
+    ///
+    /// For testing, `PhysicalSlotBackend` honours `NEXTOOMIO_NO_REBOOT` to skip actual reboot
+    /// execution. Note: this disables the safety reboot for test fixtures.
     fn trigger_tryboot(&mut self) -> Result<(), String>;
 
     /// Triggers plain system reboot to return to the default slot on timeout/failure (AC3).
+    ///
+    /// Used by the trial-watchdog path. Does NOT honour `NEXTOOMIO_NO_REBOOT`.
     fn trigger_reboot(&mut self) -> Result<(), String>;
 
     /// Arms the hardware watchdog to enforce independent trial deadline (AC3, AR-01).
@@ -1281,6 +1286,13 @@ impl SlotBackend for PhysicalSlotBackend {
         Ok(None)
     }
 
+    /// Triggers tryboot-flagged reboot into inactive partition (AC1).
+    ///
+    /// # Test hook
+    /// If `NEXTOOMIO_NO_REBOOT` is set in the environment, actual reboot command execution
+    /// is skipped. Note: this disables the safety reboot and is intended solely for offline
+    /// unit and integration test fixtures. It is explicitly NOT honoured on the trial-watchdog
+    /// deadline enforcement path (`trigger_reboot`).
     fn trigger_tryboot(&mut self) -> Result<(), String> {
         if std::env::var("NEXTOOMIO_NO_REBOOT").is_ok() {
             return Ok(());
@@ -1315,10 +1327,12 @@ impl SlotBackend for PhysicalSlotBackend {
         }
     }
 
+    /// Triggers immediate recovery reboot back to the default boot partition (AC3).
+    ///
+    /// This enforcement method is used on the trial-watchdog deadline path. To guarantee
+    /// that trial deadline enforcement cannot be bypassed or silently dropped in production,
+    /// this method intentionally does NOT honour `NEXTOOMIO_NO_REBOOT`.
     fn trigger_reboot(&mut self) -> Result<(), String> {
-        if std::env::var("NEXTOOMIO_NO_REBOOT").is_ok() {
-            return Ok(());
-        }
         #[cfg(target_os = "linux")]
         {
             let res = std::process::Command::new("systemctl")
@@ -1351,38 +1365,49 @@ impl SlotBackend for PhysicalSlotBackend {
         };
 
         if !watchdog_path.exists() {
-            // In unit test and desktop environments without hardware watchdog, arming is skipped
-            return Ok(());
+            return Err(format!(
+                "watchdog device not found at {}",
+                watchdog_path.display()
+            ));
         }
 
         #[cfg(target_os = "linux")]
         {
+            use std::os::unix::fs::FileTypeExt;
             use std::os::unix::io::AsRawFd;
+
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&watchdog_path)
                 .map_err(|e| format!("cannot open {}: {e}", watchdog_path.display()))?;
 
-            let mut timeout: std::os::raw::c_int = timeout_secs as std::os::raw::c_int;
-            extern "C" {
-                fn ioctl(
-                    fd: std::os::raw::c_int,
-                    request: std::os::raw::c_ulong,
-                    ...
-                ) -> std::os::raw::c_int;
-            }
-            // SAFETY:
-            // 1. `file.as_raw_fd()` borrows a valid open file descriptor for `/dev/watchdog`.
-            // 2. `WDIOC_SETTIMEOUT` (0xc0045706) takes a mutable pointer to a c_int specifying the timeout in seconds.
-            // 3. `timeout` is a stack-allocated c_int that remains valid for the duration of ioctl.
-            let ret = unsafe { ioctl(file.as_raw_fd(), 0xc0045706, &mut timeout) };
-            if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(format!(
-                    "ioctl(WDIOC_SETTIMEOUT) failed on {}: {err}",
-                    watchdog_path.display()
-                ));
+            let is_char_dev = file
+                .metadata()
+                .map(|m| m.file_type().is_char_device())
+                .unwrap_or(false);
+
+            if is_char_dev {
+                let mut timeout: std::os::raw::c_int = timeout_secs as std::os::raw::c_int;
+                extern "C" {
+                    fn ioctl(
+                        fd: std::os::raw::c_int,
+                        request: std::os::raw::c_ulong,
+                        ...
+                    ) -> std::os::raw::c_int;
+                }
+                // SAFETY:
+                // 1. `file.as_raw_fd()` borrows a valid open file descriptor for `/dev/watchdog`.
+                // 2. `WDIOC_SETTIMEOUT` (0xc0045706) takes a mutable pointer to a c_int specifying the timeout in seconds.
+                // 3. `timeout` is a stack-allocated c_int that remains valid for the duration of ioctl.
+                let ret = unsafe { ioctl(file.as_raw_fd(), 0xc0045706, &mut timeout) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(format!(
+                        "ioctl(WDIOC_SETTIMEOUT) failed on {}: {err}",
+                        watchdog_path.display()
+                    ));
+                }
             }
 
             // Retain the open file descriptor in static WATCHDOG_FILE to keep watchdog running
@@ -1392,18 +1417,21 @@ impl SlotBackend for PhysicalSlotBackend {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = timeout_secs;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&watchdog_path)
+                .map_err(|e| format!("cannot open {}: {e}", watchdog_path.display()))?;
+            *WATCHDOG_FILE.lock().unwrap() = Some(file);
             Ok(())
         }
     }
 
     fn disarm_watchdog(&mut self) -> Result<(), String> {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(mut file) = WATCHDOG_FILE.lock().unwrap().take() {
-                // Linux watchdog API: writing 'V' before closing indicates clean magic close/disarm
-                let _ = file.write_all(b"V");
-                let _ = file.flush();
-            }
+        if let Some(mut file) = WATCHDOG_FILE.lock().unwrap().take() {
+            // Linux watchdog API: writing 'V' before closing indicates clean magic close/disarm
+            let _ = file.write_all(b"V");
+            let _ = file.flush();
         }
         Ok(())
     }

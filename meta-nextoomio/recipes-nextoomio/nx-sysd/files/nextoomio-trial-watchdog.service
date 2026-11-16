@@ -5,12 +5,12 @@ Wants=data.mount
 After=data.mount
 Before=basic.target
 OnFailure=reboot.target
+FailureAction=reboot
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/nx-sysd update trial-watchdog --deadline 120 --poll-interval 1000
 Restart=no
-FailureAction=reboot
 
 [Install]
 WantedBy=basic.target
