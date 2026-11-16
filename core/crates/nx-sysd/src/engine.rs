@@ -5,7 +5,7 @@
 use crate::cpio::{
     read_entry_bytes, read_next_cpio_header, skip_entry_data, stream_and_hash_entry_data, CpioError,
 };
-use crate::journal::{JournalController, JournalStorage, ReconcileOutcome};
+use crate::journal::{JournalController, JournalError, JournalStorage, ReconcileOutcome};
 use crate::sha256::Sha256;
 use crate::sw_description::parse_sw_description;
 use crate::system::{HealthReport, PartitionType, Slot, SlotBackend, StagingError, StagingStorage};
@@ -193,10 +193,10 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         let journal =
             match JournalController::load_or_init(journal_storage, active.name(), default.name()) {
                 Ok(j) => j,
-                Err(e) if e.contains("corrupted") || e.contains("invalid") => {
+                Err(JournalError::Corrupted(e)) => {
                     return Err(UpdateEngineError::JournalCorrupted(e));
                 }
-                Err(e) => return Err(UpdateEngineError::Storage(e)),
+                Err(JournalError::Storage(e)) => return Err(UpdateEngineError::Storage(e)),
             };
 
         Ok(Self {
@@ -666,12 +666,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// 6. Durably commits attempt count and state Trial to alternating journal before reboot (AC1, AC5).
     /// 7. Arms the one-shot tryboot selector for target slot, keeping previous slot default (AC1, AD-14).
     /// 8. Triggers tryboot-flagged reboot if auto_reboot is true.
-    pub fn request_trial(
-        &mut self,
-        remote_confirm: bool,
-        auto_reboot: bool,
-    ) -> Result<UpdateStatus, UpdateEngineError> {
-        let _ = remote_confirm;
+    pub fn request_trial(&mut self, auto_reboot: bool) -> Result<UpdateStatus, UpdateEngineError> {
         let (current_state, attempts, tx_id, target_slot, default_slot, payload_len, payload_sha) = {
             let curr = self.journal.current();
             (
@@ -786,19 +781,30 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             return Ok(());
         }
 
-        // Arm independent hardware watchdog chain (AC3, AR-01)
-        let _ = self.backend.arm_watchdog(deadline_secs);
-
         let initial_uptime = self.backend.get_uptime_secs().unwrap_or(0.0);
+        let remaining_secs = if initial_uptime < deadline_secs as f64 {
+            (deadline_secs as f64 - initial_uptime).ceil().max(1.0) as u64
+        } else {
+            1
+        };
+
+        // Arm independent hardware watchdog chain with remaining budget (AC3, AR-01)
+        self.backend
+            .arm_watchdog(remaining_secs)
+            .map_err(UpdateEngineError::Storage)?;
+
         let start_monotonic = std::time::Instant::now();
 
         loop {
             // Re-read the journal each poll to detect commits made by other processes (AC3, CQ-R4)
-            let _ = self.journal.reload();
+            if let Err(e) = self.journal.reload() {
+                eprintln!("Warning: journal reload during trial watchdog poll: {e}");
+            }
             let current_state = self.journal.current().state;
             if current_state == UpdateTransactionState::Committed
                 || current_state == UpdateTransactionState::Failed
             {
+                let _ = self.backend.disarm_watchdog();
                 return Ok(());
             }
 

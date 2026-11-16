@@ -19,7 +19,8 @@ pub use journal::{
     ReconcileOutcome,
 };
 pub use system::{
-    evaluate_health_criteria, is_ssh_port_listening, FileStagingStorage, HealthReport,
+    evaluate_health_criteria, find_sound_card_index, is_card_device_openable,
+    is_ssh_port_listening, validate_ssh_authorized_keys, FileStagingStorage, HealthReport,
     MockSlotBackend, MockStagingStorage, PartitionType, PhysicalSlotBackend, Slot, SlotBackend,
     StagingError, StagingStorage,
 };
@@ -718,7 +719,7 @@ software = {{
             let storage = FileJournalStorage::new(&temp_dir);
             let err = JournalController::load_or_init(storage, "root_a", "root_a")
                 .expect_err("both corrupted records must fail explicit initialization");
-            assert!(err.contains("refusing to discard state"));
+            assert!(err.to_string().contains("refusing to discard state"));
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1215,8 +1216,7 @@ software = {{
 
     #[test]
     fn test_p0_f4_4_ac5_interrupted_install_reboots_to_previous_slot_not_installed() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("nx-test-p0-f4-4-ac5-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("nx-test-ac5-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -1664,7 +1664,7 @@ software =
 
         // AC1: When a trial is requested, attempt number is stored durably before reboot,
         // device boots target slot once, and previous slot remains default.
-        let status = engine.request_trial(false, true).unwrap();
+        let status = engine.request_trial(true).unwrap();
         assert_eq!(status.state, UpdateTransactionState::Trial);
         assert_eq!(status.consumed_attempts, 1);
         assert_eq!(status.default_slot, "root_a");
@@ -1681,7 +1681,7 @@ software =
         assert_eq!(engine.journal.current().default_slot, "root_a");
 
         // Requesting another trial while in state Trial is rejected
-        let err = engine.request_trial(false, false).unwrap_err();
+        let err = engine.request_trial(false).unwrap_err();
         assert_eq!(
             err,
             UpdateEngineError::InvalidStateTransition {
@@ -1711,7 +1711,7 @@ software =
         let mut engine =
             UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
 
-        let err = engine.request_trial(false, false).unwrap_err();
+        let err = engine.request_trial(false).unwrap_err();
         match err {
             UpdateEngineError::TrialFailed(msg) => {
                 assert!(msg.contains("trial can only be requested from default slot"));
@@ -1806,7 +1806,10 @@ software =
     fn test_p0_f4_5_ac3_trial_watchdog_enforces_120s_deadline_from_boot_and_reboots() {
         let capacity = 10 * 1024 * 1024;
         let mut backend = MockSlotBackend::new(Slot::B, Slot::A);
-        backend.uptime_secs = 120.0; // Simulated uptime reached 120s deadline
+        backend.uptime_secs = 20.0; // Simulated uptime is 20s from handoff
+        backend
+            .uptime_step
+            .store(100_000, std::sync::atomic::Ordering::SeqCst); // 100s advance on next read -> 120s
 
         let storage = MockStagingStorage::new(capacity);
         let mut journal = MemoryJournalStorage::default();
@@ -1823,11 +1826,11 @@ software =
         let mut engine =
             UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
 
-        // Watchdog enforces deadline of 120s from boot. Since simulated uptime is 120.0s, it triggers reboot.
         let err = engine.run_trial_watchdog(120, 50).unwrap_err();
         assert_eq!(err, UpdateEngineError::TrialDeadlineExceeded);
         assert!(engine.backend.reboot_triggered); // Plain recovery reboot back to default slot
-        assert_eq!(engine.backend.watchdog_armed, Some(120)); // Hardware watchdog was armed
+                                                  // Hardware watchdog was armed with remaining budget: 120s - 20s = 100s
+        assert_eq!(engine.backend.watchdog_armed, Some(100));
     }
 
     #[test]
@@ -1880,6 +1883,7 @@ software =
 
         assert!(res.is_ok());
         assert!(!engine.backend.reboot_triggered);
+        assert!(engine.backend.watchdog_disarmed);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -1943,7 +1947,7 @@ software =
         assert!(!engine2.backend.tryboot_triggered); // No further trial reboot
 
         // Verify that no further trial happens without a new install
-        let err = engine2.request_trial(false, false).unwrap_err();
+        let err = engine2.request_trial(false).unwrap_err();
         assert_eq!(
             err,
             UpdateEngineError::InvalidStateTransition {
@@ -1984,7 +1988,7 @@ software =
                 )
                 .unwrap();
 
-            let status = engine.request_trial(false, false).unwrap();
+            let status = engine.request_trial(false).unwrap();
             assert_eq!(status.consumed_attempts, 1);
         }
 
@@ -2022,6 +2026,20 @@ software =
                 UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
 
             // Consumed attempts must still be 2, never lower
+            assert_eq!(engine.status().consumed_attempts, 2);
+        }
+
+        // 5. Corrupt a single journal file on disk (journal.0 corrupted, journal.1 intact)
+        {
+            std::fs::write(update_dir.join("journal.0"), b"corrupted garbage bytes").unwrap();
+
+            let backend = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let engine =
+                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+            // Engine loads intact journal.1; consumed attempts remains 2, never lower (AC5)
             assert_eq!(engine.status().consumed_attempts, 2);
         }
 
@@ -2238,43 +2256,6 @@ software =
         std::env::set_var("NEXTOOMIO_SELECT_DIR", &select_dir);
         std::env::set_var("NEXTOOMIO_NO_REBOOT", "1");
 
-        let temp_dir =
-            std::env::temp_dir().join(format!("nx-test-cli-trial-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-
-        let update_dir = temp_dir.join("update");
-        let active_boot_dir = temp_dir.join("boot_active");
-        let inactive_boot_dir = temp_dir.join("boot_inactive");
-        let select_dir = temp_dir.join("select");
-
-        std::fs::create_dir_all(&update_dir).unwrap();
-        std::fs::create_dir_all(&active_boot_dir).unwrap();
-        std::fs::create_dir_all(&inactive_boot_dir).unwrap();
-        std::fs::create_dir_all(&select_dir).unwrap();
-
-        let slot_a_boot_file = temp_dir.join("slot_a_boot.img");
-        let slot_a_root_file = temp_dir.join("slot_a_root.img");
-        let slot_b_boot_file = temp_dir.join("slot_b_boot.img");
-        let slot_b_root_file = temp_dir.join("slot_b_root.img");
-
-        std::fs::write(&slot_a_boot_file, vec![0x11; 4096]).unwrap();
-        std::fs::write(&slot_a_root_file, vec![0x22; 8192]).unwrap();
-        std::fs::write(&slot_b_boot_file, vec![0x00; 4096]).unwrap();
-        std::fs::write(&slot_b_root_file, vec![0x00; 8192]).unwrap();
-
-        let hw_cfg = "dtoverlay=hifiberry-amp\n";
-        std::fs::write(active_boot_dir.join("nextoomio-hardware.txt"), hw_cfg).unwrap();
-
-        std::env::set_var("NEXTOOMIO_SLOT", "root_a");
-        std::env::set_var("NEXTOOMIO_SLOT_A_BOOT", &slot_a_boot_file);
-        std::env::set_var("NEXTOOMIO_SLOT_A_ROOT", &slot_a_root_file);
-        std::env::set_var("NEXTOOMIO_SLOT_B_BOOT", &slot_b_boot_file);
-        std::env::set_var("NEXTOOMIO_SLOT_B_ROOT", &slot_b_root_file);
-        std::env::set_var("NEXTOOMIO_ACTIVE_BOOT_DIR", &active_boot_dir);
-        std::env::set_var("NEXTOOMIO_INACTIVE_BOOT_DIR", &inactive_boot_dir);
-        std::env::set_var("NEXTOOMIO_SELECT_DIR", &select_dir);
-        std::env::set_var("NEXTOOMIO_NO_REBOOT", "1");
-
         let capacity = 10 * 1024 * 1024;
 
         // Create update container
@@ -2380,7 +2361,7 @@ software =
                 Some(capacity),
             )
             .unwrap();
-            let status = engine.request_trial(false, false).unwrap();
+            let status = engine.request_trial(false).unwrap();
             assert_eq!(status.state, UpdateTransactionState::Trial);
             assert_eq!(status.consumed_attempts, 1);
             assert_eq!(status.default_slot, "root_a");
@@ -2444,5 +2425,74 @@ software =
         std::env::remove_var("NEXTOOMIO_NO_REBOOT");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sound_card_index_extraction() {
+        let cards = " 0 [sndrpihifiberry]: HifiberryAmp - snd_rpi_hifiberry_amp\n                      snd_rpi_hifiberry_amp\n 1 [Headphones     ]: bcm2835_headpho - bcm2835 Headphones\n                      bcm2835 Headphones\n";
+        assert_eq!(find_sound_card_index(cards, "hifiberry-amp"), Some(0));
+        assert_eq!(find_sound_card_index(cards, "bcm2835_headpho"), Some(1));
+        assert_eq!(find_sound_card_index(cards, "nonexistent-card"), None);
+    }
+
+    #[test]
+    fn test_ssh_authorized_keys_validation_ad23() {
+        // Valid Ed25519 key
+        let valid_ed25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGd7P... test@nextoomio\n";
+        assert_eq!(validate_ssh_authorized_keys(valid_ed25519), Ok(1));
+
+        // Valid RSA >= 3072 bits (base64 string >= 500 chars)
+        let long_rsa_b64 = "A".repeat(520);
+        let valid_rsa = format!("ssh-rsa {long_rsa_b64} admin@bench\n");
+        assert_eq!(validate_ssh_authorized_keys(&valid_rsa), Ok(1));
+
+        // Short RSA < 3072 bits (e.g. 2048 bits / 372 chars) rejected per AD-23
+        let short_rsa_b64 = "A".repeat(372);
+        let short_rsa = format!("ssh-rsa {short_rsa_b64} old@key\n");
+        assert!(validate_ssh_authorized_keys(&short_rsa).is_err());
+
+        // Key with options (e.g. no-port-forwarding) rejected per AD-23
+        let key_with_options =
+            "command=\"/bin/sh\",no-port-forwarding ssh-ed25519 AAAAC3... test\n";
+        assert!(validate_ssh_authorized_keys(key_with_options).is_err());
+
+        // Empty file or comments only rejected
+        assert!(validate_ssh_authorized_keys("# only a comment\n").is_err());
+
+        // > 16 keys rejected
+        let seventeen_keys = (0..17)
+            .map(|i| format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGd7P{i}... user{i}\n"))
+            .collect::<String>();
+        assert!(validate_ssh_authorized_keys(&seventeen_keys).is_err());
+
+        // > 16 KiB rejected
+        let huge_content = "A".repeat(16385);
+        assert!(validate_ssh_authorized_keys(&huge_content).is_err());
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac6_trial_running_neither_target_nor_default_is_contradictory() {
+        let mut journal = MemoryJournalStorage::default();
+
+        let mut rec = JournalRecord::new_initial("root_a", "root_a");
+        rec.state = UpdateTransactionState::Trial;
+        rec.default_slot = "root_a".to_string();
+        rec.target_slot = Some("root_b".to_string());
+        rec.tx_id = Some("tx-alien-slot".to_string());
+        rec.payload_len = 1024;
+        rec.consumed_attempts = 1;
+        rec.checksum = rec.compute_checksum();
+        journal.write_record(0, &rec).unwrap();
+
+        let mut controller = JournalController::load_or_init(journal, "root_a", "root_a").unwrap();
+
+        // Booted into an unexpected third slot (e.g. root_c or unrecognised slot)
+        let outcome = controller.reconcile_boot("root_c").unwrap();
+        assert_eq!(outcome, ReconcileOutcome::ContradictoryFailed);
+        assert_eq!(controller.current().state, UpdateTransactionState::Failed);
+        assert_eq!(
+            controller.current().error_code,
+            Some("update_record_contradictory".to_string())
+        );
     }
 }

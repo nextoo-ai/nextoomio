@@ -5,8 +5,8 @@
 
 use nx_sysd::engine::DEFAULT_STAGING_RESERVATION;
 use nx_sysd::journal::FileJournalStorage;
-use nx_sysd::system::{FileStagingStorage, PhysicalSlotBackend};
-use nx_sysd::UpdateEngine;
+use nx_sysd::system::{FileStagingStorage, PhysicalSlotBackend, SlotBackend};
+use nx_sysd::{UpdateEngine, UpdateEngineError};
 use std::env;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -22,13 +22,12 @@ fn print_usage() {
         nx-sysd update stage --file <path> [--declared-length <bytes>] [--dir <path>]\n  \
         nx-sysd update validate [--dir <path>] [--hardware <id>] [--schema <n>]\n  \
         nx-sysd update install [--dir <path>] [--hardware <id>] [--schema <n>] [--capacity <bytes>]\n  \
-        nx-sysd update trial [--dir <path>] [--remote-confirm] [--no-reboot] [--json]\n  \
+        nx-sysd update trial [--dir <path>] [--no-reboot] [--json]\n  \
         nx-sysd update health-check [--dir <path>] [--json]\n  \
         nx-sysd update trial-watchdog [--dir <path>] [--deadline <secs>] [--poll-interval <ms>]\n  \
         nx-sysd update status [--dir <path>] [--json]\n  \
         nx-sysd update abort [--dir <path>]\n\n\
         Options for update trial:\n  \
-        --remote-confirm    Require explicit remote confirmation before commit (deploy workflow)\n  \
         --no-reboot         Arm trial boot without triggering immediate reboot\n"
     );
 }
@@ -93,7 +92,6 @@ fn handle_update(args: &[String]) -> ExitCode {
     let mut file_path = None;
     let mut declared_length = None;
     let mut json_output = false;
-    let mut remote_confirm = false;
     let mut no_reboot = false;
     let mut deadline_secs = 120u64;
     let mut poll_interval_ms = 1000u64;
@@ -172,10 +170,6 @@ fn handle_update(args: &[String]) -> ExitCode {
             }
             "--json" => {
                 json_output = true;
-                i += 1;
-            }
-            "--remote-confirm" => {
-                remote_confirm = true;
                 i += 1;
             }
             "--no-reboot" => {
@@ -344,7 +338,7 @@ fn handle_update(args: &[String]) -> ExitCode {
                 }
             };
 
-            match engine.request_trial(remote_confirm, !no_reboot) {
+            match engine.request_trial(!no_reboot) {
                 Ok(status) => {
                     if json_output {
                         match serde_json::to_string_pretty(&status) {
@@ -401,19 +395,93 @@ fn handle_update(args: &[String]) -> ExitCode {
             }
         }
         "trial-watchdog" => {
-            let mut engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
-                Ok(e) => e,
-                Err(err) => {
-                    eprintln!("Error: {err}");
+            let backend = PhysicalSlotBackend;
+            let active_slot = match backend.get_active_slot() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error getting active slot: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let default_slot = match backend.get_default_slot() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error getting default slot: {e}");
                     return ExitCode::from(1);
                 }
             };
 
-            match engine.run_trial_watchdog(deadline_secs, poll_interval_ms) {
-                Ok(()) => ExitCode::SUCCESS,
+            // If active slot is default slot, this is not a trial boot
+            if active_slot == default_slot {
+                return ExitCode::SUCCESS;
+            }
+
+            // We are running on a non-default slot (trial boot)!
+            match get_engine(&update_dir, hardware.clone(), schema, Some(capacity)) {
+                Ok(mut engine) => {
+                    match engine.run_trial_watchdog(deadline_secs, poll_interval_ms) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(UpdateEngineError::TrialDeadlineExceeded) => {
+                            eprintln!("Trial deadline exceeded; triggered reboot to default slot");
+                            ExitCode::from(2)
+                        }
+                        Err(err) => {
+                            eprintln!("Trial watchdog error: {err}");
+                            let mut b = backend;
+                            let _ = b.trigger_reboot();
+                            ExitCode::from(1)
+                        }
+                    }
+                }
                 Err(err) => {
-                    eprintln!("Trial watchdog error: {err}");
-                    ExitCode::from(1)
+                    eprintln!(
+                        "Cannot initialize update engine (e.g. /data not mounted: {err}); arming fallback watchdog"
+                    );
+                    let mut b = backend;
+                    let initial_uptime = b.get_uptime_secs().unwrap_or(0.0);
+                    let remaining = if initial_uptime < deadline_secs as f64 {
+                        (deadline_secs as f64 - initial_uptime).ceil().max(1.0) as u64
+                    } else {
+                        1
+                    };
+                    let _ = b.arm_watchdog(remaining);
+
+                    let start = std::time::Instant::now();
+                    loop {
+                        let cur_uptime = b.get_uptime_secs().unwrap_or(0.0);
+                        let elapsed = if cur_uptime >= initial_uptime && cur_uptime > 0.0 {
+                            cur_uptime
+                        } else {
+                            initial_uptime + start.elapsed().as_secs_f64()
+                        };
+                        if elapsed >= deadline_secs as f64 {
+                            eprintln!(
+                                "Trial deadline exceeded without /data; rebooting to default slot"
+                            );
+                            let _ = b.trigger_reboot();
+                            return ExitCode::from(2);
+                        }
+
+                        // Check if /data mounted and journal became available
+                        if let Ok(mut engine) =
+                            get_engine(&update_dir, hardware.clone(), schema, Some(capacity))
+                        {
+                            match engine.run_trial_watchdog(deadline_secs, poll_interval_ms) {
+                                Ok(()) => return ExitCode::SUCCESS,
+                                Err(UpdateEngineError::TrialDeadlineExceeded) => {
+                                    return ExitCode::from(2);
+                                }
+                                Err(e) => {
+                                    eprintln!("Watchdog error: {e}");
+                                    let _ = b.trigger_reboot();
+                                    return ExitCode::from(1);
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            poll_interval_ms.max(50),
+                        ));
+                    }
                 }
             }
         }

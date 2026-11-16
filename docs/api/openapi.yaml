@@ -133,10 +133,6 @@ paths:
             schema:
               type: object
               properties:
-                remote_confirm:
-                  type: boolean
-                  default: false
-                  description: Whether external remote confirmation is expected before committing (used by bench deploy tools; commit requires explicit confirmation).
                 auto_reboot:
                   type: boolean
                   default: true

@@ -164,6 +164,11 @@ pub trait SlotBackend: Send + Sync {
     /// Arms the hardware watchdog to enforce independent trial deadline (AC3, AR-01).
     fn arm_watchdog(&mut self, timeout_secs: u64) -> Result<(), String>;
 
+    /// Disarms the hardware watchdog when trial transaction commits successfully (AC3, AR-01).
+    fn disarm_watchdog(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Retrieves kernel/system uptime in seconds for trial deadline accounting (AC3).
     fn get_uptime_secs(&self) -> Result<f64, String>;
 
@@ -186,7 +191,10 @@ pub struct MockSlotBackend {
     pub tryboot_triggered: bool,
     pub reboot_triggered: bool,
     pub watchdog_armed: Option<u64>,
+    pub watchdog_disarmed: bool,
     pub uptime_secs: f64,
+    pub uptime_step: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub uptime_reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub health_report: Option<HealthReport>,
 }
 
@@ -215,7 +223,10 @@ impl MockSlotBackend {
             tryboot_triggered: false,
             reboot_triggered: false,
             watchdog_armed: None,
+            watchdog_disarmed: false,
             uptime_secs: 0.0,
+            uptime_step: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            uptime_reads: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             health_report: None,
         }
     }
@@ -337,8 +348,17 @@ impl SlotBackend for MockSlotBackend {
         Ok(())
     }
 
+    fn disarm_watchdog(&mut self) -> Result<(), String> {
+        self.watchdog_disarmed = true;
+        Ok(())
+    }
+
     fn get_uptime_secs(&self) -> Result<f64, String> {
-        Ok(self.uptime_secs)
+        let reads = self
+            .uptime_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let step = self.uptime_step.load(std::sync::atomic::Ordering::SeqCst) as f64 / 1000.0;
+        Ok(self.uptime_secs + (reads as f64 * step))
     }
 
     fn check_health(&self) -> Result<HealthReport, String> {
@@ -505,8 +525,199 @@ impl Drop for ScopedBootMount {
     }
 }
 
+/// Scoped RAII mount guard for /boot/select partition: remounts rw for writing, and ro on drop (AC5, AR-01).
+struct ScopedSelectRwMount {
+    mount_dir: Option<PathBuf>,
+}
+
+impl ScopedSelectRwMount {
+    fn remount_if_needed(autoboot_path: &Path) -> Result<Self, String> {
+        if std::env::var("NEXTOOMIO_SELECT_DIR").is_ok()
+            || std::env::var("NEXTOOMIO_AUTOBOOT_TXT").is_ok()
+        {
+            return Ok(Self { mount_dir: None });
+        }
+        let _mount_point = autoboot_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/boot/select"));
+        #[cfg(target_os = "linux")]
+        {
+            let output = std::process::Command::new("mount")
+                .args(["-o", "remount,rw"])
+                .arg(_mount_point)
+                .output()
+                .map_err(|e| {
+                    format!(
+                        "cannot run mount to remount rw {}: {e}",
+                        _mount_point.display()
+                    )
+                })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "failed to remount rw {}: {stderr}",
+                    _mount_point.display()
+                ));
+            }
+            Ok(Self {
+                mount_dir: Some(_mount_point.to_path_buf()),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self { mount_dir: None })
+        }
+    }
+}
+
+impl Drop for ScopedSelectRwMount {
+    fn drop(&mut self) {
+        if let Some(_mount_point) = &self.mount_dir {
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("mount")
+                    .args(["-o", "remount,ro"])
+                    .arg(_mount_point)
+                    .output();
+            }
+        }
+    }
+}
+
+/// Finds the card number in `/proc/asound/cards` matching the given overlay or configuration name.
+pub fn find_sound_card_index(cards_content: &str, overlay_name: &str) -> Option<u32> {
+    let clean = overlay_name.replace('-', "_");
+    let overlay_lower = overlay_name.to_lowercase();
+    let clean_lower = clean.to_lowercase();
+    let mut current_idx: Option<u32> = None;
+    let mut current_matches = false;
+
+    for line in cards_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let line_lower = line.to_lowercase();
+        if let Some(first_char) = line.trim_start().chars().next() {
+            if first_char.is_ascii_digit() {
+                if let Some(idx) = current_idx {
+                    if current_matches {
+                        return Some(idx);
+                    }
+                }
+                let mut parts = line.split_whitespace();
+                if let Some(num_str) = parts.next() {
+                    if let Ok(idx) = num_str.parse::<u32>() {
+                        current_idx = Some(idx);
+                        current_matches = line_lower.contains(&overlay_lower)
+                            || line_lower.contains(&clean_lower);
+                        continue;
+                    }
+                }
+            }
+        }
+        if current_idx.is_some()
+            && (line_lower.contains(&overlay_lower) || line_lower.contains(&clean_lower))
+        {
+            current_matches = true;
+        }
+    }
+
+    if current_matches {
+        current_idx
+    } else {
+        None
+    }
+}
+
+pub fn is_card_device_openable(card_idx: u32) -> bool {
+    let control_path = PathBuf::from(format!("/dev/snd/controlC{card_idx}"));
+    if let Ok(file) = File::open(&control_path) {
+        drop(file);
+        return true;
+    }
+    let pcm_p = PathBuf::from(format!("/dev/snd/pcmC{card_idx}D0p"));
+    if let Ok(file) = File::open(&pcm_p) {
+        drop(file);
+        return true;
+    }
+    let pcm_c = PathBuf::from(format!("/dev/snd/pcmC{card_idx}D0c"));
+    if let Ok(file) = File::open(&pcm_c) {
+        drop(file);
+        return true;
+    }
+    false
+}
+
+/// Validates an SSH authorized_keys file per AD-23:
+/// - Maximum file size 16 KiB (16384 bytes)
+/// - Maximum 16 keys
+/// - Accepted key types: ssh-ed25519, ecdsa-sha2-nistp256, ecdsa-sha2-nistp384, ecdsa-sha2-nistp521, ssh-rsa (>= 3072 bits)
+/// - Key options forbidden
+/// - Tolerates Windows line endings
+pub fn validate_ssh_authorized_keys(content: &str) -> Result<usize, String> {
+    if content.len() > 16384 {
+        return Err("authorized_keys file exceeds 16 KiB limit (AD-23)".to_string());
+    }
+    let mut key_count = 0;
+    for (line_num, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        key_count += 1;
+        if key_count > 16 {
+            return Err("authorized_keys file exceeds maximum of 16 keys (AD-23)".to_string());
+        }
+        let mut tokens = trimmed.split_whitespace();
+        let key_type = tokens.next().unwrap_or("");
+        match key_type {
+            "ssh-ed25519"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521" => {
+                if tokens.next().is_none() {
+                    return Err(format!(
+                        "line {} has missing key data for {key_type}",
+                        line_num + 1
+                    ));
+                }
+            }
+            "ssh-rsa" => {
+                if let Some(b64) = tokens.next() {
+                    // AD-23: RSA keys must have at least 3072 bits (modulus length >= 384 bytes, base64 payload >= 500 chars)
+                    if b64.len() < 500 {
+                        return Err(format!(
+                            "line {} has RSA key with less than 3072 bits (AD-23)",
+                            line_num + 1
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "line {} has missing key data for ssh-rsa",
+                        line_num + 1
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "line {} has disallowed key type or option prefix '{other}' (AD-23)",
+                    line_num + 1
+                ));
+            }
+        }
+    }
+    if key_count == 0 {
+        return Err("authorized_keys file contains no valid keys".to_string());
+    }
+    Ok(key_count)
+}
+
+#[allow(dead_code)]
+static WATCHDOG_FILE: std::sync::Mutex<Option<File>> = std::sync::Mutex::new(None);
+
 /// Physical slot backend reading from Linux kernel cmdline, mount tables, and block devices.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PhysicalSlotBackend;
 
 impl PhysicalSlotBackend {
@@ -533,29 +744,15 @@ impl PhysicalSlotBackend {
                 t.strip_prefix("dtoverlay=").map(str::trim)
             });
             if let Some(name) = overlay_name {
-                let clean_name = name.replace('-', "_");
-                if !cards.contains(name) && !cards.contains(&clean_name) {
+                if let Some(card_idx) = find_sound_card_index(&cards, name) {
+                    return is_card_device_openable(card_idx);
+                } else {
                     return false;
                 }
             }
         }
 
-        let snd_dir = Path::new("/dev/snd");
-        if snd_dir.is_dir() {
-            if let Ok(entries) = fs::read_dir(snd_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with("controlC") || name.starts_with("pcmC") {
-                        if let Ok(file) = File::open(entry.path()) {
-                            drop(file);
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false
+        is_card_device_openable(0)
     }
 
     fn is_device_path_overridden(&self, slot: Slot, partition: PartitionType) -> bool {
@@ -702,16 +899,38 @@ impl SlotBackend for PhysicalSlotBackend {
     }
 
     fn get_default_slot(&self) -> Result<Slot, String> {
-        // Read /boot/autoboot.txt or default to active slot
-        if let Ok(autoboot) = fs::read_to_string("/boot/autoboot.txt") {
+        let autoboot_path = self.autoboot_path();
+        if let Ok(autoboot) = fs::read_to_string(&autoboot_path) {
+            let mut in_all_or_general = true;
             for line in autoboot.lines() {
                 let trimmed = line.trim();
-                if let Some(val) = trimmed.strip_prefix("default_partition=") {
-                    if val.trim() == "3" {
-                        return Ok(Slot::B);
-                    }
-                    if val.trim() == "2" {
-                        return Ok(Slot::A);
+                if trimmed.starts_with('[') {
+                    in_all_or_general = trimmed == "[all]";
+                } else if in_all_or_general {
+                    if let Some(val) = trimmed.strip_prefix("boot_partition=") {
+                        let part = val.trim();
+                        if part == "2" {
+                            return Ok(Slot::A);
+                        } else if part == "3" {
+                            return Ok(Slot::B);
+                        } else {
+                            return Err(format!(
+                                "invalid boot_partition '{part}' in {}",
+                                autoboot_path.display()
+                            ));
+                        }
+                    } else if let Some(val) = trimmed.strip_prefix("default_partition=") {
+                        let part = val.trim();
+                        if part == "2" {
+                            return Ok(Slot::A);
+                        } else if part == "3" {
+                            return Ok(Slot::B);
+                        } else {
+                            return Err(format!(
+                                "invalid default_partition '{part}' in {}",
+                                autoboot_path.display()
+                            ));
+                        }
                     }
                 }
             }
@@ -941,7 +1160,7 @@ impl SlotBackend for PhysicalSlotBackend {
     fn arm_trial_boot(&mut self, target_slot: Slot) -> Result<(), String> {
         let autoboot_path = self.autoboot_path();
 
-        let default_slot = self.get_default_slot().unwrap_or(Slot::A);
+        let default_slot = self.get_default_slot()?;
         let default_part = match default_slot {
             Slot::A => 2,
             Slot::B => 3,
@@ -955,20 +1174,37 @@ impl SlotBackend for PhysicalSlotBackend {
             "[all]\ntryboot_a_b=1\nboot_partition={default_part}\n\n[tryboot]\nboot_partition={target_part}\n"
         );
 
-        if let Some(parent) = autoboot_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
+        let parent = autoboot_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create dir {}: {e}", parent.display()))?;
 
+        let _mount_guard = ScopedSelectRwMount::remount_if_needed(&autoboot_path)?;
+
+        let tmp_path = parent.join(format!(".autoboot.txt.tmp.{}", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&autoboot_path)
-            .map_err(|e| format!("cannot open {}: {e}", autoboot_path.display()))?;
+            .open(&tmp_path)
+            .map_err(|e| format!("cannot open temp file {}: {e}", tmp_path.display()))?;
         file.write_all(content.as_bytes())
-            .map_err(|e| format!("cannot write {}: {e}", autoboot_path.display()))?;
+            .map_err(|e| format!("cannot write {}: {e}", tmp_path.display()))?;
         file.sync_all()
-            .map_err(|e| format!("sync error {}: {e}", autoboot_path.display()))?;
+            .map_err(|e| format!("sync error {}: {e}", tmp_path.display()))?;
+        drop(file);
+
+        fs::rename(&tmp_path, &autoboot_path).map_err(|e| {
+            format!(
+                "atomic rename failed {} -> {}: {e}",
+                tmp_path.display(),
+                autoboot_path.display()
+            )
+        })?;
+
+        if let Ok(dir_file) = File::open(parent) {
+            let _ = dir_file.sync_all();
+        }
+
         Ok(())
     }
 
@@ -979,23 +1215,41 @@ impl SlotBackend for PhysicalSlotBackend {
             return Ok(());
         }
 
-        let default_slot = self.get_default_slot().unwrap_or(Slot::A);
+        let default_slot = self.get_default_slot()?;
         let default_part = match default_slot {
             Slot::A => 2,
             Slot::B => 3,
         };
         let content = format!("[all]\ntryboot_a_b=1\nboot_partition={default_part}\n");
 
+        let parent = autoboot_path.parent().unwrap_or_else(|| Path::new("."));
+        let _mount_guard = ScopedSelectRwMount::remount_if_needed(&autoboot_path)?;
+
+        let tmp_path = parent.join(format!(".autoboot.txt.tmp.{}", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&autoboot_path)
-            .map_err(|e| format!("cannot open {}: {e}", autoboot_path.display()))?;
+            .open(&tmp_path)
+            .map_err(|e| format!("cannot open temp file {}: {e}", tmp_path.display()))?;
         file.write_all(content.as_bytes())
-            .map_err(|e| format!("cannot write {}: {e}", autoboot_path.display()))?;
+            .map_err(|e| format!("cannot write {}: {e}", tmp_path.display()))?;
         file.sync_all()
-            .map_err(|e| format!("sync error {}: {e}", autoboot_path.display()))?;
+            .map_err(|e| format!("sync error {}: {e}", tmp_path.display()))?;
+        drop(file);
+
+        fs::rename(&tmp_path, &autoboot_path).map_err(|e| {
+            format!(
+                "atomic rename failed {} -> {}: {e}",
+                tmp_path.display(),
+                autoboot_path.display()
+            )
+        })?;
+
+        if let Ok(dir_file) = File::open(parent) {
+            let _ = dir_file.sync_all();
+        }
+
         Ok(())
     }
 
@@ -1034,7 +1288,7 @@ impl SlotBackend for PhysicalSlotBackend {
         #[cfg(target_os = "linux")]
         {
             // Raspberry Pi firmware selects [tryboot] section in autoboot.txt only when reboot argument is "0 tryboot"
-            let _ = std::process::Command::new("reboot")
+            let res = std::process::Command::new("reboot")
                 .arg("0 tryboot")
                 .output()
                 .or_else(|_| {
@@ -1043,8 +1297,22 @@ impl SlotBackend for PhysicalSlotBackend {
                         .arg("0 tryboot")
                         .output()
                 });
+            match res {
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    Err(format!(
+                        "reboot '0 tryboot' failed with status {}: {stderr}",
+                        out.status
+                    ))
+                }
+                Err(e) => Err(format!("failed to execute reboot '0 tryboot': {e}")),
+            }
         }
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(())
+        }
     }
 
     fn trigger_reboot(&mut self) -> Result<(), String> {
@@ -1053,35 +1321,90 @@ impl SlotBackend for PhysicalSlotBackend {
         }
         #[cfg(target_os = "linux")]
         {
-            let _ = std::process::Command::new("systemctl")
+            let res = std::process::Command::new("systemctl")
                 .arg("reboot")
-                .output();
+                .output()
+                .or_else(|_| std::process::Command::new("reboot").output());
+            match res {
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    Err(format!(
+                        "reboot failed with status {}: {stderr}",
+                        out.status
+                    ))
+                }
+                Err(e) => Err(format!("failed to execute reboot: {e}")),
+            }
         }
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(())
+        }
     }
 
     fn arm_watchdog(&mut self, timeout_secs: u64) -> Result<(), String> {
+        let watchdog_path = if let Ok(val) = std::env::var("NEXTOOMIO_WATCHDOG_DEV") {
+            PathBuf::from(val)
+        } else {
+            PathBuf::from("/dev/watchdog")
+        };
+
+        if !watchdog_path.exists() {
+            // In unit test and desktop environments without hardware watchdog, arming is skipped
+            return Ok(());
+        }
+
         #[cfg(target_os = "linux")]
         {
-            if Path::new("/dev/watchdog").exists() {
-                if let Ok(file) = OpenOptions::new().write(true).open("/dev/watchdog") {
-                    use std::os::unix::io::AsRawFd;
-                    let mut timeout: std::os::raw::c_int = timeout_secs as std::os::raw::c_int;
-                    extern "C" {
-                        fn ioctl(
-                            fd: std::os::raw::c_int,
-                            request: std::os::raw::c_ulong,
-                            ...
-                        ) -> std::os::raw::c_int;
-                    }
-                    // WDIOC_SETTIMEOUT = 0xc0045706
-                    unsafe {
-                        ioctl(file.as_raw_fd(), 0xc0045706, &mut timeout);
-                    }
-                }
+            use std::os::unix::io::AsRawFd;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&watchdog_path)
+                .map_err(|e| format!("cannot open {}: {e}", watchdog_path.display()))?;
+
+            let mut timeout: std::os::raw::c_int = timeout_secs as std::os::raw::c_int;
+            extern "C" {
+                fn ioctl(
+                    fd: std::os::raw::c_int,
+                    request: std::os::raw::c_ulong,
+                    ...
+                ) -> std::os::raw::c_int;
+            }
+            // SAFETY:
+            // 1. `file.as_raw_fd()` borrows a valid open file descriptor for `/dev/watchdog`.
+            // 2. `WDIOC_SETTIMEOUT` (0xc0045706) takes a mutable pointer to a c_int specifying the timeout in seconds.
+            // 3. `timeout` is a stack-allocated c_int that remains valid for the duration of ioctl.
+            let ret = unsafe { ioctl(file.as_raw_fd(), 0xc0045706, &mut timeout) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(format!(
+                    "ioctl(WDIOC_SETTIMEOUT) failed on {}: {err}",
+                    watchdog_path.display()
+                ));
+            }
+
+            // Retain the open file descriptor in static WATCHDOG_FILE to keep watchdog running
+            *WATCHDOG_FILE.lock().unwrap() = Some(file);
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = timeout_secs;
+            Ok(())
+        }
+    }
+
+    fn disarm_watchdog(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(mut file) = WATCHDOG_FILE.lock().unwrap().take() {
+                // Linux watchdog API: writing 'V' before closing indicates clean magic close/disarm
+                let _ = file.write_all(b"V");
+                let _ = file.flush();
             }
         }
-        let _ = timeout_secs;
         Ok(())
     }
 
@@ -1119,9 +1442,21 @@ impl SlotBackend for PhysicalSlotBackend {
         let select_dir = PathBuf::from("/boot/select");
         let key_1 = select_dir.join("authorized_keys");
         let key_2 = select_dir.join("authorized_keys.txt");
-        let ssh_key_file_present = (key_1.exists()
-            && fs::metadata(&key_1).map(|m| m.len() > 0).unwrap_or(false))
-            || (key_2.exists() && fs::metadata(&key_2).map(|m| m.len() > 0).unwrap_or(false));
+        let key_path = if key_1.exists() {
+            Some(key_1)
+        } else if key_2.exists() {
+            Some(key_2)
+        } else {
+            None
+        };
+
+        let ssh_key_file_present = match key_path {
+            Some(path) => match fs::read_to_string(&path) {
+                Ok(content) => validate_ssh_authorized_keys(&content).is_ok(),
+                Err(_) => false,
+            },
+            None => false,
+        };
 
         let tcp = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
         let tcp6 = fs::read_to_string("/proc/net/tcp6").unwrap_or_default();

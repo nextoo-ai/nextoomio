@@ -282,13 +282,31 @@ pub enum ReconcileOutcome {
     JournalCorruptedFailed,
 }
 
+/// Typed journal errors distinguishing corruption from storage/I/O issues (CQ-R9, AC6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalError {
+    Corrupted(String),
+    Storage(String),
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupted(msg) => write!(f, "journal corrupted or invalid: {msg}"),
+            Self::Storage(msg) => write!(f, "journal storage error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for JournalError {}
+
 impl<S: JournalStorage> JournalController<S> {
     pub fn load_or_init(
         mut storage: S,
         active_slot: &str,
         default_slot: &str,
-    ) -> Result<Self, String> {
-        storage.preallocate()?;
+    ) -> Result<Self, JournalError> {
+        storage.preallocate().map_err(JournalError::Storage)?;
         let r0 = storage.read_record(0);
         let r1 = storage.read_record(1);
 
@@ -304,13 +322,15 @@ impl<S: JournalStorage> JournalController<S> {
             (Ok(None), Ok(Some(b))) | (Err(_), Ok(Some(b))) => (1, b),
             (Ok(None), Ok(None)) => {
                 let init = JournalRecord::new_initial(active_slot, default_slot);
-                storage.write_record(0, &init)?;
+                storage
+                    .write_record(0, &init)
+                    .map_err(JournalError::Storage)?;
                 (0, init)
             }
             (r0_err, r1_err) => {
-                return Err(format!(
+                return Err(JournalError::Corrupted(format!(
                     "both journal records are invalid or corrupted (slot 0: {r0_err:?}, slot 1: {r1_err:?}); refusing to discard state"
-                ));
+                )));
             }
         };
 
@@ -322,7 +342,7 @@ impl<S: JournalStorage> JournalController<S> {
     }
 
     /// Reloads the newest valid journal record from storage.
-    pub fn reload(&mut self) -> Result<(), String> {
+    pub fn reload(&mut self) -> Result<(), JournalError> {
         let r0 = self.storage.read_record(0);
         let r1 = self.storage.read_record(1);
 
@@ -335,18 +355,28 @@ impl<S: JournalStorage> JournalController<S> {
                     self.active_slot_idx = 1;
                     self.latest_record = b;
                 }
+                Ok(())
             }
             (Ok(Some(a)), Ok(None)) | (Ok(Some(a)), Err(_)) => {
                 self.active_slot_idx = 0;
                 self.latest_record = a;
+                Ok(())
             }
             (Ok(None), Ok(Some(b))) | (Err(_), Ok(Some(b))) => {
                 self.active_slot_idx = 1;
                 self.latest_record = b;
+                Ok(())
             }
-            _ => {}
+            (Err(e0), Err(e1)) => Err(JournalError::Corrupted(format!(
+                "both journal records unreadable: {e0}; {e1}"
+            ))),
+            (Ok(None), Err(e)) | (Err(e), Ok(None)) => Err(JournalError::Corrupted(format!(
+                "one journal record missing and one invalid: {e}"
+            ))),
+            (Ok(None), Ok(None)) => Err(JournalError::Storage(
+                "no journal records found on reload".to_string(),
+            )),
         }
-        Ok(())
     }
 
     pub fn current(&self) -> &JournalRecord {
@@ -578,6 +608,17 @@ impl<S: JournalStorage> JournalController<S> {
                         )?;
                         return Ok(ReconcileOutcome::TrialExhausted);
                     }
+                } else {
+                    // Running neither target slot nor default slot while in state Trial is contradictory (AC6)
+                    self.commit_state(
+                        UpdateTransactionState::Failed,
+                        self.latest_record.tx_id.clone(),
+                        None,
+                        self.latest_record.payload_len,
+                        None,
+                        Some("update_record_contradictory".to_string()),
+                    )?;
+                    return Ok(ReconcileOutcome::ContradictoryFailed);
                 }
             } else {
                 self.commit_state(

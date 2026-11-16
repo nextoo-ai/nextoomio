@@ -256,15 +256,12 @@ impl UpdateTransactionState {
                 | (Receiving, Failed)
                 | (Staged, Validated)
                 | (Staged, Failed)
-                | (Staged, Idle)
                 | (Validated, Installing)
                 | (Validated, Failed)
-                | (Validated, Idle)
                 | (Installing, Installed)
                 | (Installing, Failed)
                 | (Installed, Trial)
                 | (Installed, Failed)
-                | (Installed, Idle)
                 | (Trial, Trial)
                 | (Trial, Committing)
                 | (Trial, Failed)
@@ -350,9 +347,5 @@ mod tests {
         assert!(Trial.can_transition_to(Trial));
         assert!(Trial.can_transition_to(Committing));
         assert!(Trial.can_transition_to(Failed));
-        // Discarding unwanted images:
-        assert!(Staged.can_transition_to(Idle));
-        assert!(Validated.can_transition_to(Idle));
-        assert!(Installed.can_transition_to(Idle));
     }
 }
