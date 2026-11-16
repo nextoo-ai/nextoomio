@@ -2,7 +2,8 @@
 Description=nextoomio SSH key file validator and manager
 Documentation=https://github.com/nextoo-ai/nextoomio/issues/15
 RequiresMountsFor=/boot/select /data
-After=local-fs.target
+After=local-fs.target nftables.service
+Wants=nftables.service
 Before=sshd.service
 
 [Service]

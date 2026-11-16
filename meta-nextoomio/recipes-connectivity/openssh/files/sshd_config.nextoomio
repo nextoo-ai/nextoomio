@@ -2,7 +2,6 @@
 # Key authentication only; passwords, interactive auth, and forwardings disabled.
 
 Port 22
-Protocol 2
 
 # Host keys stored persistently on the shared data partition (AC5)
 HostKey /data/ssh/ssh_host_ed25519_key
@@ -29,4 +28,3 @@ PermitTunnel no
 UsePAM no
 PrintMotd no
 AcceptEnv LANG LC_*
-Subsystem sftp /usr/libexec/sftp-server
