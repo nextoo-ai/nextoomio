@@ -55,9 +55,11 @@ do_install() {
     install -d ${D}${systemd_system_unitdir}/data.mount.d
     install -m 0644 ${UNPACKDIR}/data.mount.d/10-condition.conf ${D}${systemd_system_unitdir}/data.mount.d/10-condition.conf
 
-    # Ensure /data and /boot mountpoint directories exist in the rootfs
+    # Ensure /data, /boot, /boot/select, and /boot/firmware mountpoint directories exist in the rootfs
     install -d ${D}/data
     install -d ${D}/boot
+    install -d ${D}/boot/select
+    install -d ${D}/boot/firmware
 }
 
 FILES:${PN} += " \

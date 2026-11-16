@@ -68,6 +68,8 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/data.mount.d/10-condition.conf",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.sh",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.service",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile.service",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile-setup.sh",
@@ -105,6 +107,10 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/nextoomio-test-faults_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-hang-early.sh",
         root / "scripts/bench/test_broken_images.py",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py",
+        root / "scripts/bench/tone-check.sh",
     ]
 
     for path in required_files:
@@ -289,6 +295,11 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
                 "must include 'nextoomio-audio-profile' (D-011, D-012, P0-F6.1)"
             )
+        if "nextoomio-tone-check" not in image_text:
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
+                "must include 'nextoomio-tone-check' (P0-F6.2)"
+            )
 
     # Wic layout verification (ARCHITECTURE.md section 3.6, AC2, AC4, AC5)
     wks_path = root / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
@@ -299,9 +310,11 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 errors.append(f"Wic layout missing partition label '{label}'")
         if re.search(r"part\s+/data\s+.*--fixed-size", wks_text):
             errors.append("Wic layout /data partition must not use --fixed-size (D-006: grown on first boot)")
-        for mpoint in ("/boot/select", "/boot", "/data"):
+        for mpoint in ("/boot/select", "/boot/firmware", "/data"):
             if not re.search(rf"part\s+{re.escape(mpoint)}\s+.*--no-fstab-update", wks_text):
                 errors.append(f"Wic layout partition {mpoint} must specify --no-fstab-update")
+        if re.search(r"part\s+/boot\s+", wks_text):
+            errors.append("Wic layout must not specify /boot as mountpoint; use /boot/firmware (AC1)")
 
     image_path = root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
     if image_path.is_file():
@@ -368,6 +381,39 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             elif "--label data" in line_str:
                 if "--size 1536M" not in line_str:
                     errors.append("Wic data partition must specify initial size 1536M (--size 1536M, D-006)")
+
+    # P0-F2.2 / SYS-04: Validate boot mount target and ensure no fstab line or unit mounts on /boot itself (AC1)
+    boot_mount_sh = root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.sh"
+    if boot_mount_sh.is_file():
+        bm_text = boot_mount_sh.read_text(encoding="utf-8")
+        if not re.search(r'NEXTOOMIO_BOOT_DIR:-(?:/boot/firmware)\b', bm_text):
+            errors.append("nextoomio-boot-mount.sh target must default to /boot/firmware (AC1)")
+
+    fstab_path = root / "meta-nextoomio/recipes-core/base-files/files/fstab"
+    if fstab_path.is_file():
+        fstab_text = fstab_path.read_text(encoding="utf-8")
+        for line in fstab_text.splitlines():
+            line_str = line.strip()
+            if not line_str or line_str.startswith("#"):
+                continue
+            parts = line_str.split()
+            if len(parts) >= 2 and parts[1] == "/boot":
+                errors.append(f"fstab must not mount anything on /boot itself; active boot partition is mounted at /boot/firmware: {line_str}")
+
+    base_files_bb = root / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend"
+    if base_files_bb.is_file():
+        bf_text = base_files_bb.read_text(encoding="utf-8")
+        if "/boot/firmware" not in bf_text:
+            errors.append("base-files_%.bbappend must include /boot/firmware in dirs755")
+        if "/boot/select" not in bf_text:
+            errors.append("base-files_%.bbappend must include /boot/select in dirs755")
+
+    meta_dir = root / "meta-nextoomio"
+    if meta_dir.is_dir():
+        for unit_file in meta_dir.rglob("*.mount"):
+            unit_text = unit_file.read_text(encoding="utf-8")
+            if re.search(r"^\s*Where\s*=\s*/boot\s*$", unit_text, re.MULTILINE):
+                errors.append(f"{unit_file.relative_to(root)}: unit must not mount on /boot itself; active boot partition is mounted at /boot/firmware")
 
     # P0-F2.4: Validate network baseline, firewall rules, and hostname configuration
     if distro_conf.is_file():
@@ -658,6 +704,49 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if "/run/nextoomio/diagnostics/audio.txt" not in sh_text:
             errors.append("nextoomio-audio-profile-setup.sh must record diagnostics text to /run/nextoomio/diagnostics/audio.txt")
 
+    # P0-F6.2 / D-012: Validate nextoomio-tone-check recipe, script, and safe tone generation
+    tc_bb = root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb"
+    if tc_bb.is_file():
+        tc_text = tc_bb.read_text(encoding="utf-8")
+        if "generate-tone.py" not in tc_text:
+            errors.append("nextoomio-tone-check_0.0.1.bb must execute generate-tone.py to generate safe test tone (AC2, D-012)")
+        if "test-tone-48k-440hz.wav" not in tc_text:
+            errors.append("nextoomio-tone-check_0.0.1.bb must install test-tone-48k-440hz.wav (AC1, AC2)")
+        if "nextoomio-tone-check" not in tc_text:
+            errors.append("nextoomio-tone-check_0.0.1.bb must install nextoomio-tone-check command (AC1)")
+        if "alsa-utils" not in tc_text:
+            errors.append("nextoomio-tone-check_0.0.1.bb must declare RDEPENDS with alsa-utils (AC1)")
+
+    gen_tone = root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py"
+    if gen_tone.is_file():
+        gen_text = gen_tone.read_text(encoding="utf-8")
+        m_vol = re.search(r"MAX_LOGICAL_VOLUME_PCT\s*=\s*([0-9]+(?:\.[0-9]+)?)", gen_text)
+        if not m_vol or float(m_vol.group(1)) > 30.0:
+            errors.append("generate-tone.py must enforce 30% logical volume limit (linear gain <= 0.027, AC2, D-012)")
+        elif "0.027" not in gen_text:
+            errors.append("generate-tone.py must enforce cubic gain amplitude (linear gain <= 0.027, AC2, D-012)")
+
+    tc_sh = root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh"
+    if tc_sh.is_file():
+        tc_sh_text = tc_sh.read_text(encoding="utf-8")
+        if "sound_card_absent" not in tc_sh_text or "exit 2" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must detect absent sound card and exit with code 2 (AC3)")
+        if "playback_device_busy" not in tc_sh_text or "exit 3" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must detect busy playback device and exit with code 3 (AC3)")
+        if "trap" not in tc_sh_text or "cleanup" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must configure signal/exit cleanup trap (AC4)")
+        if "state:[[:space:]]*RUNNING" not in tc_sh_text and "state: RUNNING" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must verify stream RUNNING state from ALSA status file (AC1)")
+        if "hw_ptr" not in tc_sh_text:
+            errors.append("nextoomio-tone-check.sh must verify hardware position advancement via hw_ptr (AC1)")
+
+    # P0-F6.2: Validate tone-check.sh bench script
+    bench_tc = root / "scripts/bench/tone-check.sh"
+    if bench_tc.is_file():
+        btc_text = bench_tc.read_text(encoding="utf-8")
+        if "nextoomio-tone-check" not in btc_text:
+            errors.append("scripts/bench/tone-check.sh must invoke nextoomio-tone-check on bench host (AC1)")
+
     # Component register check in ARCHITECTURE.md section 10
     arch_doc = root / "ARCHITECTURE.md"
     if arch_doc.is_file():
@@ -795,6 +884,8 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
         "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/data.mount.d/10-condition.conf",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.sh",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.service",
         "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
         "meta-nextoomio/recipes-core/base-files/files/fstab",
         "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
@@ -818,6 +909,10 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/nextoomio-test-faults_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-hang-early.sh",
         "scripts/bench/test_broken_images.py",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py",
+        "scripts/bench/tone-check.sh",
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
     ]
@@ -1060,6 +1155,75 @@ def run_self_tests() -> int:
         avahi_bbappend.write_text(orig_avahi_bbappend, encoding="utf-8")
         print("  test_check_fails_when_recipe_uses_workdir_for_file_source: OK")
 
+        # 24. AC1 / P0-F6.2: Fail when nextoomio-image.bb missing nextoomio-tone-check in IMAGE_INSTALL
+        img_bb_path = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_img_bb = img_bb_path.read_text(encoding="utf-8")
+        img_bb_path.write_text(orig_img_bb.replace("nextoomio-tone-check", "ignored-pkg"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_INSTALL must include 'nextoomio-tone-check'" in e for e in errs), f"Expected tone check in IMAGE_INSTALL failure: {errs}"
+        img_bb_path.write_text(orig_img_bb, encoding="utf-8")
+        print("  test_check_fails_when_image_missing_tone_check: OK")
+
+        # 25. AC2 / D-012: Fail when generate-tone.py omits safe 30% volume limit
+        gt_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py"
+        orig_gt = gt_path.read_text(encoding="utf-8")
+        gt_path.write_text(orig_gt.replace("MAX_LOGICAL_VOLUME_PCT = 30.0", "MAX_LOGICAL_VOLUME_PCT = 100.0").replace("0.027", "1.0"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("generate-tone.py must enforce 30% logical volume limit" in e for e in errs), f"Expected safe volume failure: {errs}"
+        gt_path.write_text(orig_gt, encoding="utf-8")
+        print("  test_check_fails_when_tone_generator_omits_safe_volume: OK")
+
+        # 26. AC3: Fail when nextoomio-tone-check.sh omits absent sound card detection or code 2
+        tc_sh_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh"
+        orig_tc_sh = tc_sh_path.read_text(encoding="utf-8")
+        tc_sh_path.write_text(orig_tc_sh.replace("sound_card_absent", "card_missing").replace("exit 2", "exit 1"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must detect absent sound card and exit with code 2" in e for e in errs), f"Expected absent card failure: {errs}"
+        tc_sh_path.write_text(orig_tc_sh, encoding="utf-8")
+        print("  test_check_fails_when_tone_check_omits_absent_card_detection: OK")
+
+        # 27. AC3: Fail when nextoomio-tone-check.sh omits busy device detection or code 3
+        tc_sh_path.write_text(orig_tc_sh.replace("playback_device_busy", "pcm_busy").replace("exit 3", "exit 1"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must detect busy playback device and exit with code 3" in e for e in errs), f"Expected busy device failure: {errs}"
+        tc_sh_path.write_text(orig_tc_sh, encoding="utf-8")
+        print("  test_check_fails_when_tone_check_omits_busy_device_detection: OK")
+
+        # 28. AC4: Fail when nextoomio-tone-check.sh omits signal cleanup trap
+        orig_tc_trap = orig_tc_sh
+        tc_sh_path.write_text(orig_tc_trap.replace("trap", "disabled"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must configure signal/exit cleanup trap" in e for e in errs), f"Expected cleanup trap failure: {errs}"
+        tc_sh_path.write_text(orig_tc_trap, encoding="utf-8")
+        print("  test_check_fails_when_tone_check_omits_cleanup_trap: OK")
+
+        # 29. AC1: Fail when nextoomio-boot-mount.sh target is not /boot/firmware
+        bm_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.sh"
+        orig_bm = bm_path.read_text(encoding="utf-8")
+        bm_path.write_text(orig_bm.replace("/boot/firmware", "/boot"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("nextoomio-boot-mount.sh target must default to /boot/firmware" in e for e in errs), f"Expected boot target failure: {errs}"
+        bm_path.write_text(orig_bm, encoding="utf-8")
+        print("  test_check_fails_when_boot_mount_sh_target_not_boot_firmware: OK")
+
+        # 30. AC1: Fail when fstab mounts on /boot itself
+        fstab_file = tmp_root / "meta-nextoomio/recipes-core/base-files/files/fstab"
+        orig_fstab = fstab_file.read_text(encoding="utf-8")
+        fstab_file.write_text(orig_fstab + "LABEL=boot_a /boot vfat defaults 0 0\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("fstab must not mount anything on /boot itself" in e for e in errs), f"Expected fstab /boot failure: {errs}"
+        fstab_file.write_text(orig_fstab, encoding="utf-8")
+        print("  test_check_fails_when_fstab_mounts_on_boot: OK")
+
+        # 31. AC1: Fail when wic specifies /boot as mountpoint
+        wks_file = tmp_root / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
+        orig_wks = wks_file.read_text(encoding="utf-8")
+        wks_file.write_text(orig_wks.replace("/boot/firmware", "/boot"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("Wic layout must not specify /boot as mountpoint" in e for e in errs), f"Expected wic /boot failure: {errs}"
+        wks_file.write_text(orig_wks, encoding="utf-8")
+        print("  test_check_fails_when_wic_specifies_boot_mountpoint: OK")
+
     print("OK: all AC5 automated self-tests passed.")
     return 0
 
@@ -1074,7 +1238,7 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2/P0-F6.1 rules validated.")
+    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2/P0-F6.1/P0-F6.2 rules validated.")
     return 0
 
 

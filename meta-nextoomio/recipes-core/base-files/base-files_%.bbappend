@@ -6,7 +6,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 hostname = "nextoomio"
 
 # Ensure mount point directories exist in the base filesystem (ARCHITECTURE.md sections 3.5, 3.6)
-dirs755:append = " /boot/select /data"
+dirs755:append = " /boot/select /boot/firmware /data"
 
 do_install:append() {
     # Ensure hostname is nextoomio

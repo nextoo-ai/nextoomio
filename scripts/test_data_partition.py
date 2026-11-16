@@ -36,7 +36,7 @@ class TestDataPartition(unittest.TestCase):
             self.assertEqual(res.returncode, 0, f"Syntax error in {script_name}: {res.stderr}")
 
     def test_boot_mount_active_slot_resolution(self) -> None:
-        """Verify AC1: nextoomio-boot-mount.sh dynamically resolves active slot A or B and mounts ro."""
+        """Verify AC1: nextoomio-boot-mount.sh dynamically resolves active slot A or B and mounts ro at /boot/firmware."""
         script_path = DATA_RECIPE_FILES / "nextoomio-boot-mount.sh"
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -57,7 +57,7 @@ class TestDataPartition(unittest.TestCase):
                 "exit 1",  # Not yet mounted
             )
 
-            boot_dir = tmp_path / "boot"
+            boot_dir = tmp_path / "boot" / "firmware"
             cmdline_file = tmp_path / "cmdline"
             boot_dev_a = tmp_path / "boot_a_dev"
             boot_dev_b = tmp_path / "boot_b_dev"
@@ -77,6 +77,7 @@ class TestDataPartition(unittest.TestCase):
             self.assertEqual(res_a.returncode, 0, f"boot-mount failed for slot A: {res_a.stderr}")
             log_a = mount_log.read_text(encoding="utf-8")
             self.assertIn(str(boot_dev_a), log_a)
+            self.assertIn(str(boot_dir), log_a)
             self.assertIn("ro,defaults,nofail", log_a)
             self.assertIn("-t vfat", log_a)
 
@@ -94,7 +95,36 @@ class TestDataPartition(unittest.TestCase):
             self.assertEqual(res_b.returncode, 0, f"boot-mount failed for slot B: {res_b.stderr}")
             log_b = mount_log.read_text(encoding="utf-8")
             self.assertIn(str(boot_dev_b), log_b)
+            self.assertIn(str(boot_dir), log_b)
             self.assertIn("ro,defaults,nofail", log_b)
+
+            # Case 3: Unknown slot must exit non-zero with an error message instead of defaulting to slot A
+            cmdline_file.write_text("console=serial0,115200 root=/dev/unrecognized ro", encoding="utf-8")
+            env_c = {
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '/bin:/usr/bin')}",
+                "NEXTOOMIO_BOOT_DIR": str(boot_dir),
+                "NEXTOOMIO_CMDLINE_FILE": str(cmdline_file),
+                "NEXTOOMIO_BOOT_DEV_A": str(boot_dev_a),
+                "NEXTOOMIO_BOOT_DEV_B": str(boot_dev_b),
+                "NEXTOOMIO_ROOT_SRC": "/dev/unknown",
+            }
+            res_c = subprocess.run(["sh", str(script_path)], env=env_c, capture_output=True, text=True)
+            self.assertNotEqual(res_c.returncode, 0, "boot-mount must exit non-zero when slot cannot be determined")
+            self.assertIn("unable to determine active boot slot", res_c.stderr)
+
+            # Case 4: Default boot directory without NEXTOOMIO_BOOT_DIR targets /boot/firmware
+            mount_log.unlink()
+            cmdline_file.write_text("console=serial0,115200 root=/dev/mmcblk0p5 rootfstype=ext4 root_a ro", encoding="utf-8")
+            env_d = {
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '/bin:/usr/bin')}",
+                "NEXTOOMIO_CMDLINE_FILE": str(cmdline_file),
+                "NEXTOOMIO_BOOT_DEV_A": str(boot_dev_a),
+                "NEXTOOMIO_BOOT_DEV_B": str(boot_dev_b),
+            }
+            res_d = subprocess.run(["sh", str(script_path)], env=env_d, capture_output=True, text=True)
+            self.assertEqual(res_d.returncode, 0, f"boot-mount failed for default boot dir: {res_d.stderr}")
+            log_d = mount_log.read_text(encoding="utf-8")
+            self.assertIn("/boot/firmware", log_d)
 
     def test_grow_script_first_boot_expansion(self) -> None:
         """Verify AC2: first boot expands extended and data partitions to end of disk via parted and resize2fs."""
