@@ -279,6 +279,7 @@ pub enum ReconcileOutcome {
     SecondTrialRequested,
     TrialExhausted,
     ContradictoryFailed,
+    JournalCorruptedFailed,
 }
 
 impl<S: JournalStorage> JournalController<S> {
@@ -318,6 +319,34 @@ impl<S: JournalStorage> JournalController<S> {
             active_slot_idx: selected.0,
             latest_record: selected.1,
         })
+    }
+
+    /// Reloads the newest valid journal record from storage.
+    pub fn reload(&mut self) -> Result<(), String> {
+        let r0 = self.storage.read_record(0);
+        let r1 = self.storage.read_record(1);
+
+        match (r0, r1) {
+            (Ok(Some(a)), Ok(Some(b))) => {
+                if a.generation >= b.generation {
+                    self.active_slot_idx = 0;
+                    self.latest_record = a;
+                } else {
+                    self.active_slot_idx = 1;
+                    self.latest_record = b;
+                }
+            }
+            (Ok(Some(a)), Ok(None)) | (Ok(Some(a)), Err(_)) => {
+                self.active_slot_idx = 0;
+                self.latest_record = a;
+            }
+            (Ok(None), Ok(Some(b))) | (Err(_), Ok(Some(b))) => {
+                self.active_slot_idx = 1;
+                self.latest_record = b;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn current(&self) -> &JournalRecord {
@@ -383,9 +412,36 @@ impl<S: JournalStorage> JournalController<S> {
 
     /// Reconciles state after reboot: handles interrupted uploads/installs (AC5 of P0-F4.4),
     /// interrupted commits (D-026), trial attempt progression / two-attempt limits (AC4, AC5),
-    /// and contradictory records (AC6).
+    /// and contradictory or unreadable records (AC6).
     pub fn reconcile_boot(&mut self, running_slot: &str) -> Result<ReconcileOutcome, String> {
-        // 1. Contradiction check (AC6)
+        // 0. Corrupted/unreadable journal check (AC6)
+        if self.latest_record.error_code.as_deref() == Some("update_journal_corrupted") {
+            return Ok(ReconcileOutcome::JournalCorruptedFailed);
+        }
+
+        // 1. Contradiction check: slot format validity (AC6)
+        let default_slot_valid =
+            crate::system::Slot::parse(&self.latest_record.default_slot).is_some();
+        let target_slot_valid = self
+            .latest_record
+            .target_slot
+            .as_deref()
+            .map(|t| crate::system::Slot::parse(t).is_some())
+            .unwrap_or(true);
+
+        if !default_slot_valid || !target_slot_valid {
+            self.commit_state(
+                UpdateTransactionState::Failed,
+                self.latest_record.tx_id.clone(),
+                None,
+                self.latest_record.payload_len,
+                None,
+                Some("update_record_contradictory".to_string()),
+            )?;
+            return Ok(ReconcileOutcome::ContradictoryFailed);
+        }
+
+        // 1b. Contradiction check: target slot matches default slot (AC6)
         if let Some(target) = &self.latest_record.target_slot {
             if (self.latest_record.state == UpdateTransactionState::Trial
                 || self.latest_record.state == UpdateTransactionState::Installing

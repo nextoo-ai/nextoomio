@@ -136,9 +136,11 @@ paths:
                 remote_confirm:
                   type: boolean
                   default: false
+                  description: Whether external remote confirmation is expected before committing (used by bench deploy tools; commit requires explicit confirmation).
                 auto_reboot:
                   type: boolean
                   default: true
+                  description: Whether to trigger immediate trial reboot after arming trial boot.
       responses:
         '200':
           description: Trial armed and attempt recorded
@@ -193,6 +195,7 @@ components:
           minimum: 0
         error_code:
           type: [string, 'null']
+          description: Machine-readable error code if transaction failed (I18N-04)
         message:
           type: [string, 'null']
     HealthReport:
@@ -203,6 +206,7 @@ components:
         - data_mounted
         - sound_card_openable
         - ssh_listening
+        - ssh_key_file_present
       properties:
         healthy:
           type: boolean
@@ -213,6 +217,8 @@ components:
         sound_card_openable:
           type: boolean
         ssh_listening:
+          type: boolean
+        ssh_key_file_present:
           type: boolean
         details:
           type: [string, 'null']
@@ -252,6 +258,35 @@ components:
         code:
           type: string
           description: Stable machine-readable error code mapped to catalog keys in the WebUI (I18N-04)
+          enum:
+            - setup_required
+            - setup_already_completed
+            - unauthenticated
+            - csrf_invalid
+            - command_unsupported
+            - waiting_for_client
+            - source_unreachable
+            - format_unsupported
+            - playlist_invalid
+            - nas_unreachable
+            - clock_not_set
+            - data_unavailable
+            - self_master_rejected
+            - topology_cycle_rejected
+            - group_level_disabled
+            - update_oversized
+            - update_invalid_format
+            - update_incompatible_hardware
+            - update_incompatible_schema
+            - update_busy
+            - update_truncated
+            - update_corrupted_artifact
+            - update_trial_failed
+            - update_trial_exhausted
+            - update_trial_deadline_exceeded
+            - update_health_check_failed
+            - update_record_contradictory
+            - update_journal_corrupted
         details:
           type: object
           additionalProperties: true

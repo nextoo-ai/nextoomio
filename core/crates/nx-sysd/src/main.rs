@@ -26,7 +26,10 @@ fn print_usage() {
         nx-sysd update health-check [--dir <path>] [--json]\n  \
         nx-sysd update trial-watchdog [--dir <path>] [--deadline <secs>] [--poll-interval <ms>]\n  \
         nx-sysd update status [--dir <path>] [--json]\n  \
-        nx-sysd update abort [--dir <path>]\n"
+        nx-sysd update abort [--dir <path>]\n\n\
+        Options for update trial:\n  \
+        --remote-confirm    Require explicit remote confirmation before commit (deploy workflow)\n  \
+        --no-reboot         Arm trial boot without triggering immediate reboot\n"
     );
 }
 

@@ -19,8 +19,9 @@ pub use journal::{
     ReconcileOutcome,
 };
 pub use system::{
-    FileStagingStorage, HealthReport, MockSlotBackend, MockStagingStorage, PartitionType,
-    PhysicalSlotBackend, Slot, SlotBackend, StagingError, StagingStorage,
+    evaluate_health_criteria, is_ssh_port_listening, FileStagingStorage, HealthReport,
+    MockSlotBackend, MockStagingStorage, PartitionType, PhysicalSlotBackend, Slot, SlotBackend,
+    StagingError, StagingStorage,
 };
 
 #[cfg(test)]
@@ -1663,42 +1664,79 @@ software =
 
         // AC1: When a trial is requested, attempt number is stored durably before reboot,
         // device boots target slot once, and previous slot remains default.
-        let status = engine.request_trial(false, false).unwrap();
+        let status = engine.request_trial(false, true).unwrap();
         assert_eq!(status.state, UpdateTransactionState::Trial);
         assert_eq!(status.consumed_attempts, 1);
         assert_eq!(status.default_slot, "root_a");
         assert_eq!(status.target_slot, Some("root_b".to_string()));
         assert_eq!(engine.backend.is_trial_armed().unwrap(), Some(Slot::B));
+        assert!(engine.backend.tryboot_triggered); // Tryboot-flagged reboot issued
 
-        // Verify stored durably in journal
+        // Verify stored durably in journal before reboot
         assert_eq!(engine.journal.current().consumed_attempts, 1);
         assert_eq!(
             engine.journal.current().state,
             UpdateTransactionState::Trial
         );
         assert_eq!(engine.journal.current().default_slot, "root_a");
+
+        // Requesting another trial while in state Trial is rejected
+        let err = engine.request_trial(false, false).unwrap_err();
+        assert_eq!(
+            err,
+            UpdateEngineError::InvalidStateTransition {
+                from: UpdateTransactionState::Trial,
+                to: UpdateTransactionState::Trial,
+            }
+        );
+    }
+
+    #[test]
+    fn test_p0_f4_5_ac1_trial_refused_when_running_on_non_default_slot() {
+        let capacity = 10 * 1024 * 1024;
+        // Running on Slot B, but default is Slot A: trial cannot be initiated from non-default slot
+        let backend = MockSlotBackend::new(Slot::B, Slot::A);
+        let storage = MockStagingStorage::new(capacity);
+        let mut journal = MemoryJournalStorage::default();
+
+        let mut init = JournalRecord::new_initial("root_b", "root_a");
+        init.state = UpdateTransactionState::Installed;
+        init.target_slot = Some("root_b".to_string());
+        init.tx_id = Some("tx-test-wrong-slot".to_string());
+        init.payload_len = 1024;
+        init.consumed_attempts = 0;
+        init.checksum = init.compute_checksum();
+        journal.write_record(0, &init).unwrap();
+
+        let mut engine =
+            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+
+        let err = engine.request_trial(false, false).unwrap_err();
+        match err {
+            UpdateEngineError::TrialFailed(msg) => {
+                assert!(msg.contains("trial can only be requested from default slot"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
     fn test_p0_f4_5_ac2_health_check_passes_when_all_prerequisites_met() {
-        let capacity = 10 * 1024 * 1024;
-        let mut backend = MockSlotBackend::new(Slot::B, Slot::A);
-        backend.health_report = Some(HealthReport {
-            healthy: true,
-            system_target_reached: true,
-            data_mounted: true,
-            sound_card_openable: true,
-            ssh_listening: true,
-            ssh_key_file_present: true,
-            details: None,
-        });
+        // Real evaluation against fixture inputs (AC2, CQ-R4)
+        let mounts_fixture = "/dev/mmcblk0p5 / ext4 ro,relatime 0 0\n/dev/mmcblk0p7 /data ext4 rw,nosuid,nodev 0 0\ndevtmpfs /dev devtmpfs rw,relatime 0 0\n";
+        let tcp_fixture = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0\n";
 
-        let storage = MockStagingStorage::new(capacity);
-        let journal = MemoryJournalStorage::default();
-        let engine =
-            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+        let ssh_listening = is_ssh_port_listening(tcp_fixture, "");
+        assert!(ssh_listening);
 
-        let report = engine.check_health().unwrap();
+        let report = evaluate_health_criteria(
+            true,           // system target reached
+            mounts_fixture, // /data mounted in mount table
+            true,           // sound card present and openable
+            true,           // ssh key file present
+            ssh_listening,  // ssh listening on port 22
+        );
+
         assert!(report.healthy);
         assert!(report.system_target_reached);
         assert!(report.data_mounted);
@@ -1710,129 +1748,66 @@ software =
 
     #[test]
     fn test_p0_f4_5_ac2_health_check_fails_when_prerequisites_missing() {
-        let capacity = 10 * 1024 * 1024;
-        let storage = MockStagingStorage::new(capacity);
-        let journal = MemoryJournalStorage::default();
+        let valid_mounts = "/dev/mmcblk0p5 / ext4 ro,relatime 0 0\n/dev/mmcblk0p7 /data ext4 rw,nosuid,nodev 0 0\n";
 
         // 1. Missing system target
-        let mut b1 = MockSlotBackend::new(Slot::B, Slot::A);
-        b1.health_report = Some(HealthReport {
-            healthy: false,
-            system_target_reached: false,
-            data_mounted: true,
-            sound_card_openable: true,
-            ssh_listening: true,
-            ssh_key_file_present: true,
-            details: Some("system target not reached".to_string()),
-        });
-        let e1 = UpdateEngine::new(
-            b1,
-            storage.clone(),
-            journal.clone(),
-            None,
-            None,
-            Some(capacity),
-        )
-        .unwrap();
-        let r1 = e1.check_health().unwrap();
+        let r1 = evaluate_health_criteria(false, valid_mounts, true, true, true);
         assert!(!r1.healthy);
         assert!(!r1.system_target_reached);
+        assert!(r1
+            .details
+            .as_ref()
+            .unwrap()
+            .contains("system target not reached"));
 
-        // 2. Data partition unmounted
-        let mut b2 = MockSlotBackend::new(Slot::B, Slot::A);
-        b2.health_report = Some(HealthReport {
-            healthy: false,
-            system_target_reached: true,
-            data_mounted: false,
-            sound_card_openable: true,
-            ssh_listening: true,
-            ssh_key_file_present: true,
-            details: Some("data partition not mounted".to_string()),
-        });
-        let e2 = UpdateEngine::new(
-            b2,
-            storage.clone(),
-            journal.clone(),
-            None,
-            None,
-            Some(capacity),
-        )
-        .unwrap();
-        let r2 = e2.check_health().unwrap();
+        // 2. Data partition unmounted in mount table (even if directory /data exists)
+        let unmounted_mounts =
+            "/dev/mmcblk0p5 / ext4 ro,relatime 0 0\n/dev/mmcblk0p1 /boot vfat ro 0 0\n";
+        let r2 = evaluate_health_criteria(true, unmounted_mounts, true, true, true);
         assert!(!r2.healthy);
         assert!(!r2.data_mounted);
+        assert!(r2
+            .details
+            .as_ref()
+            .unwrap()
+            .contains("data partition not mounted"));
 
-        // 3. Sound card missing or cannot be opened
-        let mut b3 = MockSlotBackend::new(Slot::B, Slot::A);
-        b3.health_report = Some(HealthReport {
-            healthy: false,
-            system_target_reached: true,
-            data_mounted: true,
-            sound_card_openable: false,
-            ssh_listening: true,
-            ssh_key_file_present: true,
-            details: Some("configured sound card missing or cannot be opened".to_string()),
-        });
-        let e3 = UpdateEngine::new(
-            b3,
-            storage.clone(),
-            journal.clone(),
-            None,
-            None,
-            Some(capacity),
-        )
-        .unwrap();
-        let r3 = e3.check_health().unwrap();
+        // 3. Configured sound card missing or cannot be opened
+        let r3 = evaluate_health_criteria(true, valid_mounts, false, true, true);
         assert!(!r3.healthy);
         assert!(!r3.sound_card_openable);
+        assert!(r3
+            .details
+            .as_ref()
+            .unwrap()
+            .contains("configured sound card missing or cannot be opened"));
 
-        // 4. SSH key file present but SSH not listening
-        let mut b4 = MockSlotBackend::new(Slot::B, Slot::A);
-        b4.health_report = Some(HealthReport {
-            healthy: false,
-            system_target_reached: true,
-            data_mounted: true,
-            sound_card_openable: true,
-            ssh_listening: false,
-            ssh_key_file_present: true,
-            details: Some("SSH server not listening with key file present".to_string()),
-        });
-        let e4 = UpdateEngine::new(
-            b4,
-            storage.clone(),
-            journal.clone(),
-            None,
-            None,
-            Some(capacity),
-        )
-        .unwrap();
-        let r4 = e4.check_health().unwrap();
+        // 4. SSH key file present, but SSH port 22 not listening
+        let non_listening_tcp = "  sl  local_address rem_address   st\n   0: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345\n";
+        let ssh_listening_4 = is_ssh_port_listening(non_listening_tcp, "");
+        assert!(!ssh_listening_4);
+        let r4 = evaluate_health_criteria(true, valid_mounts, true, true, ssh_listening_4);
         assert!(!r4.healthy);
         assert!(!r4.ssh_listening);
+        assert!(r4
+            .details
+            .as_ref()
+            .unwrap()
+            .contains("SSH server not listening with key file present"));
 
-        // 5. SSH key file absent and SSH not listening: healthy (AD-23)
-        let mut b5 = MockSlotBackend::new(Slot::B, Slot::A);
-        b5.health_report = Some(HealthReport {
-            healthy: true,
-            system_target_reached: true,
-            data_mounted: true,
-            sound_card_openable: true,
-            ssh_listening: true,
-            ssh_key_file_present: false,
-            details: None,
-        });
-        let e5 = UpdateEngine::new(b5, storage, journal, None, None, Some(capacity)).unwrap();
-        let r5 = e5.check_health().unwrap();
+        // 5. SSH key file absent and SSH not listening: healthy (AD-23 compliant)
+        let r5 = evaluate_health_criteria(true, valid_mounts, true, false, false);
         assert!(r5.healthy);
+        assert!(r5.ssh_listening);
+        assert!(!r5.ssh_key_file_present);
     }
 
     #[test]
     fn test_p0_f4_5_ac3_trial_watchdog_enforces_120s_deadline_from_boot_and_reboots() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("NEXTOOMIO_TEST_UPTIME_SECS", "119.9");
-
         let capacity = 10 * 1024 * 1024;
-        let backend = MockSlotBackend::new(Slot::B, Slot::A);
+        let mut backend = MockSlotBackend::new(Slot::B, Slot::A);
+        backend.uptime_secs = 120.0; // Simulated uptime reached 120s deadline
+
         let storage = MockStagingStorage::new(capacity);
         let mut journal = MemoryJournalStorage::default();
 
@@ -1848,23 +1823,31 @@ software =
         let mut engine =
             UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
 
-        // Watchdog enforces deadline of 120s from boot. Since simulated uptime is 119.9s, it triggers reboot.
+        // Watchdog enforces deadline of 120s from boot. Since simulated uptime is 120.0s, it triggers reboot.
         let err = engine.run_trial_watchdog(120, 50).unwrap_err();
         assert_eq!(err, UpdateEngineError::TrialDeadlineExceeded);
-        assert!(engine.backend.reboot_triggered);
-
-        std::env::remove_var("NEXTOOMIO_TEST_UPTIME_SECS");
+        assert!(engine.backend.reboot_triggered); // Plain recovery reboot back to default slot
+        assert_eq!(engine.backend.watchdog_armed, Some(120)); // Hardware watchdog was armed
     }
 
     #[test]
     fn test_p0_f4_5_ac3_trial_watchdog_exits_cleanly_when_committed() {
-        let capacity = 10 * 1024 * 1024;
-        let backend = MockSlotBackend::new(Slot::B, Slot::A);
-        let storage = MockStagingStorage::new(capacity);
-        let mut journal = MemoryJournalStorage::default();
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-watchdog-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let update_dir = temp_dir.join("update");
+        std::fs::create_dir_all(&update_dir).unwrap();
 
-        let mut init = JournalRecord::new_initial("root_b", "root_b");
-        init.state = UpdateTransactionState::Committed;
+        let capacity = 10 * 1024 * 1024;
+        let mut backend = MockSlotBackend::new(Slot::B, Slot::A);
+        backend.uptime_secs = 5.0; // Early in trial boot
+
+        let storage = FileStagingStorage::new(&update_dir, capacity);
+        let mut journal = FileJournalStorage::new(&update_dir);
+
+        // Start in state Trial on target slot B (watchdog ENTERS polling loop)
+        let mut init = JournalRecord::new_initial("root_b", "root_a");
+        init.state = UpdateTransactionState::Trial;
         init.target_slot = Some("root_b".to_string());
         init.tx_id = Some("tx-ac3-committed".to_string());
         init.payload_len = 1024;
@@ -1874,9 +1857,31 @@ software =
 
         let mut engine =
             UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
-        let res = engine.run_trial_watchdog(120, 50);
+
+        // Spawn background thread to simulate another process committing the transaction after 60ms
+        let update_dir_clone = update_dir.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let mut j_storage = FileJournalStorage::new(&update_dir_clone);
+            let mut committed = JournalRecord::new_initial("root_b", "root_b");
+            committed.generation = 2;
+            committed.state = UpdateTransactionState::Committed;
+            committed.target_slot = Some("root_b".to_string());
+            committed.tx_id = Some("tx-ac3-committed".to_string());
+            committed.payload_len = 1024;
+            committed.consumed_attempts = 1;
+            committed.checksum = committed.compute_checksum();
+            let _ = j_storage.write_record(1, &committed);
+        });
+
+        // Watchdog enters loop, re-reads journal each poll, detects transition to Committed, and exits cleanly (CQ-R4)
+        let res = engine.run_trial_watchdog(120, 20);
+        let _ = handle.join();
+
         assert!(res.is_ok());
         assert!(!engine.backend.reboot_triggered);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -1913,15 +1918,16 @@ software =
         assert_eq!(engine1.status().consumed_attempts, 2);
         assert_eq!(engine1.status().default_slot, "root_a");
         assert_eq!(engine1.backend.is_trial_armed().unwrap(), Some(Slot::B));
+        assert!(engine1.backend.tryboot_triggered); // Second trial reboot triggered!
 
         // --- Round 2: Second failed attempt ---
-        // Save state from engine1 into journal2
         let current_rec = engine1.journal.current().clone();
         let mut journal2 = MemoryJournalStorage::default();
         journal2.write_record(0, &current_rec).unwrap();
 
         // Boot previous slot (Slot A) again after attempt 2 failure
-        let backend2 = MockSlotBackend::new(Slot::A, Slot::A);
+        let mut backend2 = MockSlotBackend::new(Slot::A, Slot::A);
+        backend2.trial_armed = Some(Slot::B); // Previously armed
         let mut engine2 =
             UpdateEngine::new(backend2, storage, journal2, None, None, Some(capacity)).unwrap();
 
@@ -1933,6 +1939,8 @@ software =
             Some("update_trial_exhausted".to_string())
         );
         assert_eq!(engine2.status().default_slot, "root_a");
+        assert_eq!(engine2.backend.is_trial_armed().unwrap(), None); // Tryboot selector CLEARED!
+        assert!(!engine2.backend.tryboot_triggered); // No further trial reboot
 
         // Verify that no further trial happens without a new install
         let err = engine2.request_trial(false, false).unwrap_err();
@@ -2005,7 +2013,7 @@ software =
             assert_eq!(engine.status().consumed_attempts, 2);
         }
 
-        // 4. Power loss during second trial attempt
+        // 4. Power loss / restart during second trial attempt
         {
             let backend = MockSlotBackend::new(Slot::A, Slot::A);
             let storage = FileStagingStorage::new(&update_dir, capacity);
@@ -2069,8 +2077,15 @@ software =
         journal2.write_record(0, &rec2).unwrap();
 
         let backend2 = MockSlotBackend::new(Slot::A, Slot::A);
-        let mut engine2 =
-            UpdateEngine::new(backend2, storage, journal2, None, None, Some(capacity)).unwrap();
+        let mut engine2 = UpdateEngine::new(
+            backend2,
+            storage.clone(),
+            journal2,
+            None,
+            None,
+            Some(capacity),
+        )
+        .unwrap();
 
         let outcome2 = engine2.reconcile_boot().unwrap();
         assert_eq!(outcome2, ReconcileOutcome::ContradictoryFailed);
@@ -2079,30 +2094,107 @@ software =
             engine2.status().error_code,
             Some("update_record_contradictory".to_string())
         );
+
+        // Case 3: Contradictory invalid/unparseable default_slot (not silently defaulted to Slot A, CQ-R3)
+        let mut journal3 = MemoryJournalStorage::default();
+        let mut rec3 = JournalRecord::new_initial("root_a", "invalid_slot_name");
+        rec3.default_slot = "invalid_slot_name".to_string();
+        rec3.state = UpdateTransactionState::Trial;
+        rec3.target_slot = Some("root_b".to_string());
+        rec3.consumed_attempts = 1;
+        rec3.checksum = rec3.compute_checksum();
+        journal3.write_record(0, &rec3).unwrap();
+
+        let backend3 = MockSlotBackend::new(Slot::A, Slot::A);
+        let mut engine3 = UpdateEngine::new(
+            backend3,
+            storage.clone(),
+            journal3,
+            None,
+            None,
+            Some(capacity),
+        )
+        .unwrap();
+        let outcome3 = engine3.reconcile_boot().unwrap();
+        assert_eq!(outcome3, ReconcileOutcome::ContradictoryFailed);
+        assert_eq!(engine3.status().state, UpdateTransactionState::Failed);
+        assert_eq!(
+            engine3.status().error_code,
+            Some("update_record_contradictory".to_string())
+        );
+
+        // Case 4: Unreadable journal records (both records corrupted on disk, AC6)
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-corrupt-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let corrupt_dir = temp_dir.join("update");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+
+        // Write corrupted non-JSON and bad-checksum data to both journal files
+        std::fs::write(corrupt_dir.join("journal.0"), b"corrupted garbage bytes").unwrap();
+        std::fs::write(
+            corrupt_dir.join("journal.1"),
+            b"{\"format_version\":1,\"checksum\":9999}",
+        )
+        .unwrap();
+
+        let backend4 = MockSlotBackend::new(Slot::A, Slot::A);
+        let file_storage = FileStagingStorage::new(&corrupt_dir, capacity);
+        let file_journal = FileJournalStorage::new(&corrupt_dir);
+        let err4 = match UpdateEngine::new(
+            backend4.clone(),
+            file_storage,
+            file_journal,
+            None,
+            None,
+            Some(capacity),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected UpdateEngine::new to fail on corrupted journal"),
+        };
+
+        // Device stays on last known good slot and condition is reported (AC6)
+        assert_eq!(
+            err4.to_error_code(),
+            nx_protocol::ErrorCode::UpdateJournalCorrupted
+        );
+        assert_eq!(err4.error_code_str(), "update_journal_corrupted");
+        assert_eq!(backend4.is_trial_armed().unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_p0_f4_5_ac7_absence_of_internet_nas_ma_ha_unaffected() {
-        let capacity = 10 * 1024 * 1024;
-        let mut backend = MockSlotBackend::new(Slot::B, Slot::A);
-        backend.health_report = Some(HealthReport {
-            healthy: true,
-            system_target_reached: true,
-            data_mounted: true,
-            sound_card_openable: true,
-            ssh_listening: true,
-            ssh_key_file_present: true,
-            details: None,
-        });
+        // Fixture A: Local environment ONLY - NO network interfaces, NO internet gateway,
+        // NO NAS mounts, NO Music Assistant, NO Home Assistant
+        let isolated_mounts = "/dev/mmcblk0p5 / ext4 ro,relatime 0 0\n/dev/mmcblk0p7 /data ext4 rw,nosuid,nodev 0 0\n";
+        let local_tcp = "  sl  local_address rem_address   st\n   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345\n";
 
-        let storage = MockStagingStorage::new(capacity);
-        let journal = MemoryJournalStorage::default();
-        let engine =
-            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+        let report_isolated = evaluate_health_criteria(
+            true,
+            isolated_mounts,
+            true,
+            true,
+            is_ssh_port_listening(local_tcp, ""),
+        );
+        assert!(report_isolated.healthy);
 
-        // AC7: Absence of internet, NAS, MA, or HA has zero impact on local health check
-        let report = engine.check_health().unwrap();
-        assert!(report.healthy);
+        // Fixture B: Environment with internet, NAS mounts (/mnt/nas, nfs), Music Assistant (port 8095), Home Assistant (port 8123)
+        let connected_mounts = "/dev/mmcblk0p5 / ext4 ro,relatime 0 0\n/dev/mmcblk0p7 /data ext4 rw,nosuid,nodev 0 0\n192.168.1.100:/nas /mnt/nas nfs rw 0 0\n";
+        let connected_tcp = "  sl  local_address rem_address   st\n   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345\n   1: 00000000:1F9F 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 54321\n   2: 00000000:1FB3 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 65432\n";
+
+        let report_connected = evaluate_health_criteria(
+            true,
+            connected_mounts,
+            true,
+            true,
+            is_ssh_port_listening(connected_tcp, ""),
+        );
+        assert!(report_connected.healthy);
+
+        // AC7: Results must be completely identical regardless of presence or absence of internet/NAS/MA/HA
+        assert_eq!(report_isolated, report_connected);
     }
 
     #[test]
@@ -2145,10 +2237,43 @@ software =
         std::env::set_var("NEXTOOMIO_INACTIVE_BOOT_DIR", &inactive_boot_dir);
         std::env::set_var("NEXTOOMIO_SELECT_DIR", &select_dir);
         std::env::set_var("NEXTOOMIO_NO_REBOOT", "1");
-        std::env::set_var("NEXTOOMIO_HEALTH_SYSTEM_TARGET", "1");
-        std::env::set_var("NEXTOOMIO_HEALTH_DATA_MOUNTED", "1");
-        std::env::set_var("NEXTOOMIO_HEALTH_SOUND_CARD", "1");
-        std::env::set_var("NEXTOOMIO_HEALTH_SSH_KEY_PRESENT", "0");
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-cli-trial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let update_dir = temp_dir.join("update");
+        let active_boot_dir = temp_dir.join("boot_active");
+        let inactive_boot_dir = temp_dir.join("boot_inactive");
+        let select_dir = temp_dir.join("select");
+
+        std::fs::create_dir_all(&update_dir).unwrap();
+        std::fs::create_dir_all(&active_boot_dir).unwrap();
+        std::fs::create_dir_all(&inactive_boot_dir).unwrap();
+        std::fs::create_dir_all(&select_dir).unwrap();
+
+        let slot_a_boot_file = temp_dir.join("slot_a_boot.img");
+        let slot_a_root_file = temp_dir.join("slot_a_root.img");
+        let slot_b_boot_file = temp_dir.join("slot_b_boot.img");
+        let slot_b_root_file = temp_dir.join("slot_b_root.img");
+
+        std::fs::write(&slot_a_boot_file, vec![0x11; 4096]).unwrap();
+        std::fs::write(&slot_a_root_file, vec![0x22; 8192]).unwrap();
+        std::fs::write(&slot_b_boot_file, vec![0x00; 4096]).unwrap();
+        std::fs::write(&slot_b_root_file, vec![0x00; 8192]).unwrap();
+
+        let hw_cfg = "dtoverlay=hifiberry-amp\n";
+        std::fs::write(active_boot_dir.join("nextoomio-hardware.txt"), hw_cfg).unwrap();
+
+        std::env::set_var("NEXTOOMIO_SLOT", "root_a");
+        std::env::set_var("NEXTOOMIO_SLOT_A_BOOT", &slot_a_boot_file);
+        std::env::set_var("NEXTOOMIO_SLOT_A_ROOT", &slot_a_root_file);
+        std::env::set_var("NEXTOOMIO_SLOT_B_BOOT", &slot_b_boot_file);
+        std::env::set_var("NEXTOOMIO_SLOT_B_ROOT", &slot_b_root_file);
+        std::env::set_var("NEXTOOMIO_ACTIVE_BOOT_DIR", &active_boot_dir);
+        std::env::set_var("NEXTOOMIO_INACTIVE_BOOT_DIR", &inactive_boot_dir);
+        std::env::set_var("NEXTOOMIO_SELECT_DIR", &select_dir);
+        std::env::set_var("NEXTOOMIO_NO_REBOOT", "1");
 
         let capacity = 10 * 1024 * 1024;
 
@@ -2267,25 +2392,7 @@ software =
             assert!(autoboot.contains("[tryboot]\nboot_partition=3"));
         }
 
-        // 5. Process 5: health check
-        {
-            let backend = PhysicalSlotBackend;
-            let storage = FileStagingStorage::new(&update_dir, capacity);
-            let journal = FileJournalStorage::new(&update_dir);
-            let engine = UpdateEngine::new(
-                backend,
-                storage,
-                journal,
-                Some("1.0".to_string()),
-                Some(1),
-                Some(capacity),
-            )
-            .unwrap();
-            let report = engine.check_health().unwrap();
-            assert!(report.healthy);
-        }
-
-        // 6. Process 6: status query
+        // 5. Process 5: status query
         {
             let backend = PhysicalSlotBackend;
             let storage = FileStagingStorage::new(&update_dir, capacity);
@@ -2306,6 +2413,26 @@ software =
             assert_eq!(status.default_slot, "root_a");
         }
 
+        // 6. Process 6: boot reconciliation on slot A (attempt 1 failed -> advances to attempt 2 and re-arms tryboot)
+        {
+            let backend = PhysicalSlotBackend;
+            let storage = FileStagingStorage::new(&update_dir, capacity);
+            let journal = FileJournalStorage::new(&update_dir);
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .unwrap();
+            let outcome = engine.reconcile_boot().unwrap();
+            assert_eq!(outcome, ReconcileOutcome::SecondTrialRequested);
+            assert_eq!(engine.status().consumed_attempts, 2);
+            assert_eq!(engine.status().state, UpdateTransactionState::Trial);
+        }
+
         std::env::remove_var("NEXTOOMIO_SLOT");
         std::env::remove_var("NEXTOOMIO_SLOT_A_BOOT");
         std::env::remove_var("NEXTOOMIO_SLOT_A_ROOT");
@@ -2315,10 +2442,6 @@ software =
         std::env::remove_var("NEXTOOMIO_INACTIVE_BOOT_DIR");
         std::env::remove_var("NEXTOOMIO_SELECT_DIR");
         std::env::remove_var("NEXTOOMIO_NO_REBOOT");
-        std::env::remove_var("NEXTOOMIO_HEALTH_SYSTEM_TARGET");
-        std::env::remove_var("NEXTOOMIO_HEALTH_DATA_MOUNTED");
-        std::env::remove_var("NEXTOOMIO_HEALTH_SOUND_CARD");
-        std::env::remove_var("NEXTOOMIO_HEALTH_SSH_KEY_PRESENT");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

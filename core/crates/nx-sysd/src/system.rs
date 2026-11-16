@@ -149,11 +149,23 @@ pub trait SlotBackend: Send + Sync {
     /// Arms one-shot trial boot for the specified slot (AC1, AD-14).
     fn arm_trial_boot(&mut self, target_slot: Slot) -> Result<(), String>;
 
+    /// Clears the one-shot tryboot selector after trial finalization or failure (AC4, AC6).
+    fn clear_trial_boot(&mut self) -> Result<(), String>;
+
     /// Returns the currently armed trial slot, if any.
     fn is_trial_armed(&self) -> Result<Option<Slot>, String>;
 
-    /// Triggers system reboot to execute the trial or recovery boot (AC1, AC3).
+    /// Triggers tryboot-flagged reboot to boot the tryboot selector (AC1, AC4).
+    fn trigger_tryboot(&mut self) -> Result<(), String>;
+
+    /// Triggers plain system reboot to return to the default slot on timeout/failure (AC3).
     fn trigger_reboot(&mut self) -> Result<(), String>;
+
+    /// Arms the hardware watchdog to enforce independent trial deadline (AC3, AR-01).
+    fn arm_watchdog(&mut self, timeout_secs: u64) -> Result<(), String>;
+
+    /// Retrieves kernel/system uptime in seconds for trial deadline accounting (AC3).
+    fn get_uptime_secs(&self) -> Result<f64, String>;
 
     /// Evaluates the local trial boot health check conditions (AC2, AC7).
     fn check_health(&self) -> Result<HealthReport, String>;
@@ -171,7 +183,10 @@ pub struct MockSlotBackend {
     pub write_active_slot_glitch: bool,
     pub abort_during_write: bool,
     pub trial_armed: Option<Slot>,
+    pub tryboot_triggered: bool,
     pub reboot_triggered: bool,
+    pub watchdog_armed: Option<u64>,
+    pub uptime_secs: f64,
     pub health_report: Option<HealthReport>,
 }
 
@@ -197,7 +212,10 @@ impl MockSlotBackend {
             write_active_slot_glitch: false,
             abort_during_write: false,
             trial_armed: None,
+            tryboot_triggered: false,
             reboot_triggered: false,
+            watchdog_armed: None,
+            uptime_secs: 0.0,
             health_report: None,
         }
     }
@@ -295,13 +313,32 @@ impl SlotBackend for MockSlotBackend {
         Ok(())
     }
 
+    fn clear_trial_boot(&mut self) -> Result<(), String> {
+        self.trial_armed = None;
+        Ok(())
+    }
+
     fn is_trial_armed(&self) -> Result<Option<Slot>, String> {
         Ok(self.trial_armed)
+    }
+
+    fn trigger_tryboot(&mut self) -> Result<(), String> {
+        self.tryboot_triggered = true;
+        Ok(())
     }
 
     fn trigger_reboot(&mut self) -> Result<(), String> {
         self.reboot_triggered = true;
         Ok(())
+    }
+
+    fn arm_watchdog(&mut self, timeout_secs: u64) -> Result<(), String> {
+        self.watchdog_armed = Some(timeout_secs);
+        Ok(())
+    }
+
+    fn get_uptime_secs(&self) -> Result<f64, String> {
+        Ok(self.uptime_secs)
     }
 
     fn check_health(&self) -> Result<HealthReport, String> {
@@ -473,6 +510,54 @@ impl Drop for ScopedBootMount {
 pub struct PhysicalSlotBackend;
 
 impl PhysicalSlotBackend {
+    fn autoboot_path(&self) -> PathBuf {
+        if let Ok(val) = std::env::var("NEXTOOMIO_AUTOBOOT_TXT") {
+            PathBuf::from(val)
+        } else if let Ok(val) = std::env::var("NEXTOOMIO_SELECT_DIR") {
+            PathBuf::from(val).join("autoboot.txt")
+        } else {
+            PathBuf::from("/boot/select/autoboot.txt")
+        }
+    }
+
+    fn check_sound_card_openable(&self) -> bool {
+        let configured_card = self.get_active_sound_card_selection().ok().flatten();
+        let cards = fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+        if cards.trim().is_empty() {
+            return false;
+        }
+
+        if let Some(cfg) = &configured_card {
+            let overlay_name = cfg.lines().find_map(|line| {
+                let t = line.trim();
+                t.strip_prefix("dtoverlay=").map(str::trim)
+            });
+            if let Some(name) = overlay_name {
+                let clean_name = name.replace('-', "_");
+                if !cards.contains(name) && !cards.contains(&clean_name) {
+                    return false;
+                }
+            }
+        }
+
+        let snd_dir = Path::new("/dev/snd");
+        if snd_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(snd_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("controlC") || name.starts_with("pcmC") {
+                        if let Ok(file) = File::open(entry.path()) {
+                            drop(file);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn is_device_path_overridden(&self, slot: Slot, partition: PartitionType) -> bool {
         let env_var = match (slot, partition) {
             (Slot::A, PartitionType::Boot) => "NEXTOOMIO_SLOT_A_BOOT",
@@ -496,6 +581,80 @@ impl PhysicalSlotBackend {
             PathBuf::from(slot.partition_device(partition))
         }
     }
+}
+
+/// Pure evaluation function testing local health check criteria from inputs (AC2, AC7).
+pub fn evaluate_health_criteria(
+    system_target_reached: bool,
+    mounts_content: &str,
+    sound_card_present_and_openable: bool,
+    ssh_key_file_present: bool,
+    ssh_listening: bool,
+) -> HealthReport {
+    // 2. Data partition mounted (strictly from mount table; directory existence does not qualify)
+    let data_mounted = mounts_content.lines().any(|l| {
+        let parts: Vec<&str> = l.split_whitespace().collect();
+        parts.len() >= 2 && parts[1] == "/data"
+    });
+
+    let sound_card_openable = sound_card_present_and_openable;
+
+    // 4. SSH server is listening when a valid key file is present; if key file absent, SSH disabled by design (AD-23)
+    let effective_ssh_listening = if !ssh_key_file_present {
+        true
+    } else {
+        ssh_listening
+    };
+
+    let healthy =
+        system_target_reached && data_mounted && sound_card_openable && effective_ssh_listening;
+
+    let mut missing = Vec::new();
+    if !system_target_reached {
+        missing.push("system target not reached");
+    }
+    if !data_mounted {
+        missing.push("data partition not mounted");
+    }
+    if !sound_card_openable {
+        missing.push("configured sound card missing or cannot be opened");
+    }
+    if ssh_key_file_present && !effective_ssh_listening {
+        missing.push("SSH server not listening with key file present");
+    }
+
+    let details = if missing.is_empty() {
+        None
+    } else {
+        Some(missing.join(", "))
+    };
+
+    HealthReport {
+        healthy,
+        system_target_reached,
+        data_mounted,
+        sound_card_openable,
+        ssh_listening: effective_ssh_listening,
+        ssh_key_file_present,
+        details,
+    }
+}
+
+/// Checks whether SSH port 22 is listening in Linux /proc/net/tcp or tcp6 tables.
+pub fn is_ssh_port_listening(tcp_data: &str, tcp6_data: &str) -> bool {
+    let check = |data: &str| {
+        data.lines().skip(1).any(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let local_addr = parts[1];
+                let state = parts[3];
+                local_addr.ends_with(":0016") && state == "0A" // 0x16 = 22, 0A = TCP_LISTEN
+            } else {
+                false
+            }
+        })
+    };
+    check(tcp_data) || check(tcp6_data)
 }
 
 impl SlotBackend for PhysicalSlotBackend {
@@ -780,13 +939,7 @@ impl SlotBackend for PhysicalSlotBackend {
     }
 
     fn arm_trial_boot(&mut self, target_slot: Slot) -> Result<(), String> {
-        let autoboot_path = if let Ok(val) = std::env::var("NEXTOOMIO_AUTOBOOT_TXT") {
-            PathBuf::from(val)
-        } else if let Ok(val) = std::env::var("NEXTOOMIO_SELECT_DIR") {
-            PathBuf::from(val).join("autoboot.txt")
-        } else {
-            PathBuf::from("/boot/select/autoboot.txt")
-        };
+        let autoboot_path = self.autoboot_path();
 
         let default_slot = self.get_default_slot().unwrap_or(Slot::A);
         let default_part = match default_slot {
@@ -819,14 +972,35 @@ impl SlotBackend for PhysicalSlotBackend {
         Ok(())
     }
 
-    fn is_trial_armed(&self) -> Result<Option<Slot>, String> {
-        let autoboot_path = if let Ok(val) = std::env::var("NEXTOOMIO_AUTOBOOT_TXT") {
-            PathBuf::from(val)
-        } else if let Ok(val) = std::env::var("NEXTOOMIO_SELECT_DIR") {
-            PathBuf::from(val).join("autoboot.txt")
-        } else {
-            PathBuf::from("/boot/select/autoboot.txt")
+    fn clear_trial_boot(&mut self) -> Result<(), String> {
+        let autoboot_path = self.autoboot_path();
+
+        if !autoboot_path.exists() {
+            return Ok(());
+        }
+
+        let default_slot = self.get_default_slot().unwrap_or(Slot::A);
+        let default_part = match default_slot {
+            Slot::A => 2,
+            Slot::B => 3,
         };
+        let content = format!("[all]\ntryboot_a_b=1\nboot_partition={default_part}\n");
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&autoboot_path)
+            .map_err(|e| format!("cannot open {}: {e}", autoboot_path.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", autoboot_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync error {}: {e}", autoboot_path.display()))?;
+        Ok(())
+    }
+
+    fn is_trial_armed(&self) -> Result<Option<Slot>, String> {
+        let autoboot_path = self.autoboot_path();
 
         if !autoboot_path.exists() {
             return Ok(None);
@@ -853,6 +1027,26 @@ impl SlotBackend for PhysicalSlotBackend {
         Ok(None)
     }
 
+    fn trigger_tryboot(&mut self) -> Result<(), String> {
+        if std::env::var("NEXTOOMIO_NO_REBOOT").is_ok() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Raspberry Pi firmware selects [tryboot] section in autoboot.txt only when reboot argument is "0 tryboot"
+            let _ = std::process::Command::new("reboot")
+                .arg("0 tryboot")
+                .output()
+                .or_else(|_| {
+                    std::process::Command::new("systemctl")
+                        .arg("reboot")
+                        .arg("0 tryboot")
+                        .output()
+                });
+        }
+        Ok(())
+    }
+
     fn trigger_reboot(&mut self) -> Result<(), String> {
         if std::env::var("NEXTOOMIO_NO_REBOOT").is_ok() {
             return Ok(());
@@ -866,149 +1060,84 @@ impl SlotBackend for PhysicalSlotBackend {
         Ok(())
     }
 
-    fn check_health(&self) -> Result<HealthReport, String> {
-        // AC2 & AC7:
-        // System target reached, data mounted, configured sound card present and can be opened,
-        // and SSH server is listening when a valid key file is present.
-        // Unaffected by internet, NAS, Music Assistant, or Home Assistant.
-
-        // 1. System target reached
-        let system_target_reached = if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_SYSTEM_TARGET")
+    fn arm_watchdog(&mut self, timeout_secs: u64) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
         {
-            val == "1" || val.eq_ignore_ascii_case("true")
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                let output = std::process::Command::new("systemctl")
-                    .arg("is-system-running")
-                    .output();
-                match output {
-                    Ok(out) => {
-                        let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        status == "running" || status == "degraded"
+            if Path::new("/dev/watchdog").exists() {
+                if let Ok(file) = OpenOptions::new().write(true).open("/dev/watchdog") {
+                    use std::os::unix::io::AsRawFd;
+                    let mut timeout: std::os::raw::c_int = timeout_secs as std::os::raw::c_int;
+                    extern "C" {
+                        fn ioctl(
+                            fd: std::os::raw::c_int,
+                            request: std::os::raw::c_ulong,
+                            ...
+                        ) -> std::os::raw::c_int;
                     }
-                    Err(_) => false,
+                    // WDIOC_SETTIMEOUT = 0xc0045706
+                    unsafe {
+                        ioctl(file.as_raw_fd(), 0xc0045706, &mut timeout);
+                    }
                 }
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                true
+        }
+        let _ = timeout_secs;
+        Ok(())
+    }
+
+    fn get_uptime_secs(&self) -> Result<f64, String> {
+        if let Ok(content) = fs::read_to_string("/proc/uptime") {
+            if let Some(first) = content.split_whitespace().next() {
+                if let Ok(s) = first.parse::<f64>() {
+                    return Ok(s);
+                }
+            }
+        }
+        Ok(0.0)
+    }
+
+    fn check_health(&self) -> Result<HealthReport, String> {
+        #[cfg(target_os = "linux")]
+        let system_target_reached = {
+            let output = std::process::Command::new("systemctl")
+                .arg("is-system-running")
+                .output();
+            match output {
+                Ok(out) => {
+                    let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    status == "running" || status == "degraded"
+                }
+                Err(_) => false,
             }
         };
+        #[cfg(not(target_os = "linux"))]
+        let system_target_reached = true;
 
-        // 2. Data partition mounted
-        let data_mounted = if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_DATA_MOUNTED") {
-            val == "1" || val.eq_ignore_ascii_case("true")
-        } else {
-            let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
-            mounts.lines().any(|l| {
-                let parts: Vec<&str> = l.split_whitespace().collect();
-                parts.len() >= 2 && parts[1] == "/data"
-            }) || Path::new("/data").is_dir()
-        };
+        let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+        let sound_card_openable = self.check_sound_card_openable();
 
-        // 3. Configured sound card present and can be opened
-        let sound_card_openable = if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_SOUND_CARD") {
-            val == "1" || val.eq_ignore_ascii_case("true")
-        } else {
-            let cards = fs::read_to_string("/proc/asound/cards").unwrap_or_default();
-            let has_cards = !cards.trim().is_empty();
-            let pcm_devs = Path::new("/dev/snd");
-            let has_pcm = pcm_devs.is_dir()
-                && fs::read_dir(pcm_devs)
-                    .map(|entries| {
-                        entries
-                            .flatten()
-                            .any(|entry| entry.file_name().to_string_lossy().starts_with("pcm"))
-                    })
-                    .unwrap_or(false);
-            has_cards || has_pcm
-        };
+        let select_dir = PathBuf::from("/boot/select");
+        let key_1 = select_dir.join("authorized_keys");
+        let key_2 = select_dir.join("authorized_keys.txt");
+        let ssh_key_file_present = (key_1.exists()
+            && fs::metadata(&key_1).map(|m| m.len() > 0).unwrap_or(false))
+            || (key_2.exists() && fs::metadata(&key_2).map(|m| m.len() > 0).unwrap_or(false));
 
-        // 4. SSH server is listening when a valid key file is present
-        let select_dir = std::env::var("NEXTOOMIO_SELECT_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/boot/select"));
-        let key_file_1 = select_dir.join("authorized_keys");
-        let key_file_2 = select_dir.join("authorized_keys.txt");
-        let ssh_key_file_present =
-            if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_SSH_KEY_PRESENT") {
-                val == "1" || val.eq_ignore_ascii_case("true")
-            } else {
-                (key_file_1.exists()
-                    && fs::metadata(&key_file_1)
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false))
-                    || (key_file_2.exists()
-                        && fs::metadata(&key_file_2)
-                            .map(|m| m.len() > 0)
-                            .unwrap_or(false))
-            };
-
-        let ssh_listening = if let Ok(val) = std::env::var("NEXTOOMIO_HEALTH_SSH_LISTENING") {
-            val == "1" || val.eq_ignore_ascii_case("true")
-        } else if !ssh_key_file_present {
-            // If no valid key file is present, SSH is disabled by design (AD-23)
+        let tcp = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
+        let tcp6 = fs::read_to_string("/proc/net/tcp6").unwrap_or_default();
+        let ssh_listening = if !ssh_key_file_present {
             true
         } else {
-            #[cfg(target_os = "linux")]
-            {
-                let tcp = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
-                let tcp6 = fs::read_to_string("/proc/net/tcp6").unwrap_or_default();
-                let is_port_22_listening = |data: &str| {
-                    data.lines().skip(1).any(|line| {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 4 {
-                            let local_addr = parts[1];
-                            let state = parts[3];
-                            local_addr.ends_with(":0016") && state == "0A" // 0x16 = 22, 0A = TCP_LISTEN
-                        } else {
-                            false
-                        }
-                    })
-                };
-                is_port_22_listening(&tcp) || is_port_22_listening(&tcp6)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                true
-            }
+            is_ssh_port_listening(&tcp, &tcp6)
         };
 
-        let healthy = system_target_reached
-            && data_mounted
-            && sound_card_openable
-            && (!ssh_key_file_present || ssh_listening);
-
-        let mut missing = Vec::new();
-        if !system_target_reached {
-            missing.push("system target not reached");
-        }
-        if !data_mounted {
-            missing.push("data partition not mounted");
-        }
-        if !sound_card_openable {
-            missing.push("configured sound card missing or cannot be opened");
-        }
-        if ssh_key_file_present && !ssh_listening {
-            missing.push("SSH server not listening with key file present");
-        }
-
-        let details = if missing.is_empty() {
-            None
-        } else {
-            Some(missing.join(", "))
-        };
-
-        Ok(HealthReport {
-            healthy,
+        Ok(evaluate_health_criteria(
             system_target_reached,
-            data_mounted,
+            &mounts,
             sound_card_openable,
-            ssh_listening,
             ssh_key_file_present,
-            details,
-        })
+            ssh_listening,
+        ))
     }
 }
 

@@ -76,6 +76,7 @@ pub enum UpdateEngineError {
     TrialExhausted,
     TrialDeadlineExceeded,
     HealthCheckFailed(String),
+    JournalCorrupted(String),
 }
 
 impl UpdateEngineError {
@@ -94,6 +95,7 @@ impl UpdateEngineError {
             Self::TrialExhausted => ErrorCode::UpdateTrialExhausted,
             Self::TrialDeadlineExceeded => ErrorCode::UpdateTrialDeadlineExceeded,
             Self::HealthCheckFailed(_) => ErrorCode::UpdateHealthCheckFailed,
+            Self::JournalCorrupted(_) => ErrorCode::UpdateJournalCorrupted,
         }
     }
 
@@ -143,6 +145,9 @@ impl fmt::Display for UpdateEngineError {
             Self::HealthCheckFailed(msg) => {
                 write!(f, "local health check failed: {msg} (update_health_check_failed)")
             }
+            Self::JournalCorrupted(msg) => {
+                write!(f, "update journal corrupted or unreadable: {msg} (update_journal_corrupted)")
+            }
         }
     }
 }
@@ -186,8 +191,13 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         storage_init?;
 
         let journal =
-            JournalController::load_or_init(journal_storage, active.name(), default.name())
-                .map_err(UpdateEngineError::Storage)?;
+            match JournalController::load_or_init(journal_storage, active.name(), default.name()) {
+                Ok(j) => j,
+                Err(e) if e.contains("corrupted") || e.contains("invalid") => {
+                    return Err(UpdateEngineError::JournalCorrupted(e));
+                }
+                Err(e) => return Err(UpdateEngineError::Storage(e)),
+            };
 
         Ok(Self {
             backend,
@@ -219,8 +229,29 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
                 .as_deref()
                 .and_then(Slot::parse)
             {
-                let _ = self.backend.arm_trial_boot(target);
+                if let Err(e) = self.backend.arm_trial_boot(target) {
+                    let _ = self.journal.commit_state_with_attempts(
+                        UpdateTransactionState::Failed,
+                        self.journal.current().tx_id.clone(),
+                        None,
+                        self.journal.current().payload_len,
+                        None,
+                        Some("update_trial_failed".to_string()),
+                        self.journal.current().consumed_attempts,
+                    );
+                    return Err(UpdateEngineError::TrialFailed(format!(
+                        "failed to arm second trial boot: {e}"
+                    )));
+                }
+                self.backend
+                    .trigger_tryboot()
+                    .map_err(UpdateEngineError::Storage)?;
             }
+        } else if outcome == ReconcileOutcome::TrialExhausted
+            || outcome == ReconcileOutcome::ContradictoryFailed
+            || outcome == ReconcileOutcome::JournalCorruptedFailed
+        {
+            let _ = self.backend.clear_trial_boot();
         }
         Ok(outcome)
     }
@@ -622,17 +653,25 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
 
     /// Arms one-shot trial boot of the installed target slot (UPD-06, AR-01, AC1, AC4, AC5).
     ///
-    /// 1. Verifies precondition: transaction state must be Installed (or Trial for attempt 2).
-    /// 2. Verifies consumed attempts < 2 (refuses with TrialExhausted if >= 2, AC4).
-    /// 3. Increments attempt counter: 0 -> 1 on attempt 1, 1 -> 2 on attempt 2.
-    /// 4. Durably commits attempt count and state Trial to alternating journal before reboot (AC1, AC5).
-    /// 5. Arms the one-shot tryboot selector for target slot, keeping previous slot default (AC1, AD-14).
-    /// 6. Triggers reboot if auto_reboot is true.
+    /// * `remote_confirm`: Flags whether external remote confirmation is expected before committing.
+    ///   Accepted for compatibility with bench deploy tooling (`scripts/bench/deploy.py`);
+    ///   in Phase 0, commit requires an explicit confirmation request.
+    /// * `auto_reboot`: Triggers a tryboot-flagged reboot immediately upon arming.
+    ///
+    /// 1. Verifies precondition: transaction state must be Installed.
+    /// 2. Verifies running slot is the default slot (trial can only start from default slot, AC6).
+    /// 3. Validates default slot and target slot parsing (AC6).
+    /// 4. Verifies consumed attempts < 2 (refuses with TrialExhausted if >= 2, AC4).
+    /// 5. Increments attempt counter: 0 -> 1 on attempt 1.
+    /// 6. Durably commits attempt count and state Trial to alternating journal before reboot (AC1, AC5).
+    /// 7. Arms the one-shot tryboot selector for target slot, keeping previous slot default (AC1, AD-14).
+    /// 8. Triggers tryboot-flagged reboot if auto_reboot is true.
     pub fn request_trial(
         &mut self,
-        _remote_confirm: bool,
+        remote_confirm: bool,
         auto_reboot: bool,
     ) -> Result<UpdateStatus, UpdateEngineError> {
+        let _ = remote_confirm;
         let (current_state, attempts, tx_id, target_slot, default_slot, payload_len, payload_sha) = {
             let curr = self.journal.current();
             (
@@ -646,13 +685,27 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             )
         };
 
-        if current_state != UpdateTransactionState::Installed
-            && current_state != UpdateTransactionState::Trial
-        {
+        if current_state != UpdateTransactionState::Installed {
             return Err(UpdateEngineError::InvalidStateTransition {
                 from: current_state,
                 to: UpdateTransactionState::Trial,
             });
+        }
+
+        let default_slot_parsed = Slot::parse(&default_slot).ok_or_else(|| {
+            UpdateEngineError::InvalidFormat(format!(
+                "invalid default slot in record: {default_slot}"
+            ))
+        })?;
+
+        let active_slot = self
+            .backend
+            .get_active_slot()
+            .map_err(UpdateEngineError::Storage)?;
+        if active_slot != default_slot_parsed {
+            return Err(UpdateEngineError::TrialFailed(format!(
+                "trial can only be requested from default slot {default_slot_parsed}, currently running {active_slot}"
+            )));
         }
 
         if attempts >= 2 {
@@ -666,7 +719,6 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             UpdateEngineError::InvalidFormat(format!("invalid target slot: {target_str}"))
         })?;
 
-        let default_slot_parsed = Slot::parse(&default_slot).unwrap_or(Slot::A);
         if target == default_slot_parsed {
             return Err(UpdateEngineError::InvalidFormat(format!(
                 "target slot {target} matches default slot {default_slot_parsed}"
@@ -695,7 +747,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
 
         if auto_reboot {
             self.backend
-                .trigger_reboot()
+                .trigger_tryboot()
                 .map_err(UpdateEngineError::Storage)?;
         }
 
@@ -710,7 +762,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     }
 
     /// Enforces the 120-second trial deadline from trial-slot handoff (UPD-06, AR-01, AC3).
-    /// Runs independently of the services being checked.
+    /// Arms the independent hardware watchdog and polls the journal for commit.
     pub fn run_trial_watchdog(
         &mut self,
         deadline_secs: u64,
@@ -734,35 +786,32 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             return Ok(());
         }
 
-        let get_uptime_secs = || -> f64 {
-            if let Ok(val) = std::env::var("NEXTOOMIO_TEST_UPTIME_SECS") {
-                if let Ok(s) = val.parse::<f64>() {
-                    return s;
-                }
-            }
-            if let Ok(content) = std::fs::read_to_string("/proc/uptime") {
-                if let Some(first) = content.split_whitespace().next() {
-                    if let Ok(s) = first.parse::<f64>() {
-                        return s;
-                    }
-                }
-            }
-            0.0
-        };
+        // Arm independent hardware watchdog chain (AC3, AR-01)
+        let _ = self.backend.arm_watchdog(deadline_secs);
 
+        let initial_uptime = self.backend.get_uptime_secs().unwrap_or(0.0);
         let start_monotonic = std::time::Instant::now();
-        let initial_uptime = get_uptime_secs();
 
         loop {
-            // Check if transaction was committed
-            if self.journal.current().state == UpdateTransactionState::Committed {
+            // Re-read the journal each poll to detect commits made by other processes (AC3, CQ-R4)
+            let _ = self.journal.reload();
+            let current_state = self.journal.current().state;
+            if current_state == UpdateTransactionState::Committed
+                || current_state == UpdateTransactionState::Failed
+            {
                 return Ok(());
             }
 
-            // Carry boot budget from kernel/systemd uptime
-            let elapsed_uptime = initial_uptime + start_monotonic.elapsed().as_secs_f64();
+            // Carry boot budget from kernel uptime / elapsed monotonic time
+            let current_uptime = self.backend.get_uptime_secs().unwrap_or(0.0);
+            let elapsed_uptime = if current_uptime >= initial_uptime && current_uptime > 0.0 {
+                current_uptime
+            } else {
+                initial_uptime + start_monotonic.elapsed().as_secs_f64()
+            };
+
             if elapsed_uptime >= deadline_secs as f64 {
-                // 120s deadline exceeded without commit (AC3): return to previous slot
+                // 120s deadline exceeded without commit (AC3): return to previous slot via plain reboot
                 let _ = self.backend.trigger_reboot();
                 return Err(UpdateEngineError::TrialDeadlineExceeded);
             }
