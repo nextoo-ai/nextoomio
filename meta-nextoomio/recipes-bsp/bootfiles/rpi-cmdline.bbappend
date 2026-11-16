@@ -3,5 +3,5 @@
 # rather than fixed device node (/dev/mmcblk0p2).
 # Unconditional assignment (=) overrides upstream meta-raspberrypi default (?=).
 # Disk signature 0x4e58544d is defined in meta-nextoomio/files/wic/nextoomio-ab.wks.in.
-# Slot B dynamic root selection is handled in P0-F4 (#4) / P0-F4.1 (#17).
-CMDLINE_ROOT_PARTITION = "PARTUUID=4e58544d-05"
+# The update image class shares this value when generating slot-specific boot images (D-067).
+require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc

@@ -11,11 +11,12 @@ software =
         copy1 = {
             images: (
                 {
-                    filename = "@BOOT_PKG_FILE@";
+                    filename = "@BOOT_PKG_A@";
                     device = "/dev/mmcblk0p2";
                     type = "raw";
                     compressed = "zlib";
-                    sha256 = "@BOOT_SHA256@";
+                    sha256 = "@BOOT_A_SHA256@";
+                    size = @BOOT_A_SIZE@;
                     installed-directly = true;
                 },
                 {
@@ -31,11 +32,12 @@ software =
         copy2 = {
             images: (
                 {
-                    filename = "@BOOT_PKG_FILE@";
+                    filename = "@BOOT_PKG_B@";
                     device = "/dev/mmcblk0p3";
                     type = "raw";
                     compressed = "zlib";
-                    sha256 = "@BOOT_SHA256@";
+                    sha256 = "@BOOT_B_SHA256@";
+                    size = @BOOT_B_SIZE@;
                     installed-directly = true;
                 },
                 {

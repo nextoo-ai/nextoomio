@@ -12,7 +12,8 @@
 #     short-lived token and refreshes it while the session runs;
 #   - sets the commit author to the App's bot identity;
 #   - starts the role: Claude Code (`claude --agent <role>`) for architect,
-#     reviewer, and qm; Antigravity (`agy`) for developer and devops.
+#     reviewer, and qm; Codex (`codex exec`) for developer and devops, or
+#     Antigravity (`agy`) with NEXTOOMIO_ENGINE=antigravity.
 # Nothing is written into the repository. See docs/engineering/agent-team.md.
 set -eu
 
@@ -86,10 +87,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Which program runs the role (docs/engineering/agent-team.md, section 4).
-# Author roles run in Antigravity on a Gemini model; the others in Claude Code.
+# Author roles run in Codex on a GPT model (owner's decision of 2026-11-16,
+# after the Antigravity quota ran out); NEXTOOMIO_ENGINE=antigravity selects
+# Antigravity on a Gemini model. The other roles run in Claude Code.
 case $role in
-  developer|devops) engine=${NEXTOOMIO_ENGINE:-antigravity} ;;
+  developer|devops) engine=${NEXTOOMIO_ENGINE:-codex} ;;
   *)                engine=${NEXTOOMIO_ENGINE:-claude} ;;
+esac
+case $engine in
+  claude|codex|antigravity) ;;
+  *) echo "agent-run: unknown engine '$engine'" >&2; exit 2 ;;
 esac
 
 if [ "$engine" = claude ]; then
@@ -97,19 +104,39 @@ if [ "$engine" = claude ]; then
   exit $?
 fi
 
-# Antigravity has no agent definitions or hooks of ours: the role's brief is
-# the body of its definition, passed with the task. Only the headless form
-# `agent-run.sh <role> -p "<task>"` is supported for it.
+# Codex and Antigravity have no agent definitions or hooks of ours: the role's
+# brief is the body of its definition, passed with the task. Only the headless
+# form `agent-run.sh <role> -p "<task>"` is supported for them.
 if [ "${1:-}" != "-p" ] || [ -z "${2:-}" ]; then
-  echo "agent-run: role '$role' runs in Antigravity; use: agent-run.sh $role -p \"<task>\"" >&2
+  echo "agent-run: role '$role' runs in $engine; use: agent-run.sh $role -p \"<task>\"" >&2
   exit 2
 fi
-model=${NEXTOOMIO_AGY_MODEL:-gemini-3.8-flash-high}
+if [ "$engine" = codex ]; then
+  model=${NEXTOOMIO_CODEX_MODEL:-gpt-6.1-terra}
+  program=Codex
+  limits="This program runs without anyone to ask, in a sandbox: you can write
+only inside the working tree, and a command that needs anything else fails.
+Use git for reading only. Do not use curl, and do not install tools: if a
+tool the task needs is not installed (for example cargo), say so in the
+summary."
+else
+  model=${NEXTOOMIO_AGY_MODEL:-gemini-3.8-flash-high}
+  program=Antigravity
+  limits="This program runs without anyone to ask. A shell command outside its allow
+list ends your whole run with no output, and your work is lost. Use only:
+git (reading only), gh, make, python3, node, npm, cargo, and the utilities
+mkdir, ls, cat, cp, mv, find, grep, head, tail, sed, awk, wc, diff, sort,
+touch, echo, printf, pwd, which, test, mktemp, tee, tr, cut, dirname,
+basename. Do not use rm, curl, chmod, or any other command, and do not
+wrap commands in bash -c or sh -c. Prefer your file-editing tools to shell
+commands for creating and changing files. If a tool the task needs is not
+installed (for example cargo), do not search for it: say so in the summary."
+fi
 agents_dir=${NEXTOOMIO_AGENTS_DIR:-$here/../.claude/agents}
 brief=$(awk 'f>=2; /^---$/ {f++}' "$agents_dir/$role.md")
 prompt="$brief
 
-Your model id for the role and model line is: $model (Antigravity).
+Your model id for the role and model line is: $model ($program).
 The role-guard hook does not run in this program; the limits above apply all the same.
 
 How you deliver here differs from your role definition: this program cannot
@@ -124,15 +151,7 @@ When writing verification evidence in the change's own pull request, write
 the literal marker {{COMMIT}} in the 'Image version and commit' field instead
 of a commit hash; the pipeline replaces it with the change commit upon delivery.
 
-This program runs without anyone to ask. A shell command outside its allow
-list ends your whole run with no output, and your work is lost. Use only:
-git (reading only), gh, make, python3, node, npm, cargo, and the utilities
-mkdir, ls, cat, cp, mv, find, grep, head, tail, sed, awk, wc, diff, sort,
-touch, echo, printf, pwd, which, test, mktemp, tee, tr, cut, dirname,
-basename. Do not use rm, curl, chmod, or any other command, and do not
-wrap commands in bash -c or sh -c. Prefer your file-editing tools to shell
-commands for creating and changing files. If a tool the task needs is not
-installed (for example cargo), do not search for it: say so in the summary.
+$limits
 
 End your reply with exactly this block, in English:
 
@@ -144,6 +163,27 @@ check; this becomes the pull-request description>
 ## Task
 
 $2"
+if [ "$engine" = codex ]; then
+  # Codex prints its progress, including the prompt, on both streams; the
+  # pipeline reads PR-Title and PR-Summary from this script's output, so only
+  # the final message is passed on. The progress goes to a log outside the
+  # repository. The sandbox allows writes in the working tree only (.git stays
+  # read-only) and network access, which gh and cargo need.
+  out_dir=$state_dir/codex
+  mkdir -p "$out_dir"
+  stamp=$(date +%Y%m%d-%H%M%S)-$$
+  last=$out_dir/$role-$stamp.last
+  status=0
+  codex exec --model "$model" --sandbox workspace-write \
+    -c sandbox_workspace_write.network_access=true --color never \
+    --output-last-message "$last" "$prompt" \
+    < /dev/null > "$out_dir/$role-$stamp.log" 2>&1 || status=$?
+  if [ -s "$last" ]; then cat "$last"; else
+    echo "agent-run: Codex left no final message; see $out_dir/$role-$stamp.log" >&2
+    [ "$status" != 0 ] || status=1
+  fi
+  exit "$status"
+fi
 # No --mode: headless runs start in Antigravity's Auto mode, which decides
 # tool permissions itself. With accept-edits, shell commands are denied
 # because a headless run cannot ask.

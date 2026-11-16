@@ -192,8 +192,12 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
 
     has_cmdline_root = False
     expected_partuuid = None
-    if cmdline_bbappend.is_file():
-        bbappend_text = cmdline_bbappend.read_text(encoding="utf-8")
+    cmdline_include = cmdline_bbappend.with_name("nextoomio-cmdline.inc")
+    include_directive = "require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc"
+    if not cmdline_bbappend.is_file() or include_directive not in cmdline_bbappend.read_text(encoding="utf-8"):
+        errors.append("rpi-cmdline.bbappend must require nextoomio-cmdline.inc")
+    if cmdline_include.is_file():
+        bbappend_text = cmdline_include.read_text(encoding="utf-8")
         for line in bbappend_text.splitlines():
             line_clean = line.strip()
             if line_clean.startswith("#") or not line_clean:
@@ -274,6 +278,22 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "selector partition must hold only the boot-selection file (D-005)"
             )
 
+        m_incompat = re.search(r'^\s*INCOMPATIBLE_LICENSE\s*=\s*["\']([^"\']*)["\']', conf_text, re.MULTILINE)
+        if not m_incompat:
+            errors.append(
+                "meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must be configured "
+                "with hard assignment '=' to reject unaccepted licenses (AC4)"
+            )
+        else:
+            incompat_val = m_incompat.group(1).split()
+            required_licenses = {"AGPL-3.0-only", "AGPL-3.0-or-later", "AGPL-1.0-only", "AGPL-1.0-or-later"}
+            missing_licenses = required_licenses - set(incompat_val)
+            if missing_licenses:
+                errors.append(
+                    f"meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must include "
+                    f"AGPL licenses {sorted(required_licenses)} (missing: {sorted(missing_licenses)}) (AC4)"
+                )
+
     autoboot_bb = root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb"
     if autoboot_bb.is_file():
         autoboot_text = autoboot_bb.read_text(encoding="utf-8")
@@ -305,6 +325,19 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
                 "must include 'nextoomio-tone-check' (P0-F6.2)"
             )
+        m_maxsize = re.search(r'^\s*IMAGE_ROOTFS_MAXSIZE\s*=\s*["\']?(\d+)["\']?', image_text, re.MULTILINE)
+        if not m_maxsize:
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_ROOTFS_MAXSIZE "
+                "must be configured with hard assignment '=' to enforce the root slot size budget (AC2)"
+            )
+        else:
+            maxsize_val = int(m_maxsize.group(1))
+            if maxsize_val <= 0 or maxsize_val > 3145728:
+                errors.append(
+                    f"meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_ROOTFS_MAXSIZE ({maxsize_val}) "
+                    "must be positive and not exceed the 3 GiB root slot budget (3145728 KiB) per ARCHITECTURE.md section 3.6 (AC2)"
+                )
 
     # Wic layout verification (ARCHITECTURE.md section 3.6, AC2, AC4, AC5)
     wks_path = root / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
@@ -782,23 +815,14 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append(
                 "image_types_nextoomio.bbclass must not use '|| true' on mcopy or mmd (silent boot assembly failure forbidden, CQ-R2)"
             )
-        for req_boot in ("Image", "bcm2711-rpi-4-b.dtb", "cmdline.txt", "config.txt", "nextoomio-hardware.txt"):
+        for req_boot in ("${SDIMG_KERNELIMAGE}", "bcm2711-rpi-4-b.dtb", "cmdline.txt", "config.txt", "nextoomio-hardware.txt", "start4.elf", "fixup4.dat"):
             if req_boot not in class_text:
-                errors.append(f"image_types_nextoomio.bbclass must check presence of required boot file '{req_boot}' with bbfatal (CQ-R2, D-056)")
-        if "bcm2835-bootfiles:do_deploy" not in class_text:
-            errors.append(
-                "image_types_nextoomio.bbclass: do_image_swu[depends] must include 'bcm2835-bootfiles:do_deploy' "
-                "for firmware deployment (CQ-R1, CQ-R2, AC1, AC4)"
-            )
-        if not re.search(r'bcm2835-bootfiles[^\n]*\n\s*bbfatal', class_text):
-            errors.append(
-                "image_types_nextoomio.bbclass must fail with bbfatal when bcm2835-bootfiles firmware directory "
-                "is missing or empty (CQ-R1, CQ-R2, AC4)"
-            )
-        if not re.search(r'overlays[^\n]*\n\s*bbfatal', class_text):
-            errors.append(
-                "image_types_nextoomio.bbclass must fail with bbfatal when overlays directory is missing or empty (CQ-R2, D-056)"
-            )
+                errors.append(f"image_types_nextoomio.bbclass must check required boot file '{req_boot}' (D-056)")
+        if "rpi-bootfiles:do_deploy" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must depend on rpi-bootfiles:do_deploy")
+        for required in ('${IMAGE_BOOT_FILES_label-boot_a}', 'bbfatal "Boot file entry ${entry} matches nothing', 'bbfatal "Required boot file ${req} is not in the boot payload', 'bbfatal "The boot payload has no device tree overlays'):
+            if required not in class_text:
+                errors.append(f"image_types_nextoomio.bbclass missing boot assembly check: {required}")
         if "gzip -l" in class_text:
             errors.append(
                 "image_types_nextoomio.bbclass must not use 'gzip -l' for uncompressed size calculation "
@@ -806,6 +830,27 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             )
         if "SWUPDATE_DESCRIPTION_TEMPLATE" not in class_text or "sed" not in class_text:
             errors.append("image_types_nextoomio.bbclass must use SWUPDATE_DESCRIPTION_TEMPLATE and sed to populate sw-description")
+
+        # D-067: both slot payloads and the fatal FAT read-back must remain wired in.
+        required_slot_fragments = (
+            'require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc',
+            'NEXTOOMIO_ROOT_B = "PARTUUID=4e58544d-06"',
+            'BOOT_PKG_A="nextoomio-boot-a.vfat.gz"',
+            'BOOT_PKG_B="nextoomio-boot-b.vfat.gz"',
+            'for slot in a b; do',
+            'EXPECTED_ROOT="${CMDLINE_ROOT_PARTITION}"',
+            'OTHER_ROOT="${NEXTOOMIO_ROOT_B}"',
+            'EXPECTED_ROOT="${NEXTOOMIO_ROOT_B}"',
+            'OTHER_ROOT="${CMDLINE_ROOT_PARTITION}"',
+            'mcopy -i "${SLOT_ARTIFACT}" ::/cmdline.txt "${SWU_BUILD_DIR}/readback-$slot.txt"',
+            'grep -Eq "(^|[[:space:]])root=$EXPECTED_ROOT([[:space:]]|$)"',
+            'grep -Fq "$OTHER_ROOT"',
+            'bbfatal "Invalid root reference in boot slot $slot cmdline.txt"',
+            'for f in sw-description "${BOOT_PKG_A}" "${BOOT_PKG_B}" "${ROOT_PKG_FILE}"',
+        )
+        for fragment in required_slot_fragments:
+            if fragment not in class_text:
+                errors.append(f"D-067 slot payload/read-back check missing: {fragment}")
 
     distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
     if distro_conf.is_file():
@@ -837,6 +882,18 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("sw-description.in copy1 must target slot A partitions (/dev/mmcblk0p2, /dev/mmcblk0p5)")
         if "/dev/mmcblk0p3" not in desc_text or "/dev/mmcblk0p6" not in desc_text:
             errors.append("sw-description.in copy2 must target slot B partitions (/dev/mmcblk0p3, /dev/mmcblk0p6)")
+        for selection, slot, boot_device, root_device in (
+            ("copy1", "A", "p2", "p5"), ("copy2", "B", "p3", "p6")
+        ):
+            match = re.search(rf"{selection}\s*=\s*\{{(.*?)\);", desc_text, re.DOTALL)
+            section = match.group(1) if match else ""
+            for fragment in (f'filename = "@BOOT_PKG_{slot}@"',
+                             f'sha256 = "@BOOT_{slot}_SHA256@"',
+                             f'size = @BOOT_{slot}_SIZE@',
+                             f'device = "/dev/mmcblk0{boot_device}"',
+                             f'device = "/dev/mmcblk0{root_device}"'):
+                if fragment not in section:
+                    errors.append(f"D-067 {selection} missing {fragment}")
         if re.search(r'signature\s*=\s*true', desc_text, re.IGNORECASE):
             errors.append("sw-description.in must NOT require signature verification (UPD-03, AC2)")
 
@@ -1043,6 +1100,7 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend",
+        "meta-nextoomio/recipes-bsp/bootfiles/nextoomio-cmdline.inc",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend",
         "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
@@ -1099,6 +1157,12 @@ def run_self_tests() -> int:
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
     ]
+
+    baseline_errors = validate_layer(ROOT)
+    if baseline_errors:
+        for error in baseline_errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
 
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp_root = pathlib.Path(tmp_str)
@@ -1484,8 +1548,8 @@ def run_self_tests() -> int:
 
         # 41. CQ-R2 / Point 3: Fail when boot assembly uses || true
         true_class = orig_class.replace(
-            'mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/',
-            'mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/ || true'
+            'mcopy -o -i "${BOOT_ARTIFACT}" "${f}" "::/${dst}"',
+            'mcopy -o -i "${BOOT_ARTIFACT}" "${f}" "::/${dst}" || true'
         )
         class_p.write_text(true_class, encoding="utf-8")
         errs = validate_layer(tmp_root)
@@ -1525,35 +1589,57 @@ def run_self_tests() -> int:
         class_p.write_text(orig_class, encoding="utf-8")
         print("  test_check_fails_when_uncompressed_size_uses_gzip_l: OK")
 
-        # 46. CQ-R1 / CQ-R2: Fail when do_image_swu[depends] is missing bcm2835-bootfiles:do_deploy
-        no_dep_class = orig_class.replace("bcm2835-bootfiles:do_deploy", "")
-        class_p.write_text(no_dep_class, encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("bcm2835-bootfiles:do_deploy" in e for e in errs), f"Expected bcm2835-bootfiles:do_deploy failure: {errs}"
+        # Reject a missing firmware dependency or nonfatal boot payload checks.
+        for original, replacement, expected in (
+            ("rpi-bootfiles:do_deploy", "", "rpi-bootfiles:do_deploy"),
+            ('bbfatal "Required boot file ${req} is not in the boot payload"', 'echo "skipping required file"', "Required boot file"),
+            ('bbfatal "The boot payload has no device tree overlays"', 'echo "skipping overlays"', "no device tree overlays"),
+            ('${IMAGE_BOOT_FILES_label-boot_a}', '', 'IMAGE_BOOT_FILES_label-boot_a'),
+        ):
+            assert original in orig_class
+            class_p.write_text(orig_class.replace(original, replacement), encoding="utf-8")
+            assert any(expected in e for e in validate_layer(tmp_root))
         class_p.write_text(orig_class, encoding="utf-8")
-        print("  test_check_fails_when_swu_depends_missing_bcm2835_bootfiles: OK")
+        print("  test_boot_assembly_checks: OK")
 
-        # 47. CQ-R1 / CQ-R2 / AC4: Fail when bcm2835-bootfiles firmware directory check is not fatal
-        no_fw_fatal = orig_class.replace(
-            'bbfatal "Firmware directory ${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles is missing or empty"',
-            'echo "skipping firmware"'
-        )
-        class_p.write_text(no_fw_fatal, encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("bcm2835-bootfiles firmware directory" in e for e in errs), f"Expected bcm2835-bootfiles fatal check failure: {errs}"
+        # D-067: reject a shared boot payload and a removed FAT read-back.
+        sw_desc_p.write_text(orig_sw_desc.replace("@BOOT_PKG_B@", "@BOOT_PKG_A@"), encoding="utf-8")
+        assert any("D-067 copy2" in e for e in validate_layer(tmp_root))
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        class_p.write_text(orig_class.replace('mcopy -i "${SLOT_ARTIFACT}" ::/cmdline.txt "${SWU_BUILD_DIR}/readback-$slot.txt"', 'true'), encoding="utf-8")
+        assert any("D-067 slot payload/read-back" in e for e in validate_layer(tmp_root))
         class_p.write_text(orig_class, encoding="utf-8")
-        print("  test_check_fails_when_firmware_check_not_fatal: OK")
+        print("  test_d067_shared_payload_and_missing_readback: OK")
 
-        # 48. CQ-R2 / D-056: Fail when overlays directory check is not fatal
-        no_ov_fatal = orig_class.replace(
-            'bbfatal "Device tree overlays directory ${DEPLOY_DIR_IMAGE}/overlays is missing or empty"',
-            'echo "skipping overlays"'
-        )
-        class_p.write_text(no_ov_fatal, encoding="utf-8")
+        # 49. AC2: Fail when IMAGE_ROOTFS_MAXSIZE is missing, weakly assigned, or exceeds budget
+        image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_image_bb = image_bb.read_text(encoding="utf-8")
+        image_bb.write_text(re.sub(r"^\s*IMAGE_ROOTFS_MAXSIZE\b[^\n]*\n", "", orig_image_bb, flags=re.MULTILINE), encoding="utf-8")
         errs = validate_layer(tmp_root)
-        assert any("overlays directory is missing or empty" in e for e in errs), f"Expected overlays fatal check failure: {errs}"
-        class_p.write_text(orig_class, encoding="utf-8")
-        print("  test_check_fails_when_overlays_check_not_fatal: OK")
+        assert any("IMAGE_ROOTFS_MAXSIZE must be configured" in e for e in errs), f"Expected size budget guard error: {errs}"
+        image_bb.write_text(re.sub(r"IMAGE_ROOTFS_MAXSIZE\s*=", "IMAGE_ROOTFS_MAXSIZE ?=", orig_image_bb), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_ROOTFS_MAXSIZE must be configured" in e for e in errs), f"Expected weak assignment failure: {errs}"
+        image_bb.write_text(re.sub(r'IMAGE_ROOTFS_MAXSIZE\s*=\s*"[^"]*"', 'IMAGE_ROOTFS_MAXSIZE = "9999999"', orig_image_bb), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must be positive and not exceed the 3 GiB root slot budget" in e for e in errs), f"Expected budget exceeded failure: {errs}"
+        image_bb.write_text(orig_image_bb, encoding="utf-8")
+        print("  test_check_fails_when_image_rootfs_maxsize_invalid: OK")
+
+        # 50. AC4: Fail when INCOMPATIBLE_LICENSE is missing, weakly assigned, or omits AGPL
+        distro_conf = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
+        orig_distro_conf = distro_conf.read_text(encoding="utf-8")
+        distro_conf.write_text(re.sub(r"^\s*INCOMPATIBLE_LICENSE\b[^\n]*\n", "", orig_distro_conf, flags=re.MULTILINE), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected license gate error: {errs}"
+        distro_conf.write_text(re.sub(r"INCOMPATIBLE_LICENSE\s*=", "INCOMPATIBLE_LICENSE ?=", orig_distro_conf), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected weak assignment failure: {errs}"
+        distro_conf.write_text(re.sub(r'INCOMPATIBLE_LICENSE\s*=\s*"[^"]*"', 'INCOMPATIBLE_LICENSE = "GPL-3.0"', orig_distro_conf), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("INCOMPATIBLE_LICENSE must include AGPL licenses" in e for e in errs), f"Expected missing AGPL license failure: {errs}"
+        distro_conf.write_text(orig_distro_conf, encoding="utf-8")
+        print("  test_check_fails_when_incompatible_license_invalid: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0
