@@ -43,7 +43,7 @@ These belong in CI. The Reviewer checks only that the jobs ran on the reviewed c
 | CQ-R10 | User-facing WebUI text exists only in the English catalog behind stable keys, with interpolation and plural forms instead of concatenation. |
 | CQ-R11 | Every new third-party component is named by the story, pinned to an exact version, and recorded with its license in the recipe and the component register; model weights, firmware, and bundled assets are checked separately. |
 | CQ-R12 | Nothing in the change depends on correct wall-clock time for a local function (AD-21). |
-| CQ-R13 | The change stays inside the author role's paths ([agent team](agent-team.md), section 4). An edit to `ARCHITECTURE.md` from a `dev/` or `ops/` branch is confined to register rows in section 10. |
+| CQ-R13 | The change stays inside the author role's paths ([agent team](agent-team.md), section 4), which include the files the story names under "Touches". An edit to `ARCHITECTURE.md` from a `dev/` or `ops/` branch is confined to register rows in section 10. |
 | CQ-R14 | No abstraction, configuration option, or dependency without a use in this change. |
 
 ## 3. Documentation checklist
