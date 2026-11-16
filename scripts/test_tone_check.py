@@ -218,10 +218,10 @@ import time, pathlib
 status_path = pathlib.Path("{status_file}")
 
 # Transition to RUNNING state and advance hw_ptr progressively to 96,000 frames
-frames = [0, 20000, 40000, 60000, 80000, 96000]
+frames = [0, 10000, 25000, 40000, 55000, 70000, 85000, 96000]
 for f in frames:
     status_path.write_text(f"state: RUNNING\\nowner_pid: 100\\nhw_ptr: {{f}}\\n", encoding="utf-8")
-    time.sleep(0.12)
+    time.sleep(0.08)
 
 # Hold final frames briefly as snd_pcm_drain completes before stream close
 time.sleep(0.15)

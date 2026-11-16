@@ -337,16 +337,24 @@ EOF
     fi
 fi
 
-# Calculate advanced frames
+# Calculate observed frames reached by hardware position (AC1, Reviewer Finding 3)
+# In ALSA, hw_ptr starts at 0 upon playback initialization. The latest observed
+# hardware pointer during playback reflects the total frames played by the stream.
 FRAMES_ADVANCED=0
-if [ -n "$HW_PTR_START" ] && [ -n "$HW_PTR_LATEST" ]; then
-    if [ "$HW_PTR_LATEST" -ge "$HW_PTR_START" ]; then
-        FRAMES_ADVANCED=$((HW_PTR_LATEST - HW_PTR_START))
-    fi
+if [ -n "$HW_PTR_LATEST" ]; then
+    FRAMES_ADVANCED="$HW_PTR_LATEST"
 fi
 
 # Verify AC1: stream was in RUNNING state and hardware position advanced
-if [ "$RUNNING_SEEN" -ne 1 ] || [ "$FRAMES_ADVANCED" -lt "$MIN_ADVANCE_FRAMES" ]; then
+# - Stream must have reached RUNNING state during playback (RUNNING_SEEN=1)
+# - Hardware pointer must have reached expected frames within tolerance (>= MIN_ADVANCE_FRAMES)
+# - Hardware clock must not be stalled (if multiple samples collected, latest must exceed start)
+STALLED=0
+if [ "$SAMPLE_COUNT" -gt 1 ] && [ -n "$HW_PTR_START" ] && [ "$HW_PTR_LATEST" -le "$HW_PTR_START" ]; then
+    STALLED=1
+fi
+
+if [ "$RUNNING_SEEN" -ne 1 ] || [ "$FRAMES_ADVANCED" -lt "$MIN_ADVANCE_FRAMES" ] || [ "$STALLED" -eq 1 ]; then
     if [ "$OUTPUT_JSON" -eq 1 ]; then
         cat << EOF
 {
