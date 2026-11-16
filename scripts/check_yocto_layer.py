@@ -700,9 +700,14 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append(
                 "image_types_nextoomio.bbclass must not use '|| true' on mcopy or mmd (silent boot assembly failure forbidden, CQ-R2)"
             )
-        for req_boot in ("Image", "bcm2711-rpi-4-b.dtb", "cmdline.txt", "config.txt"):
+        for req_boot in ("Image", "bcm2711-rpi-4-b.dtb", "cmdline.txt", "config.txt", "nextoomio-hardware.txt"):
             if req_boot not in class_text:
-                errors.append(f"image_types_nextoomio.bbclass must check presence of required boot file '{req_boot}' with bbfatal (CQ-R2)")
+                errors.append(f"image_types_nextoomio.bbclass must check presence of required boot file '{req_boot}' with bbfatal (CQ-R2, D-056)")
+        if "gzip -l" in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must not use 'gzip -l' for uncompressed size calculation "
+                "(modulo 2^32 wrap risk); compute size via 'gzip -dc | wc -c' (CQ-R1)"
+            )
         if "SWUPDATE_DESCRIPTION_TEMPLATE" not in class_text or "sed" not in class_text:
             errors.append("image_types_nextoomio.bbclass must use SWUPDATE_DESCRIPTION_TEMPLATE and sed to populate sw-description")
 
@@ -1121,6 +1126,22 @@ def run_self_tests() -> int:
         assert any("top-level images list" in e for e in errs), f"Expected top-level images failure: {errs}"
         sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
         print("  test_check_fails_when_sw_description_has_top_level_images: OK")
+
+        # 30. AC5 / D-056: Fail when image_types_nextoomio.bbclass does not check nextoomio-hardware.txt presence
+        no_hw_class = orig_class.replace('nextoomio-hardware.txt', 'ignored-hardware.txt')
+        class_p.write_text(no_hw_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("nextoomio-hardware.txt" in e for e in errs), f"Expected nextoomio-hardware.txt check failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_boot_assembly_omits_hardware_include: OK")
+
+        # 31. CQ-R1: Fail when image_types_nextoomio.bbclass uses gzip -l for uncompressed rootfs size
+        gzip_l_class = orig_class.replace('gzip -dc "${ROOTFS_ARTIFACT}" | wc -c', 'gzip -l "${ROOTFS_ARTIFACT}" | awk \'NR==2 {print $2}\'')
+        class_p.write_text(gzip_l_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("gzip -l" in e for e in errs), f"Expected gzip -l failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_uncompressed_size_uses_gzip_l: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0

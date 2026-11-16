@@ -51,17 +51,13 @@ IMAGE_CMD:swu () {
     mkfs.vfat -F 32 -n "boot" -C "${BOOT_ARTIFACT}" 262144
 
     # 2. Populate boot files into boot VFAT filesystem
-    # Required boot files must cause fatal build failure if absent (AC1, CQ-R2)
-    for req in Image bcm2711-rpi-4-b.dtb cmdline.txt config.txt; do
+    # Required boot files must cause fatal build failure if absent (AC1, CQ-R2, D-056)
+    for req in Image bcm2711-rpi-4-b.dtb cmdline.txt config.txt nextoomio-hardware.txt; do
         if [ ! -f "${DEPLOY_DIR_IMAGE}/${req}" ]; then
             bbfatal "Required boot file ${req} missing from ${DEPLOY_DIR_IMAGE}"
         fi
         mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/${req}" ::/
     done
-
-    if [ -f "${DEPLOY_DIR_IMAGE}/nextoomio-hardware.txt" ]; then
-        mcopy -i "${BOOT_ARTIFACT}" "${DEPLOY_DIR_IMAGE}/nextoomio-hardware.txt" ::/
-    fi
 
     if [ -d "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles" ]; then
         mcopy -i "${BOOT_ARTIFACT}" -s "${DEPLOY_DIR_IMAGE}/bcm2835-bootfiles/"* ::/
@@ -87,7 +83,7 @@ IMAGE_CMD:swu () {
     elif [ -f "${IMGDEPLOYDIR}/${IMAGE_NAME}.rootfs.ext4" ]; then
         ROOT_EXPANDED_SIZE=$(stat -c %s "${IMGDEPLOYDIR}/${IMAGE_NAME}.rootfs.ext4")
     else
-        ROOT_EXPANDED_SIZE=$(gzip -l "${ROOTFS_ARTIFACT}" | awk 'NR==2 {print $2}')
+        ROOT_EXPANDED_SIZE=$(gzip -dc "${ROOTFS_ARTIFACT}" | wc -c)
     fi
 
     if [ "${ROOT_EXPANDED_SIZE}" -gt "${NEXTOOMIO_ROOT_SLOT_MAXSIZE}" ]; then
