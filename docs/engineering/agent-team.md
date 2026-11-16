@@ -1,7 +1,7 @@
 # Agent team
 
 Document version: **0.14 (autonomous operation)**  
-Date: **2026-11-15**  
+Date: **2026-11-16**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
 

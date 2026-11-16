@@ -1,7 +1,7 @@
 # Code-quality rules
 
-Document version: **1.1**  
-Date: **2026-11-14**  
+Document version: **1.2**  
+Date: **2026-11-16**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [agent team](agent-team.md).
 
 These are the rules the Reviewer applies to every pull request. They restate nothing that the specification, the architecture, or `AGENTS.md` defines; each rule says what the review checks. Rule identifiers are stable and are cited in review findings.
