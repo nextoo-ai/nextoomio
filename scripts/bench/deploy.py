@@ -218,20 +218,26 @@ def parse_swu_description(swu_path: pathlib.Path) -> Dict[str, Any]:
 
     try:
         with open(swu_path, "rb") as f:
-            header = f.read(110)
-            if len(header) < 110:
-                return metadata
+            while True:
+                header = f.read(110)
+                if len(header) < 110:
+                    break
 
-            magic = header[:6]
-            if magic in (b"070701", b"070702"):  # SVR4 new ASCII CPIO
+                magic = header[:6]
+                if magic not in (b"070701", b"070702"):  # SVR4 new ASCII CPIO
+                    break
+
                 namesize = int(header[94:102], 16)
                 filesize = int(header[54:62], 16)
                 filename_bytes = f.read(namesize)
                 filename = filename_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
 
-                # CPIO header + filename is padded to 4 bytes
                 pad_name = (4 - ((110 + namesize) % 4)) % 4
-                f.read(pad_name)
+                if pad_name > 0:
+                    f.read(pad_name)
+
+                if filename == "TRAILER!!!":
+                    break
 
                 if filename == "sw-description":
                     content = f.read(filesize).decode("utf-8", errors="replace")
@@ -245,6 +251,14 @@ def parse_swu_description(swu_path: pathlib.Path) -> Dict[str, Any]:
                             for h in m_hw.group(1).split(",")
                             if h.strip()
                         ]
+                    break
+                else:
+                    # Skip file content
+                    f.seek(filesize, os.SEEK_CUR)
+
+                pad_file = (4 - (filesize % 4)) % 4
+                if pad_file > 0:
+                    f.seek(pad_file, os.SEEK_CUR)
     except Exception:
         pass
 
@@ -317,6 +331,7 @@ class Deployer:
         self.remote_confirm = remote_confirm
         self.verbose = verbose
         self.timer = StepTimer()
+        self.initial_boot_id: Optional[str] = None
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -400,8 +415,20 @@ class Deployer:
                 self.expected_version = swu_meta["version"]
                 self._log(f"Extracted expected version from SWU: {self.expected_version}")
 
+            if not self.expected_version:
+                raise DeployError(
+                    "precheck",
+                    f"No expected version could be determined from '{self.swu_path}' (sw-description missing or unreadable) and --expected-version was not specified",
+                )
+
             if not self.runner.check_reachability(timeout=5.0):
                 raise DeployError("precheck", "Bench device is not reachable over SSH")
+
+            # Record initial boot ID for reboot detection (Finding 3)
+            res_boot = self.runner.run("cat /proc/sys/kernel/random/boot_id", timeout=5.0)
+            if res_boot.ok and res_boot.stdout.strip():
+                self.initial_boot_id = res_boot.stdout.strip()
+                self._log(f"Initial device boot ID: {self.initial_boot_id}")
 
             previous_slot, previous_version, initial_status = self.query_device_state()
             if previous_slot not in ("root_a", "root_b"):
@@ -486,17 +513,50 @@ class Deployer:
                 f"Step 6: Waiting for device to reboot and return (timeout={self.timeout_secs}s)..."
             )
 
-            # Give the device a brief moment to drop connection
-            grace_period = min(2.0, self.poll_interval_secs)
-            if grace_period > 0:
-                time.sleep(grace_period)
-
             start_wait = time.monotonic()
             device_returned = False
+            device_went_down = False
+
             while (time.monotonic() - start_wait) < self.timeout_secs:
-                if self.runner.check_reachability(timeout=3.0):
+                # 1. If initial_boot_id is known, check if boot ID has changed
+                if self.initial_boot_id:
+                    res_boot = self.runner.run(
+                        "cat /proc/sys/kernel/random/boot_id",
+                        timeout=min(3.0, self.poll_interval_secs + 1.0),
+                    )
+                    if res_boot.ok and res_boot.stdout.strip():
+                        current_boot_id = res_boot.stdout.strip()
+                        if current_boot_id != self.initial_boot_id:
+                            self._log(
+                                f"Device boot ID changed ({self.initial_boot_id} -> {current_boot_id}); reboot confirmed."
+                            )
+                            device_returned = True
+                            break
+                        else:
+                            self._log(
+                                "Device still reachable with pre-reboot boot ID (shutdown in progress)..."
+                            )
+                            time.sleep(self.poll_interval_secs)
+                            continue
+
+                # 2. Check reachability
+                is_reachable = self.runner.check_reachability(
+                    timeout=min(3.0, self.poll_interval_secs + 1.0)
+                )
+                if not is_reachable:
+                    device_went_down = True
+                    self._log("Device observed unreachable (reboot in progress).")
+                elif device_went_down:
+                    self._log("Device returned after reboot.")
                     device_returned = True
                     break
+                elif not self.initial_boot_id:
+                    # Fallback when boot_id is unavailable on the target
+                    if (time.monotonic() - start_wait) > max(3.0, self.poll_interval_secs * 2):
+                        self._log("Device reachable (boot ID unavailable).")
+                        device_returned = True
+                        break
+
                 time.sleep(self.poll_interval_secs)
 
             if not device_returned:
@@ -528,8 +588,8 @@ class Deployer:
                     details=device_update_state,
                 )
 
-            # Check version match (AC3)
-            if self.expected_version and new_version != self.expected_version:
+            # Check version match (AC1, AC3)
+            if new_version != self.expected_version:
                 raise DeployError(
                     "version_check",
                     f"Image version mismatch: running '{new_version}', expected '{self.expected_version}'",
@@ -542,6 +602,7 @@ class Deployer:
 
             # Step 8: Confirm (AD-22)
             self.timer.start("confirm")
+            status_after_confirm: Dict[str, Any] = {}
             if self.remote_confirm:
                 self._log("Step 8: Sending remote confirmation to commit update...")
                 res_conf = self.runner.run("nx-sysd update confirm", timeout=15.0)
@@ -551,14 +612,33 @@ class Deployer:
                         f"Remote confirmation rejected (code {res_conf.returncode}): {res_conf.stderr.strip() or res_conf.stdout.strip()}",
                     )
                 confirmation_sent = True
-                self._log("Update committed successfully.")
+                self._log("Remote confirmation sent. Verifying update state on device...")
+
+                _, _, status_after_confirm = self.query_device_state()
+                raw_state = status_after_confirm.get("state")
+                final_state = str(raw_state) if raw_state is not None else "unknown"
+
+                if final_state.lower() != "committed":
+                    raise DeployError(
+                        "confirm",
+                        f"Update state on device is not 'committed' after confirmation (got '{final_state}')",
+                        details=status_after_confirm,
+                    )
+                self._log(f"Update committed successfully (verified device state: '{final_state}').")
             else:
-                self._log("Step 8: Remote confirmation not requested; committed by local health check.")
+                self._log("Step 8: Remote confirmation not requested; checking device update state...")
+                _, _, status_after_confirm = self.query_device_state()
+                raw_state = status_after_confirm.get("state")
+                final_state = str(raw_state) if raw_state is not None else "unknown"
+
             self.timer.stop("confirm")
 
-            # Final status query
+            # Final status query / result assembly
             _, _, final_status = self.query_device_state()
-            final_state = final_status.get("state", "committed")
+            if not final_status and status_after_confirm:
+                final_status = status_after_confirm
+            raw_state = final_status.get("state")
+            final_state = str(raw_state) if raw_state is not None else final_state
 
             return DeployResult(
                 success=True,

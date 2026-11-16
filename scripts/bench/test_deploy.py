@@ -119,16 +119,19 @@ class MockBenchDevice(SshRunner):
         self,
         initial_slot: str = "root_a",
         initial_version: str = "0.0.1-dev-base",
-        target_version: str = "0.0.1-dev-test",
+        target_version: str = "0.0.1-dev-target",
         reachable: bool = True,
         fail_validation: bool = False,
         fail_install: bool = False,
         fail_timeout: bool = False,
         simulate_rollback: bool = False,
         version_mismatch: bool = False,
+        reboot_delay_polls: int = 0,
+        fail_confirm_state: bool = False,
     ):
         self.active_slot = initial_slot
         self.default_slot = initial_slot
+        self.initial_version = initial_version
         self.current_version = initial_version
         self.target_version = target_version
         self.reachable = reachable
@@ -137,8 +140,14 @@ class MockBenchDevice(SshRunner):
         self.fail_timeout = fail_timeout
         self.simulate_rollback = simulate_rollback
         self.version_mismatch = version_mismatch
+        self.reboot_delay_polls = reboot_delay_polls
+        self.remaining_reboot_delay = 0
+        self.fail_confirm_state = fail_confirm_state
 
         # State tracking
+        self.boot_count = 1
+        self.boot_id = f"mock-boot-id-{self.boot_count}"
+        self.pre_reboot_boot_id = self.boot_id
         self.update_state = "Idle"
         self.confirmation_received = False
         self.commands_executed: List[str] = []
@@ -161,10 +170,31 @@ class MockBenchDevice(SshRunner):
         self.update_state = "Staged"
         return SshCommandResult(0, "Upload staged successfully", "")
 
+    def _trigger_reboot(self) -> None:
+        self.boot_count += 1
+        self.boot_id = f"mock-boot-id-{self.boot_count}"
+        if self.simulate_rollback:
+            self.update_state = "Failed"
+        else:
+            self.active_slot = opposite_slot(self.active_slot)
+            if self.version_mismatch:
+                self.current_version = "0.0.0-unrelated-version"
+            else:
+                self.current_version = self.target_version
+
     def run(self, cmd: str, timeout: Optional[float] = None) -> SshCommandResult:
         self.commands_executed.append(cmd)
         if not self.reachable:
             return SshCommandResult(255, "", "SSH connection refused")
+
+        if "cat /proc/sys/kernel/random/boot_id" in cmd:
+            if self.trial_armed and self.remaining_reboot_delay > 0:
+                self.remaining_reboot_delay -= 1
+                old_id = self.pre_reboot_boot_id
+                if self.remaining_reboot_delay == 0:
+                    self._trigger_reboot()
+                return SshCommandResult(0, old_id, "")
+            return SshCommandResult(0, self.boot_id, "")
 
         if "nx-sysd version --json" in cmd:
             data = {
@@ -205,22 +235,20 @@ class MockBenchDevice(SshRunner):
         if "nx-sysd update trial" in cmd:
             self.trial_armed = True
             self.update_state = "Trial"
-            # Simulate reboot behavior
+            self.pre_reboot_boot_id = self.boot_id
             if self.fail_timeout:
                 self.reachable = False  # Device hangs / never returns
-            elif self.simulate_rollback:
-                # Device boots previous slot and marks failed
-                self.update_state = "Failed"
+            elif self.reboot_delay_polls > 0:
+                self.remaining_reboot_delay = self.reboot_delay_polls
             else:
-                # Normal reboot into inactive slot
-                self.active_slot = opposite_slot(self.active_slot)
-                if self.version_mismatch:
-                    self.current_version = "0.0.0-unrelated-version"
-                else:
-                    self.current_version = self.target_version
+                self._trigger_reboot()
             return SshCommandResult(0, "Trial boot armed, rebooting", "")
 
         if "nx-sysd update confirm" in cmd:
+            self.trial_armed = False
+            if self.fail_confirm_state:
+                self.update_state = "Unconfirmed"
+                return SshCommandResult(0, '{"state": "Unconfirmed"}', "")
             self.confirmation_received = True
             self.default_slot = self.active_slot
             self.update_state = "Committed"
@@ -297,6 +325,43 @@ class TestDeployTool(unittest.TestCase):
         self.assertIn("Running Slot:      root_b", report)
         self.assertIn("Step Elapsed Times:", report)
 
+    def test_ac1_precheck_fails_when_no_expected_version(self) -> None:
+        """AC1: Precheck fails with non-zero exit when no version in SWU and none provided."""
+        no_ver_swu = self.temp_path / "no-version.swu"
+        no_ver_swu.write_bytes(b"not a valid cpio archive")
+        device = MockBenchDevice()
+        deployer = Deployer(
+            runner=device,
+            swu_path=no_ver_swu,
+            expected_version=None,
+            timeout_secs=5.0,
+            poll_interval_secs=0.01,
+        )
+        res = deployer.deploy()
+        self.assertFalse(res.success)
+        self.assertEqual(res.failing_step, "precheck")
+        self.assertIn("No expected version", str(res.error_message))
+        self.assertFalse(res.confirmation_sent)
+
+    def test_ac1_confirm_fails_when_device_state_not_committed(self) -> None:
+        """AC1: Confirm step fails with non-zero exit if device state is not 'committed'."""
+        device = MockBenchDevice(
+            initial_slot="root_a",
+            fail_confirm_state=True,
+        )
+        deployer = Deployer(
+            runner=device,
+            swu_path=self.swu_file,
+            timeout_secs=5.0,
+            poll_interval_secs=0.01,
+            remote_confirm=True,
+        )
+        res = deployer.deploy()
+        self.assertFalse(res.success)
+        self.assertEqual(res.failing_step, "confirm")
+        self.assertIn("not 'committed'", str(res.error_message))
+        self.assertNotEqual(res.final_state.lower(), "committed")
+
     def test_ac3_validation_failure(self) -> None:
         """AC3: Validation fails -> non-zero exit, failing step named, no confirmation."""
         device = MockBenchDevice(
@@ -365,6 +430,29 @@ class TestDeployTool(unittest.TestCase):
         self.assertIn("mismatch", str(res.error_message).lower())
         self.assertFalse(res.confirmation_sent)
         self.assertFalse(device.confirmation_received)
+
+    def test_ac3_device_stays_reachable_during_shutdown_before_reboot(self) -> None:
+        """AC3/AC4: Device remains reachable for a few polls after reboot without false rollback."""
+        device = MockBenchDevice(
+            initial_slot="root_a",
+            initial_version="0.0.1-dev-base",
+            target_version="0.0.1-dev-target",
+            reboot_delay_polls=2,
+        )
+        deployer = Deployer(
+            runner=device,
+            swu_path=self.swu_file,
+            timeout_secs=5.0,
+            poll_interval_secs=0.01,
+            remote_confirm=True,
+        )
+        res = deployer.deploy()
+        self.assertTrue(res.success)
+        self.assertEqual(res.running_slot, "root_b")
+        self.assertEqual(res.new_version, "0.0.1-dev-target")
+        self.assertEqual(res.final_state, "Committed")
+        self.assertTrue(res.confirmation_sent)
+        self.assertFalse(res.rollback_detected)
 
     def test_ac4_rollback_reporting(self) -> None:
         """AC4: Device returned on previous slot -> reports rollback and state, no confirmation."""
@@ -447,6 +535,53 @@ class TestDeployTool(unittest.TestCase):
             self.assertNotIn("PRIVATE KEY", arg)
             self.assertNotIn("ssh-rsa", arg)
             self.assertNotIn("ssh-ed25519", arg)
+
+        # Check working directory and stdout/stderr during a mock deploy run
+        with tempfile.TemporaryDirectory() as clean_dir:
+            clean_path = pathlib.Path(clean_dir)
+            swu_copy = clean_path / "test-clean.swu"
+            swu_copy.write_bytes(self.swu_file.read_bytes())
+            initial_files = set(clean_path.iterdir())
+
+            device = MockBenchDevice(
+                initial_slot="root_a",
+                initial_version="0.0.1-dev-base",
+                target_version="0.0.1-dev-target",
+            )
+            deployer = Deployer(
+                runner=device,
+                swu_path=swu_copy,
+                timeout_secs=5.0,
+                poll_interval_secs=0.01,
+                verbose=True,
+            )
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            old_stdout, old_stderr = sys.stdout, sys.stderr
+            try:
+                sys.stdout, sys.stderr = stdout_buf, stderr_buf
+                res = deployer.deploy()
+                report = format_text_report(res)
+                print(report)
+            finally:
+                sys.stdout, sys.stderr = old_stdout, old_stderr
+
+            combined_output = stdout_buf.getvalue() + stderr_buf.getvalue()
+
+            # Verify no secret or key patterns in output
+            for pattern in (
+                "PRIVATE KEY",
+                "ssh-rsa",
+                "ssh-ed25519",
+                "BEGIN RSA",
+                "BEGIN OPENSSH",
+            ):
+                self.assertNotIn(pattern, combined_output)
+
+            # Verify no credentials or unexpected files were created in working directory
+            final_files = set(clean_path.iterdir())
+            self.assertEqual(initial_files, final_files)
 
     def test_cli_argument_parsing(self) -> None:
         """Verify CLI argument handling for positional and option flags."""
