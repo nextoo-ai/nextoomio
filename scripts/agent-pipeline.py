@@ -309,6 +309,16 @@ def build_round_comment(role: str, issue: int, summary: str) -> str:
     return f"{clean}\n\nRole: {role_name} · Model: {AUTHOR_MODEL}"
 
 
+def round_author_task(number: int, issue: int, why: str) -> str:
+    """Build the task given to an author role on a later round (D-054)."""
+    return (f"Pull request {number} for issue {issue} needs changes: {why}. "
+            f"Read the review and the CI result with `gh pr view {number} --comments` and "
+            f"`gh pr checks {number}`, and address them. "
+            f"Provide a PR-Summary that describes the whole pull request at its head "
+            f"(what the diff contains now, what was run on it), not only the changes of the round. "
+            f"Follow your role definition.")
+
+
 def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
     """Commit and push the author's changes as the role; open the pull request if there is none.
 
@@ -325,7 +335,8 @@ def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
                      + ", ".join(f"`{p}`" for p in refused) + ". The changes are kept in a local stash.")
     found = re.search(r"^PR-Title:\s*(.+)$", output, re.M)
     pr_title = found.group(1).strip() if found else title
-    summary = output.split("PR-Summary:", 1)[1].strip() if "PR-Summary:" in output else \
+    has_summary = "PR-Summary:" in output and bool(output.split("PR-Summary:", 1)[1].strip())
+    summary = output.split("PR-Summary:", 1)[1].strip() if has_summary else \
         "The author gave no summary; see the diff."
     bot, email = bot_identity(role)
     env = dict(os.environ, GIT_AUTHOR_NAME=bot, GIT_COMMITTER_NAME=bot,
@@ -341,6 +352,8 @@ def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
     run(["git", "-c", "credential.helper=", "-c", f"credential.helper={helper}",
          "push", "-q", "-u", "origin", branch], env=dict(env, NEXTOOMIO_PUSH_TOKEN=token(role, cwd=cwd)), cwd=cwd)
     if number:
+        if has_summary:
+            gh(["pr", "edit", str(number), "--body", build_pr_body(role, issue, summary)], role=role)
         gh(["pr", "comment", str(number), "--body",
             build_round_comment(role, issue, summary)], role=role)
         return number
@@ -2347,6 +2360,198 @@ sys.exit(0)
         finally:
             gh = old_gh_d052
 
+        # Test 16: AC1 to AC3 verification of updating pull-request description on later rounds (D-054)
+        # AC3: The round task text asks for a summary of the whole pull request at its head.
+        task_review = round_author_task(234, 226, "the review requested changes")
+        assert "Pull request 234 for issue 226 needs changes: the review requested changes." in task_review
+        assert "gh pr view 234 --comments" in task_review
+        assert "gh pr checks 234" in task_review
+        assert "describes the whole pull request at its head" in task_review
+        assert "(what the diff contains now, what was run on it)" in task_review
+        assert "not only the changes of the round" in task_review
+        assert "Follow your role definition." in task_review
+
+        task_ci = round_author_task(234, 226, "CI failed on the head commit")
+        assert "Pull request 234 for issue 226 needs changes: CI failed on the head commit." in task_ci
+        assert "describes the whole pull request at its head" in task_ci
+
+        print("test_d054_ac3_round_task_text_asks_for_summary_at_head: OK")
+
+        # AC1 and AC2: deliver() updates description when PR-Summary is present; leaves unchanged when absent
+        d054_origin = os.path.join(tmpdir, "d054_origin")
+        d054_local = os.path.join(tmpdir, "d054_local")
+        os.makedirs(d054_origin)
+        subprocess.run(["git", "init", "-q", "-b", "main", d054_origin], check=True)
+        subprocess.run(["git", "-C", d054_origin, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", d054_origin, "config", "user.email", "pipeline-test@example.com"], check=True)
+        subprocess.run(["git", "-C", d054_origin, "config", "receive.denyCurrentBranch", "ignore"], check=True)
+        subprocess.run(["git", "-C", d054_origin, "commit", "-q", "--allow-empty", "-m", "Initial commit"], check=True)
+
+        subprocess.run(["git", "clone", "-q", d054_origin, d054_local], check=True)
+        subprocess.run(["git", "-C", d054_local, "config", "user.name", "Pipeline Test"], check=True)
+        subprocess.run(["git", "-C", d054_local, "config", "user.email", "pipeline-test@example.com"], check=True)
+
+        mock_token_d054 = os.path.join(tmpdir, "d054_token.sh")
+        with open(mock_token_d054, "w") as f:
+            f.write("#!/bin/sh\necho mock_token\n")
+        os.chmod(mock_token_d054, 0o755)
+
+        mock_guard_d054 = os.path.join(tmpdir, "d054_guard.py")
+        with open(mock_guard_d054, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        os.chmod(mock_guard_d054, 0o755)
+
+        d054_tooling = Tooling(
+            run_dir=tmpdir,
+            tooling_dir=tmpdir,
+            agent_run=tooling_root.agent_run,
+            agent_token=mock_token_d054,
+            role_guard=mock_guard_d054,
+            agents_dir=tooling_root.agents_dir,
+        )
+
+        class MockGH_D054:
+            def __init__(self):
+                self.pr_descriptions = {
+                    540: "Initial round 1 description\n\nRefs #237\n\nRole: DevOps · Model: old-model",
+                    541: "Initial round 1 dev description\n\nRefs #237\n\nRole: Developer · Model: old-model",
+                }
+                self.pr_comments = []
+                self.edit_calls = []
+
+            def __call__(self, args, role=None, check=True):
+                if len(args) >= 2 and args[0] == "api" and "users/nextoomio-" in args[1]:
+                    return "12345"
+                if len(args) >= 2 and args[0] == "pr" and args[1] == "edit":
+                    pr_num = int(args[2])
+                    body_idx = args.index("--body") + 1
+                    new_body = args[body_idx]
+                    self.pr_descriptions[pr_num] = new_body
+                    self.edit_calls.append({"pr": pr_num, "body": new_body, "role": role})
+                    return "{}"
+                if len(args) >= 2 and args[0] == "pr" and args[1] == "comment":
+                    pr_num = int(args[2])
+                    body_idx = args.index("--body") + 1
+                    comment_body = args[body_idx]
+                    self.pr_comments.append({"pr": pr_num, "body": comment_body, "role": role})
+                    return "{}"
+                return "{}"
+
+        mock_gh_d054 = MockGH_D054()
+        old_gh_d054 = gh
+        old_tooling_d054 = TOOLING
+
+        try:
+            gh = mock_gh_d054
+            TOOLING = d054_tooling
+
+            subprocess.run(["git", "-C", d054_local, "switch", "-q", "-c", "ops/D-054-test"], check=True)
+            subprocess.run(["git", "-C", d054_local, "push", "-q", "-u", "origin", "ops/D-054-test"], check=True)
+
+            # AC1: Given an open pull request made by the pipeline, when a later round
+            # delivers a commit with a PR-Summary, then the pull-request description equals
+            # build_pr_body of that summary (one Refs #<n> line, one role line) and a round comment is posted.
+            with open(os.path.join(d054_local, "change1.txt"), "w") as f:
+                f.write("change round 2\n")
+
+            output_round2 = (
+                "PR-Title: ops: updated round 2 changes\n"
+                "PR-Summary:\n"
+                "Refs #237\n\n"
+                "This is the updated summary describing the whole pull request at its head.\n"
+                "All items verified and covered by tests.\n\n"
+                "Role: DevOps · Model: gemini-3.8-flash-high (Antigravity)\n"
+            )
+
+            pr_ret1 = deliver("devops", 237, "D-054 test issue", "ops/D-054-test", output_round2, [], 540, cwd=d054_local)
+            assert pr_ret1 == 540, f"Expected deliver to return PR number 540, got {pr_ret1}"
+
+            # PR description updated
+            assert len(mock_gh_d054.edit_calls) == 1
+            assert mock_gh_d054.edit_calls[0]["pr"] == 540
+            assert mock_gh_d054.edit_calls[0]["role"] == "devops"
+
+            desc_after_r2 = mock_gh_d054.pr_descriptions[540]
+            expected_r2_desc = build_pr_body("devops", 237, output_round2.split("PR-Summary:", 1)[1].strip())
+            assert desc_after_r2 == expected_r2_desc, f"PR description does not match build_pr_body:\n{desc_after_r2}"
+            assert desc_after_r2.startswith("Refs #237\n\n")
+            assert desc_after_r2.count("Refs #237") == 1
+            role_lines = [l for l in desc_after_r2.splitlines() if l.strip().startswith("Role:")]
+            assert len(role_lines) == 1
+            assert role_lines[0] == f"Role: DevOps · Model: {AUTHOR_MODEL}"
+            assert desc_after_r2.endswith(f"Role: DevOps · Model: {AUTHOR_MODEL}")
+            assert "This is the updated summary describing the whole pull request at its head." in desc_after_r2
+
+            # Round comment posted
+            assert len(mock_gh_d054.pr_comments) == 1
+            comment_r2 = mock_gh_d054.pr_comments[0]
+            assert comment_r2["pr"] == 540
+            assert comment_r2["role"] == "devops"
+            expected_r2_comment = build_round_comment("devops", 237, output_round2.split("PR-Summary:", 1)[1].strip())
+            assert comment_r2["body"] == expected_r2_comment
+            assert "Refs #237" not in comment_r2["body"]
+            comment_role_lines = [l for l in comment_r2["body"].splitlines() if l.strip().startswith("Role:")]
+            assert len(comment_role_lines) == 1
+            assert comment_role_lines[0] == f"Role: DevOps · Model: {AUTHOR_MODEL}"
+
+            # Also verify Developer role delivers with Developer role line
+            with open(os.path.join(d054_local, "change_dev.txt"), "w") as f:
+                f.write("change round 2 dev\n")
+            output_dev = "PR-Title: dev: update\nPR-Summary: Dev summary for whole PR at head."
+            deliver("developer", 237, "D-054 dev issue", "ops/D-054-test", output_dev, [], 541, cwd=d054_local)
+            desc_dev = mock_gh_d054.pr_descriptions[541]
+            assert desc_dev.count("Refs #237") == 1
+            assert f"Role: Developer · Model: {AUTHOR_MODEL}" in desc_dev
+
+            print("test_d054_ac1_later_round_with_summary_updates_description_and_posts_comment: OK")
+
+            # AC2: Given a later round whose output has no PR-Summary, then the description is unchanged.
+            with open(os.path.join(d054_local, "change1.txt"), "a") as f:
+                f.write("change round 3 without summary\n")
+
+            desc_before_r3 = mock_gh_d054.pr_descriptions[540]
+            edits_count_before = len(mock_gh_d054.edit_calls)
+            comments_count_before = len(mock_gh_d054.pr_comments)
+
+            output_no_summary = "PR-Title: ops: round 3 fixes\nI fixed the issue without writing PR-Summary keyword."
+            pr_ret2 = deliver("devops", 237, "D-054 test issue", "ops/D-054-test", output_no_summary, [], 540, cwd=d054_local)
+            assert pr_ret2 == 540
+
+            # Description is unchanged (no edit called)
+            assert len(mock_gh_d054.edit_calls) == edits_count_before, "gh pr edit was called when no summary was provided!"
+            assert mock_gh_d054.pr_descriptions[540] == desc_before_r3, "PR description was modified!"
+
+            # Round comment is posted and states that author gave no summary
+            assert len(mock_gh_d054.pr_comments) == comments_count_before + 1
+            comment_r3 = mock_gh_d054.pr_comments[-1]
+            assert comment_r3["pr"] == 540
+            assert comment_r3["role"] == "devops"
+            assert "The author gave no summary; see the diff." in comment_r3["body"]
+            assert comment_r3["body"].endswith(f"Role: DevOps · Model: {AUTHOR_MODEL}")
+
+            # AC2 variant: PR-Summary present but contains only whitespace
+            with open(os.path.join(d054_local, "change1.txt"), "a") as f:
+                f.write("change round 4 whitespace summary\n")
+
+            output_whitespace = "PR-Title: ops: round 4\nPR-Summary:   \n\t  \n"
+            deliver("devops", 237, "D-054 test issue", "ops/D-054-test", output_whitespace, [], 540, cwd=d054_local)
+
+            assert len(mock_gh_d054.edit_calls) == edits_count_before, "gh pr edit called for whitespace-only summary!"
+            assert mock_gh_d054.pr_descriptions[540] == desc_before_r3, "PR description modified for whitespace-only summary!"
+            comment_r4 = mock_gh_d054.pr_comments[-1]
+            assert "The author gave no summary; see the diff." in comment_r4["body"]
+
+            print("test_d054_ac2_later_round_no_summary_leaves_description_unchanged: OK")
+
+            # Offline verification
+            assert gh is mock_gh_d054
+            assert TOOLING is d054_tooling
+            print("test_d054_offline_coverage: OK")
+
+        finally:
+            gh = old_gh_d054
+            TOOLING = old_tooling_d054
+
     print("OK: all self-tests passed.")
     return 0
 
@@ -2426,9 +2631,7 @@ def main(argv=None, cwd=None, run_dir=None):
                 say(f"pull request #{number} at {head[:7]}")
                 say(f"pull request #{number}: APPROVED")
             elif verdict == "CHANGES_REQUESTED":
-                task = (f"Pull request {number} for issue {issue} needs changes: the review requested changes. "
-                        f"Read the review and the CI result with `gh pr view {number} --comments` and "
-                        f"`gh pr checks {number}`, and address them. Follow your role definition.")
+                task = round_author_task(number, issue, "the review requested changes")
                 run(["git", "switch", branch], cwd=cwd)
             else:
                 skip_author = True
@@ -2473,9 +2676,7 @@ def main(argv=None, cwd=None, run_dir=None):
                 if rounds > MAX_ROUNDS:
                     block(issue, f"pull request #{number} was not approved after {MAX_ROUNDS} rounds of changes; "
                                  "the Architect decides whether the story or the approach is wrong.")
-                task = (f"Pull request {number} for issue {issue} needs changes: {why}. Read the review and the CI "
-                        f"result with `gh pr view {number} --comments` and `gh pr checks {number}`, and address them. "
-                        "Follow your role definition.")
+                task = round_author_task(number, issue, why)
                 run(["git", "switch", branch], cwd=cwd)
 
         # Auto-merge enabled before the approval did not fire on its own in the
