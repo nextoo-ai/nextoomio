@@ -109,7 +109,7 @@ IMAGE_CMD:swu () {
             EXPECTED_ROOT="${NEXTOOMIO_ROOT_B}"
             OTHER_ROOT="${CMDLINE_ROOT_PARTITION}"
             sed "s|root=${CMDLINE_ROOT_PARTITION}|root=${NEXTOOMIO_ROOT_B}|g" \
-                "${DEPLOY_DIR_IMAGE}/cmdline.txt" > "${SWU_BUILD_DIR}/cmdline-b.txt"
+                "${DEPLOY_DIR_IMAGE}/${BOOTFILES_DIR_NAME}/cmdline.txt" > "${SWU_BUILD_DIR}/cmdline-b.txt"
             mdel -i "${SLOT_ARTIFACT}" ::/cmdline.txt
             mcopy -i "${SLOT_ARTIFACT}" "${SWU_BUILD_DIR}/cmdline-b.txt" ::/cmdline.txt
         fi
