@@ -1,7 +1,7 @@
 # Agent team
 
-Document version: **0.13 (autonomous operation)**  
-Date: **2026-11-15**  
+Document version: **0.14 (autonomous operation)**  
+Date: **2026-11-16**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
 
@@ -28,6 +28,8 @@ Version 0.11 records the pipeline runs on D-041 to D-050 and what remains for th
 Version 0.12 records who closes a defect that is assigned to a story (section 5, step 5) and the matching change of the guard, which now limits closing an issue by hand to the Architect instead of denying it to every role: the first product story, P0-F1.1 (#8), met every criterion and still could not close, because its defects were open and no rule named who closes them.
 
 Version 0.13 records the Architect's authority to unblock development (section 4.1) and what `Completes-Story: yes` means for a story with bench criteria (section 5, step 3), after P0-F2.1 (#11) was blocked twice with no code finding and stories with bench criteria could not reach `state:implemented`.
+
+Version 0.14 adds `docs/bench/` to the DevOps paths and states for DevOps what section 4.2 already states for the Developer: files a story names under "Touches" are inside the role's paths for that story (section 4.5). The first run of the Phase 0 queue blocked P0-F7.1 (#31) because the bench record it must deliver lies under `docs/bench/`, which was in no role's paths (findings #228 and #235), and P0-F2.3 (#13) because its "Touches" names `core/crates/nx-sysd/**`. The guard and the pipeline already accepted "Touches" for both author roles; only the text did not.
 
 ## 1. Goal
 
@@ -114,8 +116,8 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Responsibility:** CI workflows, kas and Yocto build, image and update-file production, deploy tooling, bench operation, and recording bench evidence.
 - **Input:** One enabler or story issue in its area labelled `state:ready`, a story with `state:implemented` that needs hardware evidence, or a failed build.
 - **Output:** A pull request on an `ops/` branch with build or CI changes, or with an evidence file stating the observed result.
-- **May edit:** `.github/`, `kas/`, `meta-nextoomio/`, `scripts/`, `Makefile`, `.gitignore`, and `docs/evidence/`; the register rows of `ARCHITECTURE.md` section 10 under the same condition as the Developer.
-- **May not:** Edit original application code, the maintained requirement documents, or the agent rules. Bench limits are in OQ-14.
+- **May edit:** `.github/`, `kas/`, `meta-nextoomio/`, `scripts/`, `Makefile`, `.gitignore`, `docs/evidence/`, and `docs/bench/` (bench procedures and the bench record); other files the story names under "Touches"; the register rows of `ARCHITECTURE.md` section 10 under the same condition as the Developer.
+- **May not:** Edit original application code that the story does not name under "Touches", the maintained requirement documents, or the agent rules. Bench limits are in OQ-14.
 - **Model:** Gemini 3.8 Flash (High) in Antigravity (`agy`).
 - **Concurrency:** One DevOps agent at a time, because the bench and the build cache are single resources.
 

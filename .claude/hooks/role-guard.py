@@ -39,6 +39,7 @@ ROLE_PATHS = {
         "Makefile",
         ".gitignore",
         "docs/evidence/**",
+        "docs/bench/**",
         "ARCHITECTURE.md",  # register rows in section 10 only; checked in review (CQ-R13)
     ],
     "reviewer": [],
