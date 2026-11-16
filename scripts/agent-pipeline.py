@@ -8,7 +8,7 @@ Steps (docs/engineering/agent-team.md, section 5):
   1. The author role implements the issue in the working tree. The pipeline
      checks that the changed paths belong to the role, then commits, pushes,
      and opens the pull request under the role's identity. (The author roles
-     run in Antigravity, whose sandbox does not let git write to .git.)
+     run in Codex or Antigravity, whose sandboxes do not let git write to .git.)
   2. Auto-merge is enabled, so GitHub merges once the rules on main are met.
   3. CI runs; the Reviewer reviews. Requested changes or a CI failure go back
      to the author, at most MAX_ROUNDS times, then the issue is blocked.
@@ -62,7 +62,11 @@ def get_required_checks(repo=REPO, role=None):
     if not has_rule or not checks:
         raise Stop(1, "the rules on main name no required status checks")
     return checks
-AUTHOR_MODEL = os.environ.get("NEXTOOMIO_AGY_MODEL", "gemini-3.8-flash-high") + " (Antigravity)"
+# The same defaults as scripts/agent-run.sh: author roles run in Codex unless NEXTOOMIO_ENGINE says Antigravity.
+if os.environ.get("NEXTOOMIO_ENGINE", "codex") == "antigravity":
+    AUTHOR_MODEL = os.environ.get("NEXTOOMIO_AGY_MODEL", "gemini-3.8-flash-high") + " (Antigravity)"
+else:
+    AUTHOR_MODEL = os.environ.get("NEXTOOMIO_CODEX_MODEL", "gpt-6.1-terra") + " (Codex)"
 AGENT_TIMEOUT = int(os.environ.get("NEXTOOMIO_AGENT_TIMEOUT_SECONDS", "3600"))
 
 
@@ -693,6 +697,11 @@ def run_self_tests():
         with open(os.path.join(stub_bin, "agy"), "w") as f:
             f.write('#!/bin/sh\necho "AGY_PROMPT: $@"\n')
         os.chmod(os.path.join(stub_bin, "agy"), 0o755)
+        # Codex writes its final message to the file named after --output-last-message; the prompt is the last argument.
+        with open(os.path.join(stub_bin, "codex"), "w") as f:
+            f.write('#!/bin/sh\nout=\nwhile [ $# -gt 1 ]; do [ "$1" = --output-last-message ] && out=$2; shift; done\n'
+                    'echo "stub progress that must not reach the caller"\necho "CODEX_PROMPT: $1" > "$out"\n')
+        os.chmod(os.path.join(stub_bin, "codex"), 0o755)
 
         # Stub agent-token.sh in pinned tooling so agent-run.sh needs no network
         with open(tooling_root.agent_token, "w") as f:
@@ -712,6 +721,7 @@ def run_self_tests():
                             PATH=f"{stub_bin}:{os.environ.get('PATH', '')}",
                             NEXTOOMIO_STATE_DIR=os.path.join(tmpdir, "state"))
         env_fallback.pop("NEXTOOMIO_AGENTS_DIR", None)
+        env_fallback.pop("NEXTOOMIO_ENGINE", None)
         res_fallback = subprocess.run([tooling_root.agent_run, "devops", "-p", "fallback task"],
                                       capture_output=True, text=True, env=env_fallback)
         assert res_fallback.returncode == 0, f"agent-run.sh fallback failed: {res_fallback.stderr}"
@@ -724,6 +734,20 @@ def run_self_tests():
         assert res_custom.returncode == 0, f"agent-run.sh with NEXTOOMIO_AGENTS_DIR failed: {res_custom.stderr}"
         assert "CUSTOM_AGENT_BRIEF_CONTENT" in res_custom.stdout, f"Custom brief not found: {res_custom.stdout}"
         assert "custom task" in res_custom.stdout, f"Custom task not found: {res_custom.stdout}"
+
+        # 3. Author roles start in Codex by default and only its final message is passed on;
+        #    NEXTOOMIO_ENGINE=antigravity starts Antigravity; an unknown engine is refused.
+        assert "CODEX_PROMPT:" in res_custom.stdout, f"Codex was not the default author program: {res_custom.stdout}"
+        assert "stub progress" not in res_custom.stdout, f"Codex progress leaked into the output: {res_custom.stdout}"
+        assert "(Codex)" in res_custom.stdout, f"Model line does not name Codex: {res_custom.stdout}"
+        res_agy = subprocess.run([tooling_root.agent_run, "devops", "-p", "agy task"], capture_output=True, text=True,
+                                 env=dict(env_custom, NEXTOOMIO_ENGINE="antigravity"))
+        assert res_agy.returncode == 0 and "AGY_PROMPT:" in res_agy.stdout, f"Antigravity not started: {res_agy.stdout} {res_agy.stderr}"
+        assert "(Antigravity)" in res_agy.stdout, f"Model line does not name Antigravity: {res_agy.stdout}"
+        res_bad = subprocess.run([tooling_root.agent_run, "devops", "-p", "x"], capture_output=True, text=True,
+                                 env=dict(env_custom, NEXTOOMIO_ENGINE="other"))
+        assert res_bad.returncode == 2, f"Unknown engine was not refused: {res_bad.returncode}"
+        print("test_author_engine_selection: OK")
         assert "{{COMMIT}}" in res_custom.stdout, f"Marker instruction missing from agent prompt: {res_custom.stdout}"
         assert "'Image version and commit'" in res_custom.stdout, f"Field instruction missing from agent prompt: {res_custom.stdout}"
         print("test_agent_run_pinned_agents: OK")
@@ -1601,7 +1625,7 @@ def run_self_tests():
             "- Item A\n"
             "- Item B\n\n"
             f"Refs #{test_issue}\n\n"
-            f"Role: DevOps · Model: gemini-3.8-flash-high (Antigravity)"
+            f"Role: DevOps · Model: {AUTHOR_MODEL}"
         )
 
         body_ac1_devops = build_pr_body("devops", test_issue, raw_summary_ac1)
@@ -2477,7 +2501,7 @@ sys.exit(0)
                 "Refs #237\n\n"
                 "This is the updated summary describing the whole pull request at its head.\n"
                 "All items verified and covered by tests.\n\n"
-                "Role: DevOps · Model: gemini-3.8-flash-high (Antigravity)\n"
+                f"Role: DevOps · Model: {AUTHOR_MODEL}\n"
             )
 
             pr_ret1 = deliver("devops", 237, "D-054 test issue", "ops/D-054-test", output_round2, [], 540, cwd=d054_local)

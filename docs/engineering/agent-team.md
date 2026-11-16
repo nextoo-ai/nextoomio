@@ -1,6 +1,6 @@
 # Agent team
 
-Document version: **0.14 (autonomous operation)**  
+Document version: **0.15 (autonomous operation)**  
 Date: **2026-11-16**  
 Status: **Adopted. The workflow runs without the project owner in the loop (section 3.1). Section 7 states what is in place and what is not; sections 9.2 and 9.3 record what has been tried. Where a decision in section 9 names the project owner as the one who starts agents, approves, merges, or closes, section 3.1 replaces it.**  
 Related rules: [AGENTS.md](../../AGENTS.md), [backlog conventions](../backlog/README.md), [code-quality rules](code-quality.md).
@@ -30,6 +30,8 @@ Version 0.12 records who closes a defect that is assigned to a story (section 5,
 Version 0.13 records the Architect's authority to unblock development (section 4.1) and what `Completes-Story: yes` means for a story with bench criteria (section 5, step 3), after P0-F2.1 (#11) was blocked twice with no code finding and stories with bench criteria could not reach `state:implemented`.
 
 Version 0.14 adds `docs/bench/` to the DevOps paths and states for DevOps what section 4.2 already states for the Developer: files a story names under "Touches" are inside the role's paths for that story (section 4.5). The first run of the Phase 0 queue blocked P0-F7.1 (#31) because the bench record it must deliver lies under `docs/bench/`, which was in no role's paths (findings #228 and #235), and P0-F2.3 (#13) because its "Touches" names `core/crates/nx-sysd/**`. The guard and the pipeline already accepted "Touches" for both author roles; only the text did not.
+
+Version 0.15 moves the author roles from Antigravity to Codex (project owner's decision, 2026-11-16, after the Antigravity quota ran out with a reset five days away): section 4, section 7, and section 8. Antigravity stays selectable with `NEXTOOMIO_ENGINE=antigravity`. Sections 9 and 11 keep what was recorded for the runs in Antigravity.
 
 ## 1. Goal
 
@@ -65,7 +67,7 @@ Reasons recorded by the project owner:
 | # | Decision |
 | --- | --- |
 | D-E | **No person in the loop.** The project owner sees only the result. Starting roles, review cycles, merging, verification, and closing run without the owner. This replaces D-A and the owner's approval and merge. |
-| D-F | **Each role runs on an independent model.** Development runs in Antigravity; review runs on Sonnet; the chief Architect is Fable. The assignments for DevOps and QM in section 4 are the Architect's, made so that no role checks work produced by its own model. |
+| D-F | **Each role runs on an independent model.** Development runs in Codex (in Antigravity until 2026-11-16; owner's decision of that day); review runs on Sonnet; the chief Architect is Fable. The assignments for DevOps and QM in section 4 are the Architect's, made so that no role checks work produced by its own model. |
 | D-G | **The Architect orchestrates.** It prepares and marks stories ready, starts the pipeline, triages findings, decides blocked stories, and keeps the rules. |
 
 The owner still acts where GitHub requires the account holder: confirming access for changes to App permissions and repository settings.
@@ -91,7 +93,7 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Output:** One `dev/` branch and one pull request referencing the issue with `Refs #<n>`, with CI passing and the Definition of Done items 1–5 of the backlog conventions addressed.
 - **May edit:** `core/`, `matter/`, `webui/`, `docs/api/`, tests, and other files the story names under "Touches"; `README.md` and `CONTRIBUTING.md` where the change affects them; the rows of the component and license register (`ARCHITECTURE.md` section 10) for a component the story names, to pin its exact version and record its license (RF-03).
 - **May not:** Change `SPECIFICATION.md`, `ROADMAP.md`, any other part of `ARCHITECTURE.md`, acceptance criteria, CI workflows, or the agent rules; introduce a third-party component the story does not name. If a story cannot be delivered as written, it stops and follows OQ-09. It does not review or merge pull requests and does not close issues.
-- **Model:** Gemini 3.8 Flash (High) in Antigravity (`agy`). The label `risk:high` is kept as information for the Reviewer and the Architect; it no longer selects another model.
+- **Model:** GPT-6.1 Terra (`gpt-6.1-terra`) in Codex (`codex exec`); with `NEXTOOMIO_ENGINE=antigravity`, Gemini 3.8 Flash (High) in Antigravity (`agy`). The label `risk:high` is kept as information for the Reviewer and the Architect; it no longer selects another model.
 
 ### 4.3 PR Reviewer / Code Quality
 
@@ -118,7 +120,7 @@ Paths not listed under "May edit" are read-only for that role. `SK/` is read-onl
 - **Output:** A pull request on an `ops/` branch with build or CI changes, or with an evidence file stating the observed result.
 - **May edit:** `.github/`, `kas/`, `meta-nextoomio/`, `scripts/`, `Makefile`, `.gitignore`, `docs/evidence/`, and `docs/bench/` (bench procedures and the bench record); other files the story names under "Touches"; the register rows of `ARCHITECTURE.md` section 10 under the same condition as the Developer.
 - **May not:** Edit original application code that the story does not name under "Touches", the maintained requirement documents, or the agent rules. Bench limits are in OQ-14.
-- **Model:** Gemini 3.8 Flash (High) in Antigravity (`agy`).
+- **Model:** GPT-6.1 Terra (`gpt-6.1-terra`) in Codex (`codex exec`); with `NEXTOOMIO_ENGINE=antigravity`, Gemini 3.8 Flash (High) in Antigravity (`agy`).
 - **Concurrency:** One DevOps agent at a time, because the bench and the build cache are single resources.
 
 ## 5. Workflow
@@ -165,14 +167,14 @@ Pull requests never use a closing keyword: an issue is closed only after the QM 
 | `.claude/agents/` | One definition per role (section 8) | In place |
 | `.claude/hooks/role-guard.py` | Path and command guard (OQ-02) | In place |
 | `docs/engineering/code-quality.md` | Section 6 | In place |
-| `scripts/agent-token.sh`, `scripts/agent-run.sh` | Role identity for a session (OQ-12, section 8); Developer and DevOps start in Antigravity | In place |
+| `scripts/agent-token.sh`, `scripts/agent-run.sh` | Role identity for a session (OQ-12, section 8); Developer and DevOps start in Codex, or in Antigravity with `NEXTOOMIO_ENGINE=antigravity` | In place |
 | `.gitignore` | `.claude/worktrees/` | In place |
 | GitHub labels | `state:ready`, `state:blocked`, `type:finding`, `risk:high` | In place |
 | GitHub Apps | One per role (section 9.1) | In place |
 | Rule set on `main` | Changes only through a pull request; the three CI checks; one approval of the head commit by someone other than the last pusher; no forced push or deletion; no bypass actor. Auto-merge and branch deletion on merge are enabled in the repository | In place since 2026-11-14; not yet described in `CONTRIBUTING.md` (P0-F8.2, #85) |
 | `scripts/agent-pipeline.py` | The workflow of section 5 | In place; section 9.3 records whether it has run. It takes the "Touches" list from the issue body as extra paths for the guard; that list is written by the Architect and is trusted |
 | `.github/PULL_REQUEST_TEMPLATE.md` | Role and model line and the issue reference; P0-F8.1 (#84) covers the template | Not in place |
-| CI | Role path scope (CQ-M10) and lock files (CQ-M8) | Not in place. For the Developer and DevOps roles, which run in Antigravity without the guard, the pipeline checks the changed paths before it commits, and the Reviewer applies CQ-R13; a pull request made outside the pipeline has the review only |
+| CI | Role path scope (CQ-M10) and lock files (CQ-M8) | Not in place. For the Developer and DevOps roles, which run in Codex or Antigravity without the guard, the pipeline checks the changed paths before it commits, and the Reviewer applies CQ-R13; a pull request made outside the pipeline has the review only |
 | Bench key | OQ-14 | Not in place |
 
 ## 8. Agent definitions and starting a session
@@ -188,7 +190,7 @@ Each file under `.claude/agents/<role>.md` (`architect`, `developer`, `reviewer`
 A role is started with `scripts/agent-run.sh <role>`, normally by the pipeline. The script gives `gh` and `git` a private configuration that contains only the short-lived token of the role's App, refreshes it while the session runs, removes it afterwards, and sets the commit author to the App's bot identity. `scripts/agent-run.sh --check <role>` sets up the identity, prints it, and exits.
 
 - **Architect, Reviewer, QM** run in Claude Code as `claude --agent <role>`, with the definition's model, removed tools, and guard hook. The command-line program must be signed in.
-- **Developer, DevOps** run in Antigravity as `agy -p`, headless. Antigravity has no agent definitions or hooks of ours: the script passes the body of the role's definition together with the task, and the repository's `AGENTS.md` is read by Antigravity itself. **The guard does not run there**, and Antigravity's sandbox does not let `git` write to `.git`, so these roles only change files and run checks; the pipeline makes the branch, commit, push, and pull request for them. Before committing, the pipeline applies the guard's path rules to every changed file, which is a mechanical check of the role's paths for pipeline runs; the Reviewer applies CQ-R13 as well. The `model` field in these two definitions applies only if the role is started in Claude Code instead.
+- **Developer, DevOps** run in Codex as `codex exec`, headless, in its `workspace-write` sandbox with network access (which `gh` and `cargo` need); `NEXTOOMIO_ENGINE=antigravity` starts them in Antigravity as `agy -p` instead. Neither program has agent definitions or hooks of ours: the script passes the body of the role's definition together with the task, and the repository's `AGENTS.md` is read by the program itself. **The guard does not run there**, and neither sandbox lets `git` write to `.git`, so these roles only change files and run checks; the pipeline makes the branch, commit, push, and pull request for them. Before committing, the pipeline applies the guard's path rules to every changed file, which is a mechanical check of the role's paths for pipeline runs; the Reviewer applies CQ-R13 as well. Codex prints its progress on the output streams; the script passes on only the final message and keeps the progress in `~/.config/nextoomio/codex/`. The `model` field in these two definitions applies only if the role is started in Claude Code instead.
 
 **Bootstrap exception.** `scripts/agent-run.sh`, `scripts/agent-token.sh`, and `scripts/agent-pipeline.py` are DevOps paths, but they are what the DevOps role is started with. Until one pipeline run has delivered a DevOps change from start to end, the Architect may change these three files on an `arch/` branch, through the same review and rule set as any change. The Architect authorised this under D-G. It covered pull requests #154, #158, #159, #160, and #161. **It ended on 2026-11-14** with the first complete pipeline run (section 9.3); these files now change only through DevOps issues.
 
@@ -368,7 +370,7 @@ Created by the Architect as stories under feature P0-F8 (#71) with the next free
 | # | Work item | Role |
 | --- | --- | --- |
 | 1 | Continue an interrupted run from the state on GitHub (D-051, #197). The pipeline defects D-042 and D-044 to D-050 and the evidence defects D-041 and D-043 are closed | DevOps |
-| 2 | CI role path-scope check (CQ-M10), the control behind the guard and the only path control for the Antigravity roles; lock-file enforcement (CQ-M8) | DevOps |
+| 2 | CI role path-scope check (CQ-M10), the control behind the guard and the only path control for the author roles, which run outside Claude Code; lock-file enforcement (CQ-M8) | DevOps |
 | 3 | Describe the rule set in `CONTRIBUTING.md` and record the evidence for P0-F8.2 (#85) | DevOps |
 | 4 | Dedicated bench key and bench rules in the evidence template (P0-F8.5, #88); the key is created and placed by the owner | DevOps |
 | 5 | Parallel author runs in worktrees under the pipeline (D-C, OQ-07); the pipeline runs one issue at a time | DevOps |
