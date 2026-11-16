@@ -2,13 +2,16 @@
 //!
 //! Enforces UPD-04, UPD-05, AR-01, AR-08, and all acceptance criteria AC1..AC6.
 
-use crate::cpio::{read_cpio_entries, CpioError};
+use crate::cpio::{
+    read_entry_bytes, read_next_cpio_header, skip_entry_data, stream_and_hash_entry_data, CpioError,
+};
 use crate::journal::{JournalController, JournalStorage};
 use crate::sha256::Sha256;
 use crate::sw_description::parse_sw_description;
 use crate::system::{SlotBackend, StagingStorage};
 use nx_protocol::{ErrorCode, UpdateTransactionState};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::io::Read;
 
@@ -234,78 +237,78 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         Ok(())
     }
 
+    /// Requests starting an installation. Refuses with UpdateBusy if another transaction is currently receiving or installing (AC5).
+    pub fn begin_install(&mut self) -> Result<(), UpdateEngineError> {
+        let curr = self.journal.current().state;
+        if curr == UpdateTransactionState::Receiving || curr == UpdateTransactionState::Installing {
+            return Err(UpdateEngineError::Busy);
+        }
+        if curr != UpdateTransactionState::Validated {
+            return Err(UpdateEngineError::InvalidStateTransition {
+                from: curr,
+                to: UpdateTransactionState::Installing,
+            });
+        }
+        // In Phase 0 story #19, install execution is out of scope (P0-F4.4 / #20).
+        Ok(())
+    }
+
     /// Stages payload from an input reader into the preallocated staging file.
+    /// Streams reader directly into disk storage while computing SHA-256 without memory buffering.
     pub fn stage_upload<R: Read>(
         &mut self,
-        mut reader: R,
+        reader: R,
         declared_len: Option<u64>,
     ) -> Result<UpdateStatus, UpdateEngineError> {
         self.begin_upload(declared_len)?;
 
-        let mut hasher = Sha256::new();
-        let mut total_written = 0u64;
-        let mut chunk = [0u8; 16384];
-        let mut temp_buffer = Vec::new();
+        struct HashingReader<R: Read> {
+            inner: R,
+            hasher: Sha256,
+        }
 
-        loop {
-            let n = match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    // Interrupted connection during upload (AC4)
-                    let err = UpdateEngineError::Truncated(e.to_string());
-                    let _ = self.journal.commit_state(
-                        UpdateTransactionState::Failed,
-                        None,
-                        None,
-                        total_written,
-                        None,
-                        Some(err.error_code_str().to_string()),
-                    );
-                    return Err(err);
+        impl<R: Read> Read for HashingReader<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                if n > 0 {
+                    self.hasher.update(&buf[..n]);
                 }
-            };
+                Ok(n)
+            }
+        }
 
-            if total_written + (n as u64) > self.reserved_capacity {
-                // Exceeds reservation (AC3)
-                let err = UpdateEngineError::Oversized {
-                    size: total_written + (n as u64),
-                    limit: self.reserved_capacity,
+        let mut hashing_reader = HashingReader {
+            inner: reader,
+            hasher: Sha256::new(),
+        };
+
+        let total_written = match self
+            .storage
+            .write_payload(&mut hashing_reader, declared_len)
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let err = if e.contains("exceeds reserved") {
+                    UpdateEngineError::Oversized {
+                        size: self.reserved_capacity + 1,
+                        limit: self.reserved_capacity,
+                    }
+                } else {
+                    UpdateEngineError::Truncated(e)
                 };
                 let _ = self.journal.commit_state(
                     UpdateTransactionState::Failed,
                     None,
                     None,
-                    total_written + (n as u64),
+                    0,
                     None,
                     Some(err.error_code_str().to_string()),
                 );
                 return Err(err);
             }
+        };
 
-            hasher.update(&chunk[..n]);
-            temp_buffer.extend_from_slice(&chunk[..n]);
-            total_written += n as u64;
-        }
-
-        // Write buffered payload to preallocated staging storage
-        if let Err(e) = self
-            .storage
-            .write_payload(temp_buffer.as_slice(), Some(total_written))
-        {
-            let err = UpdateEngineError::Storage(e);
-            let _ = self.journal.commit_state(
-                UpdateTransactionState::Failed,
-                None,
-                None,
-                total_written,
-                None,
-                Some(err.error_code_str().to_string()),
-            );
-            return Err(err);
-        }
-
-        let sha256_hex = hasher.hex_digest();
+        let sha256_hex = hashing_reader.hasher.hex_digest();
 
         // Transition Receiving -> Staged
         self.journal
@@ -327,6 +330,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// Validates CPIO container structure, sw-description existence as first file,
     /// hardware model compatibility, configuration schema range, and artifact SHA-256 integrity.
     ///
+    /// Streams entries incrementally to prevent memory exhaustion on target hardware.
     /// Preserves active and default boot slots and performs zero writes to the inactive slot.
     pub fn validate(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
         let (curr_state, payload_len, curr_sha) = {
@@ -355,9 +359,8 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             return Err(err);
         }
 
-        // Read payload bytes from staging storage
-        let payload_bytes = match self.storage.read_payload() {
-            Ok(bytes) => bytes,
+        let mut reader = match self.storage.open_payload_reader() {
+            Ok(r) => r,
             Err(e) => {
                 let err = UpdateEngineError::Storage(e);
                 self.fail_validation(&err)?;
@@ -365,19 +368,10 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             }
         };
 
-        if payload_bytes.len() < payload_len as usize {
-            let err = UpdateEngineError::Truncated(format!(
-                "expected {payload_len} bytes, found {}",
-                payload_bytes.len()
-            ));
-            self.fail_validation(&err)?;
-            return Err(err);
-        }
-
-        // Parse CPIO archive
-        let entries = match read_cpio_entries(&payload_bytes[..payload_len as usize]) {
-            Ok(e) => e,
-            Err(CpioError::Truncated) => {
+        // 1. First file must be sw-description
+        let first_header = match read_next_cpio_header(&mut reader) {
+            Ok(Some(h)) => h,
+            Ok(None) | Err(CpioError::Truncated) => {
                 let err = UpdateEngineError::Truncated("CPIO stream ended prematurely".to_string());
                 self.fail_validation(&err)?;
                 return Err(err);
@@ -394,24 +388,32 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             }
         };
 
-        if entries.is_empty() {
-            let err = UpdateEngineError::Truncated("archive contains no entries".to_string());
-            self.fail_validation(&err)?;
-            return Err(err);
-        }
-
-        // 1. First file must be sw-description
-        let first = &entries[0];
-        if first.name != "sw-description" {
+        if first_header.name != "sw-description" {
             let err = UpdateEngineError::InvalidFormat(format!(
                 "first entry in update container must be 'sw-description', found '{}'",
-                first.name
+                first_header.name
             ));
             self.fail_validation(&err)?;
             return Err(err);
         }
 
-        let desc_text = match std::str::from_utf8(&first.data) {
+        // sw-description is loaded into memory (max 10 MiB limit to prevent memory abuse)
+        let desc_bytes =
+            match read_entry_bytes(&mut reader, first_header.filesize, 10 * 1024 * 1024) {
+                Ok(b) => b,
+                Err(CpioError::Truncated) => {
+                    let err = UpdateEngineError::Truncated("sw-description truncated".to_string());
+                    self.fail_validation(&err)?;
+                    return Err(err);
+                }
+                Err(e) => {
+                    let err = UpdateEngineError::InvalidFormat(e.to_string());
+                    self.fail_validation(&err)?;
+                    return Err(err);
+                }
+            };
+
+        let desc_text = match std::str::from_utf8(&desc_bytes) {
             Ok(s) => s,
             Err(_) => {
                 let err = UpdateEngineError::InvalidFormat(
@@ -454,7 +456,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             return Err(err);
         }
 
-        // 5. Artifact presence and SHA-256 verification (AC2, AC3)
+        // 5. Artifact presence and streaming SHA-256 verification (AC2, AC3)
         if sw_desc.images.is_empty() {
             let err =
                 UpdateEngineError::InvalidFormat("sw-description declares zero images".to_string());
@@ -462,51 +464,104 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             return Err(err);
         }
 
-        for image in &sw_desc.images {
-            let entry = entries.iter().find(|e| e.name == image.filename);
-            let entry = match entry {
-                Some(e) => e,
-                None => {
-                    let err = UpdateEngineError::InvalidFormat(format!(
-                        "declared artifact '{}' missing from CPIO container",
-                        image.filename
-                    ));
+        let mut verified_images = HashSet::new();
+
+        loop {
+            let header = match read_next_cpio_header(&mut reader) {
+                Ok(Some(h)) => h,
+                Ok(None) => break, // Reached TRAILER!!! or clean EOF
+                Err(CpioError::Truncated) => {
+                    let err =
+                        UpdateEngineError::Truncated("CPIO stream ended prematurely".to_string());
+                    self.fail_validation(&err)?;
+                    return Err(err);
+                }
+                Err(CpioError::InvalidMagic) => {
+                    let err = UpdateEngineError::InvalidFormat("invalid CPIO magic".to_string());
+                    self.fail_validation(&err)?;
+                    return Err(err);
+                }
+                Err(e) => {
+                    let err = UpdateEngineError::InvalidFormat(e.to_string());
                     self.fail_validation(&err)?;
                     return Err(err);
                 }
             };
 
-            let actual_sha256 = Sha256::hex(&entry.data);
-            let expected_sha256 = image.sha256.to_lowercase();
+            if let Some(expected_image) = sw_desc
+                .images
+                .iter()
+                .find(|img| img.filename == header.name)
+            {
+                let mut hasher = Sha256::new();
+                if let Err(e) = stream_and_hash_entry_data(&mut reader, header.filesize, |chunk| {
+                    hasher.update(chunk);
+                }) {
+                    let err = if e == CpioError::Truncated {
+                        UpdateEngineError::Truncated(format!(
+                            "artifact '{}' truncated",
+                            header.name
+                        ))
+                    } else {
+                        UpdateEngineError::InvalidFormat(e.to_string())
+                    };
+                    self.fail_validation(&err)?;
+                    return Err(err);
+                }
 
-            if actual_sha256 != expected_sha256 {
-                let err = UpdateEngineError::CorruptedArtifact {
-                    file: image.filename.clone(),
-                    expected: expected_sha256,
-                    actual: actual_sha256,
-                };
+                let actual_sha256 = hasher.hex_digest();
+                let expected_sha256 = expected_image.sha256.to_lowercase();
+
+                if actual_sha256 != expected_sha256 {
+                    let err = UpdateEngineError::CorruptedArtifact {
+                        file: header.name,
+                        expected: expected_sha256,
+                        actual: actual_sha256,
+                    };
+                    self.fail_validation(&err)?;
+                    return Err(err);
+                }
+
+                verified_images.insert(header.name);
+            } else {
+                if let Err(e) = skip_entry_data(&mut reader, header.filesize) {
+                    let err = if e == CpioError::Truncated {
+                        UpdateEngineError::Truncated("entry truncated".to_string())
+                    } else {
+                        UpdateEngineError::InvalidFormat(e.to_string())
+                    };
+                    self.fail_validation(&err)?;
+                    return Err(err);
+                }
+            }
+        }
+
+        // Verify every declared artifact was present in the CPIO container
+        for image in &sw_desc.images {
+            if !verified_images.contains(&image.filename) {
+                let err = UpdateEngineError::InvalidFormat(format!(
+                    "declared artifact '{}' missing from CPIO container",
+                    image.filename
+                ));
                 self.fail_validation(&err)?;
                 return Err(err);
             }
         }
 
         // All checks passed!
-        // Derive transaction ID from SHA-256 of the payload + generation
-        let tx_sha = curr_sha.unwrap_or_else(|| Sha256::hex(&payload_bytes));
+        let tx_sha = curr_sha.unwrap_or_else(|| Sha256::hex(b"tx"));
         let tx_id = format!(
             "tx-{}-{}",
             &tx_sha[..12],
             self.journal.current().generation + 1
         );
 
-        // Target slot is inactive slot
         let active_slot = self
             .backend
             .get_active_slot()
             .map_err(UpdateEngineError::Storage)?;
         let target_slot = active_slot.inactive();
 
-        // Commit Validated state
         self.journal
             .commit_state(
                 UpdateTransactionState::Validated,
@@ -518,7 +573,6 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             )
             .map_err(UpdateEngineError::Storage)?;
 
-        // AC2: Active and default slots are completely unchanged, nothing written to inactive slot
         Ok(self.status())
     }
 

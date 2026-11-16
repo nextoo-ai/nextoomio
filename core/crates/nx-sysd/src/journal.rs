@@ -117,7 +117,16 @@ pub struct MemoryJournalStorage {
 impl JournalStorage for MemoryJournalStorage {
     fn read_record(&self, slot_idx: usize) -> Result<Option<JournalRecord>, String> {
         if slot_idx < 2 {
-            Ok(self.records[slot_idx].clone())
+            match &self.records[slot_idx] {
+                Some(rec) => {
+                    if rec.is_valid() {
+                        Ok(Some(rec.clone()))
+                    } else {
+                        Err(format!("journal record {slot_idx} is corrupted or invalid"))
+                    }
+                }
+                None => Ok(None),
+            }
         } else {
             Err("invalid journal slot index".to_string())
         }
@@ -164,10 +173,16 @@ impl JournalStorage for FileJournalStorage {
                 if rec.is_valid() {
                     Ok(Some(rec))
                 } else {
-                    Ok(None) // Checksum corrupted
+                    Err(format!(
+                        "journal record at {} has invalid checksum or format",
+                        path.display()
+                    ))
                 }
             }
-            Err(_) => Ok(None),
+            Err(e) => Err(format!(
+                "journal record at {} is malformed: {e}",
+                path.display()
+            )),
         }
     }
 
@@ -187,8 +202,12 @@ impl JournalStorage for FileJournalStorage {
 
         file.write_all(json.as_bytes())
             .map_err(|e| format!("write error {}: {e}", path.display()))?;
-        file.flush()
-            .map_err(|e| format!("flush error {}: {e}", path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync_all error {}: {e}", path.display()))?;
+
+        if let Ok(dir_file) = fs::File::open(&self.journal_dir) {
+            let _ = dir_file.sync_all();
+        }
 
         Ok(())
     }
@@ -208,49 +227,28 @@ impl<S: JournalStorage> JournalController<S> {
         active_slot: &str,
         default_slot: &str,
     ) -> Result<Self, String> {
-        let r0 = storage.read_record(0).unwrap_or(None);
-        let r1 = storage.read_record(1).unwrap_or(None);
+        let r0 = storage.read_record(0);
+        let r1 = storage.read_record(1);
 
         let selected = match (r0, r1) {
-            (Some(a), Some(b)) => {
-                if a.is_valid() && b.is_valid() {
-                    if a.generation >= b.generation {
-                        (0, a)
-                    } else {
-                        (1, b)
-                    }
-                } else if a.is_valid() {
-                    (0, a)
-                } else if b.is_valid() {
-                    (1, b)
-                } else {
-                    let init = JournalRecord::new_initial(active_slot, default_slot);
-                    storage.write_record(0, &init)?;
-                    (0, init)
-                }
-            }
-            (Some(a), None) => {
-                if a.is_valid() {
+            (Ok(Some(a)), Ok(Some(b))) => {
+                if a.generation >= b.generation {
                     (0, a)
                 } else {
-                    let init = JournalRecord::new_initial(active_slot, default_slot);
-                    storage.write_record(0, &init)?;
-                    (0, init)
-                }
-            }
-            (None, Some(b)) => {
-                if b.is_valid() {
                     (1, b)
-                } else {
-                    let init = JournalRecord::new_initial(active_slot, default_slot);
-                    storage.write_record(0, &init)?;
-                    (0, init)
                 }
             }
-            (None, None) => {
+            (Ok(Some(a)), Ok(None)) | (Ok(Some(a)), Err(_)) => (0, a),
+            (Ok(None), Ok(Some(b))) | (Err(_), Ok(Some(b))) => (1, b),
+            (Ok(None), Ok(None)) => {
                 let init = JournalRecord::new_initial(active_slot, default_slot);
                 storage.write_record(0, &init)?;
                 (0, init)
+            }
+            (r0_err, r1_err) => {
+                return Err(format!(
+                    "both journal records are invalid or corrupted (slot 0: {r0_err:?}, slot 1: {r1_err:?}); refusing to discard state"
+                ));
             }
         };
 

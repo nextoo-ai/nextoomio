@@ -67,29 +67,20 @@ impl fmt::Display for Slot {
     }
 }
 
-/// Abstract slot interface for inspecting active/default slots and writing to the inactive slot.
+/// Abstract slot interface for inspecting active and default boot slots (AC2, AC3).
 pub trait SlotBackend: Send + Sync {
     /// Returns the currently running system slot.
     fn get_active_slot(&self) -> Result<Slot, String>;
 
     /// Returns the currently configured default boot slot.
     fn get_default_slot(&self) -> Result<Slot, String>;
-
-    /// Sets the default boot slot (switches tryboot or autoboot.txt selection).
-    fn set_default_slot(&mut self, slot: Slot) -> Result<(), String>;
-
-    /// Writes raw payload to the inactive slot block devices.
-    fn write_inactive_slot(&mut self, slot: Slot, data: &[u8]) -> Result<(), String>;
 }
 
 /// Mock slot backend for unit tests.
-/// Tracks every modification to ensure AC2 and AC3 are preserved.
 #[derive(Debug, Clone)]
 pub struct MockSlotBackend {
     pub active_slot: Slot,
     pub default_slot: Slot,
-    pub inactive_writes: Vec<(Slot, usize)>,
-    pub default_slot_changes: Vec<Slot>,
 }
 
 impl MockSlotBackend {
@@ -97,8 +88,6 @@ impl MockSlotBackend {
         Self {
             active_slot: active,
             default_slot: default,
-            inactive_writes: Vec::new(),
-            default_slot_changes: Vec::new(),
         }
     }
 }
@@ -111,17 +100,6 @@ impl SlotBackend for MockSlotBackend {
     fn get_default_slot(&self) -> Result<Slot, String> {
         Ok(self.default_slot)
     }
-
-    fn set_default_slot(&mut self, slot: Slot) -> Result<(), String> {
-        self.default_slot = slot;
-        self.default_slot_changes.push(slot);
-        Ok(())
-    }
-
-    fn write_inactive_slot(&mut self, slot: Slot, data: &[u8]) -> Result<(), String> {
-        self.inactive_writes.push((slot, data.len()));
-        Ok(())
-    }
 }
 
 /// Physical slot backend reading from Linux kernel cmdline and mount tables.
@@ -130,6 +108,13 @@ pub struct PhysicalSlotBackend;
 
 impl SlotBackend for PhysicalSlotBackend {
     fn get_active_slot(&self) -> Result<Slot, String> {
+        // 0. Environment override for test/developer workstations
+        if let Ok(val) = std::env::var("NEXTOOMIO_SLOT") {
+            if let Some(slot) = Slot::parse(&val) {
+                return Ok(slot);
+            }
+        }
+
         // 1. Inspect /proc/cmdline for root device or PARTUUID
         if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
             if cmdline.contains("4e58544d-06")
@@ -162,8 +147,7 @@ impl SlotBackend for PhysicalSlotBackend {
             }
         }
 
-        // Default to Slot A if unknown
-        Ok(Slot::A)
+        Err("unable to determine active slot from /proc/cmdline or /proc/mounts".to_string())
     }
 
     fn get_default_slot(&self) -> Result<Slot, String> {
@@ -183,26 +167,63 @@ impl SlotBackend for PhysicalSlotBackend {
         }
         self.get_active_slot()
     }
+}
 
-    fn set_default_slot(&mut self, slot: Slot) -> Result<(), String> {
-        let part_num = match slot {
-            Slot::A => "2",
-            Slot::B => "3",
-        };
-        let content = format!("[all]\ndefault_partition={part_num}\n");
-        fs::write("/boot/autoboot.txt", content)
-            .map_err(|e| format!("cannot write /boot/autoboot.txt: {e}"))
+#[cfg(target_os = "linux")]
+fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn posix_fallocate(fd: std::os::raw::c_int, offset: i64, len: i64) -> std::os::raw::c_int;
     }
+    let fd = file.as_raw_fd();
+    let ret = unsafe { posix_fallocate(fd, 0, capacity as i64) };
+    if ret != 0 {
+        return Err(format!("posix_fallocate failed with errno {ret}"));
+    }
+    Ok(())
+}
 
-    fn write_inactive_slot(&mut self, slot: Slot, data: &[u8]) -> Result<(), String> {
-        let dev_path = slot.root_device();
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(dev_path)
-            .map_err(|e| format!("cannot open {dev_path}: {e}"))?;
-        file.write_all(data)
-            .map_err(|e| format!("cannot write to {dev_path}: {e}"))
+#[cfg(target_os = "macos")]
+fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    #[repr(C)]
+    struct Fstore {
+        fst_flags: u32,
+        fst_posmode: i32,
+        fst_offset: i64,
+        fst_length: i64,
+        fst_bytesalloc: i64,
     }
+    extern "C" {
+        fn fcntl(fd: std::os::raw::c_int, cmd: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+    }
+    const F_PREALLOCATE: std::os::raw::c_int = 42;
+    const F_ALLOCATEALL: u32 = 0x00000004;
+    const F_PEOFPOSMODE: i32 = 3;
+
+    let mut store = Fstore {
+        fst_flags: F_ALLOCATEALL,
+        fst_posmode: F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: capacity as i64,
+        fst_bytesalloc: 0,
+    };
+    let fd = file.as_raw_fd();
+    let ret = unsafe { fcntl(fd, F_PREALLOCATE, &mut store) };
+    if ret != 0 {
+        file.set_len(capacity)
+            .map_err(|e| format!("cannot allocate {capacity} bytes: {e}"))?;
+    } else {
+        file.set_len(capacity)
+            .map_err(|e| format!("cannot allocate {capacity} bytes: {e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
+    file.set_len(capacity)
+        .map_err(|e| format!("cannot allocate {capacity} bytes: {e}"))
 }
 
 /// Abstract storage backend for the preallocated update staging reservation.
@@ -226,11 +247,11 @@ pub trait StagingStorage: Send + Sync {
     /// Reads the payload bytes (up to payload_size).
     fn read_payload(&self) -> Result<Vec<u8>, String>;
 
+    /// Returns a streaming reader over the staged payload bytes up to payload_size.
+    fn open_payload_reader(&self) -> Result<Box<dyn Read + Send>, String>;
+
     /// Resets payload length to zero without unlinking, truncating, or punching holes.
     fn cleanup(&mut self) -> Result<(), String>;
-
-    /// Simulates filling the remaining data partition outside the staging reservation (for AC1 testing).
-    fn fill_unreserved_space(&mut self, bytes: u64) -> Result<(), String>;
 }
 
 /// Mock staging storage for deterministic in-memory verification.
@@ -239,7 +260,6 @@ pub struct MockStagingStorage {
     pub reserved_capacity: u64,
     pub buffer: Vec<u8>,
     pub payload_size: usize,
-    pub unreserved_free_bytes: u64,
 }
 
 impl MockStagingStorage {
@@ -248,7 +268,6 @@ impl MockStagingStorage {
             reserved_capacity: capacity,
             buffer: vec![0u8; capacity as usize],
             payload_size: 0,
-            unreserved_free_bytes: 10 * 1024 * 1024 * 1024, // 10 GiB free initially
         }
     }
 }
@@ -256,8 +275,10 @@ impl MockStagingStorage {
 impl StagingStorage for MockStagingStorage {
     fn init_staging(&mut self, capacity: u64) -> Result<(), String> {
         self.reserved_capacity = capacity;
-        self.buffer = vec![0u8; capacity as usize];
-        self.payload_size = 0;
+        if self.buffer.len() as u64 != capacity {
+            self.buffer = vec![0u8; capacity as usize];
+            self.payload_size = 0;
+        }
         Ok(())
     }
 
@@ -307,15 +328,14 @@ impl StagingStorage for MockStagingStorage {
         Ok(self.buffer[..self.payload_size].to_vec())
     }
 
+    fn open_payload_reader(&self) -> Result<Box<dyn Read + Send>, String> {
+        let size = self.payload_size.min(self.buffer.len());
+        Ok(Box::new(std::io::Cursor::new(self.buffer[..size].to_vec())))
+    }
+
     fn cleanup(&mut self) -> Result<(), String> {
         // Preallocated extent is NEVER shortened (AC6, AR-08)
         self.payload_size = 0;
-        Ok(())
-    }
-
-    fn fill_unreserved_space(&mut self, _bytes: u64) -> Result<(), String> {
-        // Fill the rest of the disk so free unreserved space is 0
-        self.unreserved_free_bytes = 0;
         Ok(())
     }
 }
@@ -355,39 +375,81 @@ impl StagingStorage for FileStagingStorage {
         fs::create_dir_all(&self.staging_dir)
             .map_err(|e| format!("cannot create {}: {e}", self.staging_dir.display()))?;
 
-        // Preallocate staging file if missing or wrong size
-        let needs_alloc = match fs::metadata(&self.staging_file) {
-            Ok(meta) => meta.len() != capacity,
-            Err(_) => true,
-        };
+        // 1. Open or create staging file without truncating (AC6)
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.staging_file)
+            .map_err(|e| format!("cannot open {}: {e}", self.staging_file.display()))?;
 
-        if needs_alloc {
-            let file = File::create(&self.staging_file)
-                .map_err(|e| format!("cannot create {}: {e}", self.staging_file.display()))?;
-            file.set_len(capacity)
-                .map_err(|e| format!("cannot allocate {} bytes: {e}", capacity))?;
+        // 2. Preallocate extents if newly created or smaller than requested capacity
+        let current_meta = file
+            .metadata()
+            .map_err(|e| format!("cannot stat {}: {e}", self.staging_file.display()))?;
+
+        #[cfg(unix)]
+        let current_allocated = {
+            use std::os::unix::fs::MetadataExt;
+            current_meta.blocks() * 512
+        };
+        #[cfg(not(unix))]
+        let current_allocated = current_meta.len();
+
+        if current_allocated < capacity || current_meta.len() < capacity {
+            allocate_file_extents(&file, capacity)?;
         }
 
-        let meta = StagingMeta {
-            payload_size: 0,
-            reserved_capacity: capacity,
-        };
-        let meta_json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
-        fs::write(&self.meta_file, meta_json)
-            .map_err(|e| format!("cannot write meta file: {e}"))?;
+        // 3. Metadata initialization (idempotent: never resets existing payload_size)
+        if self.meta_file.exists() {
+            if let Ok(content) = fs::read_to_string(&self.meta_file) {
+                if let Ok(mut meta) = serde_json::from_str::<StagingMeta>(&content) {
+                    if meta.reserved_capacity != capacity {
+                        meta.reserved_capacity = capacity;
+                        if let Ok(json) = serde_json::to_string(&meta) {
+                            let _ = fs::write(&self.meta_file, json);
+                        }
+                    }
+                }
+            }
+        } else {
+            let meta = StagingMeta {
+                payload_size: 0,
+                reserved_capacity: capacity,
+            };
+            let meta_json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
+            fs::write(&self.meta_file, meta_json)
+                .map_err(|e| format!("cannot write meta file: {e}"))?;
+        }
 
         Ok(())
     }
 
     fn get_allocated_size(&self) -> Result<u64, String> {
-        fs::metadata(&self.staging_file)
-            .map(|m| m.len())
-            .map_err(|e| {
-                format!(
-                    "cannot stat staging file {}: {e}",
-                    self.staging_file.display()
-                )
-            })
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&self.staging_file)
+                .map(|m| m.blocks() * 512)
+                .map_err(|e| {
+                    format!(
+                        "cannot stat staging file {}: {e}",
+                        self.staging_file.display()
+                    )
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            fs::metadata(&self.staging_file)
+                .map(|m| m.len())
+                .map_err(|e| {
+                    format!(
+                        "cannot stat staging file {}: {e}",
+                        self.staging_file.display()
+                    )
+                })
+        }
     }
 
     fn get_payload_size(&self) -> Result<u64, String> {
@@ -453,13 +515,26 @@ impl StagingStorage for FileStagingStorage {
     }
 
     fn read_payload(&self) -> Result<Vec<u8>, String> {
-        let size = self.get_payload_size()? as usize;
+        let size = self.get_payload_size()?;
+        if size > self.reserved_capacity {
+            return Err("payload size exceeds reserved capacity".to_string());
+        }
         let mut file = File::open(&self.staging_file)
             .map_err(|e| format!("cannot open {}: {e}", self.staging_file.display()))?;
-        let mut buf = vec![0u8; size];
+        let mut buf = vec![0u8; size as usize];
         file.read_exact(&mut buf)
             .map_err(|e| format!("cannot read payload: {e}"))?;
         Ok(buf)
+    }
+
+    fn open_payload_reader(&self) -> Result<Box<dyn Read + Send>, String> {
+        let size = self.get_payload_size()?;
+        if size > self.reserved_capacity {
+            return Err("payload size exceeds reserved capacity".to_string());
+        }
+        let file = File::open(&self.staging_file)
+            .map_err(|e| format!("cannot open {}: {e}", self.staging_file.display()))?;
+        Ok(Box::new(file.take(size)))
     }
 
     fn cleanup(&mut self) -> Result<(), String> {
@@ -471,10 +546,6 @@ impl StagingStorage for FileStagingStorage {
         let meta_json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
         fs::write(&self.meta_file, meta_json)
             .map_err(|e| format!("cannot write meta file: {e}"))?;
-        Ok(())
-    }
-
-    fn fill_unreserved_space(&mut self, _bytes: u64) -> Result<(), String> {
         Ok(())
     }
 }

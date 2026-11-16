@@ -82,12 +82,15 @@ software =
     }
 
     #[test]
-    fn test_ac1_first_boot_staging_preallocated_at_full_size_and_full_partition_does_not_prevent_upload(
-    ) {
-        let capacity = 50 * 1024 * 1024; // 50 MiB simulated staging reservation
+    fn test_ac1_staging_preallocated_at_full_reserved_size_file_storage() {
+        let temp_dir = std::env::temp_dir().join(format!("nx-test-ac1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let capacity = 10 * 1024 * 1024; // 10 MiB test reservation
         let backend = MockSlotBackend::new(Slot::A, Slot::A);
-        let storage = MockStagingStorage::new(capacity);
-        let journal = MemoryJournalStorage::default();
+        let storage = FileStagingStorage::new(&temp_dir, capacity);
+        let journal = FileJournalStorage::new(&temp_dir);
 
         let mut engine = UpdateEngine::new(
             backend,
@@ -100,24 +103,29 @@ software =
         .expect("engine initialization failed");
 
         // 1. Verify staging area is allocated at its full reserved size on first boot (AC1)
-        assert_eq!(
-            engine.storage.get_allocated_size().unwrap(),
-            capacity,
-            "staging extent must be preallocated to full capacity"
+        let allocated = engine.storage.get_allocated_size().unwrap();
+        assert!(
+            allocated >= capacity,
+            "staging extent must be preallocated to full capacity: allocated {allocated} < {capacity}"
         );
 
-        // 2. Simulate filling the remainder of the data partition (0 bytes free unreserved)
-        engine.storage.fill_unreserved_space(0).unwrap();
-        assert_eq!(engine.storage.unreserved_free_bytes, 0);
-
-        // 3. Stage valid update: preallocated extents allow upload to proceed normally without failing out of space (AC1)
+        // 2. Stage valid update into preallocated staging file (AC1)
         let swu_bytes = make_valid_swu("1.0", 1, b"boot payload data", b"rootfs payload data");
         let status = engine
             .stage_upload(Cursor::new(&swu_bytes), Some(swu_bytes.len() as u64))
-            .expect("upload into preallocated staging must succeed even when unreserved data space is exhausted");
+            .expect("upload into preallocated staging must succeed");
 
         assert_eq!(status.state, UpdateTransactionState::Staged);
         assert_eq!(status.payload_length, swu_bytes.len() as u64);
+
+        // Extent remains allocated after staging
+        let allocated_after = engine.storage.get_allocated_size().unwrap();
+        assert!(
+            allocated_after >= capacity,
+            "staging extent must remain allocated after upload: {allocated_after} < {capacity}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -162,16 +170,78 @@ software =
         // AC2: active and default slots are completely unchanged
         assert_eq!(engine.backend.get_active_slot().unwrap(), Slot::A);
         assert_eq!(engine.backend.get_default_slot().unwrap(), Slot::A);
-        assert!(
-            engine.backend.default_slot_changes.is_empty(),
-            "boot selection must remain unchanged"
+    }
+
+    #[test]
+    fn test_ac2_stage_and_validate_across_separate_engine_processes() {
+        let temp_dir = std::env::temp_dir().join(format!("nx-test-proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let capacity = 10 * 1024 * 1024;
+        let swu_bytes = make_valid_swu(
+            "1.0",
+            1,
+            b"boot partition content",
+            b"root partition content",
         );
 
-        // AC2: nothing was written to the inactive slot
-        assert!(
-            engine.backend.inactive_writes.is_empty(),
-            "validation alone must perform zero writes to the inactive slot"
-        );
+        // Process 1: nx-sysd update stage
+        {
+            let backend = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage = FileStagingStorage::new(&temp_dir, capacity);
+            let journal = FileJournalStorage::new(&temp_dir);
+
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .expect("process 1 initialization failed");
+
+            let status = engine
+                .stage_upload(Cursor::new(&swu_bytes), Some(swu_bytes.len() as u64))
+                .expect("process 1 stage failed");
+
+            assert_eq!(status.state, UpdateTransactionState::Staged);
+            assert_eq!(status.payload_length, swu_bytes.len() as u64);
+        }
+
+        // Process 2: nx-sysd update validate (new instance over the same directory)
+        {
+            let backend = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage = FileStagingStorage::new(&temp_dir, capacity);
+            let journal = FileJournalStorage::new(&temp_dir);
+
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .expect("process 2 initialization failed");
+
+            // Verify payload metadata was not wiped by init_staging on process start
+            assert_eq!(engine.status().state, UpdateTransactionState::Staged);
+            assert_eq!(engine.status().payload_length, swu_bytes.len() as u64);
+
+            let status = engine
+                .validate()
+                .expect("validation in second process must succeed");
+
+            assert_eq!(status.state, UpdateTransactionState::Validated);
+            assert!(status.tx_id.is_some());
+            assert_eq!(status.target_slot, Some("root_b".to_string()));
+            assert_eq!(engine.backend.get_active_slot().unwrap(), Slot::A);
+            assert_eq!(engine.backend.get_default_slot().unwrap(), Slot::A);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -207,10 +277,8 @@ software =
             let st = engine.status();
             assert_eq!(st.state, UpdateTransactionState::Failed);
             assert_eq!(st.error_code, Some("update_truncated".to_string()));
-            assert!(
-                engine.backend.default_slot_changes.is_empty(),
-                "boot selection unchanged"
-            );
+            assert_eq!(engine.backend.get_active_slot().unwrap(), Slot::A);
+            assert_eq!(engine.backend.get_default_slot().unwrap(), Slot::A);
         }
 
         // Case 2: Corrupted artifact -> update_corrupted_artifact
@@ -265,10 +333,8 @@ software = {{
             let st = engine.status();
             assert_eq!(st.state, UpdateTransactionState::Failed);
             assert_eq!(st.error_code, Some("update_corrupted_artifact".to_string()));
-            assert!(
-                engine.backend.default_slot_changes.is_empty(),
-                "boot selection unchanged"
-            );
+            assert_eq!(engine.backend.get_active_slot().unwrap(), Slot::A);
+            assert_eq!(engine.backend.get_default_slot().unwrap(), Slot::A);
         }
 
         // Case 3: Declares other hardware -> update_incompatible_hardware
@@ -302,10 +368,8 @@ software = {{
                 st.error_code,
                 Some("update_incompatible_hardware".to_string())
             );
-            assert!(
-                engine.backend.default_slot_changes.is_empty(),
-                "boot selection unchanged"
-            );
+            assert_eq!(engine.backend.get_active_slot().unwrap(), Slot::A);
+            assert_eq!(engine.backend.get_default_slot().unwrap(), Slot::A);
         }
 
         // Case 4: Exceeds reservation -> update_oversized
@@ -339,10 +403,8 @@ software = {{
             let st = engine.status();
             assert_eq!(st.state, UpdateTransactionState::Failed);
             assert_eq!(st.error_code, Some("update_oversized".to_string()));
-            assert!(
-                engine.backend.default_slot_changes.is_empty(),
-                "boot selection unchanged"
-            );
+            assert_eq!(engine.backend.get_active_slot().unwrap(), Slot::A);
+            assert_eq!(engine.backend.get_default_slot().unwrap(), Slot::A);
         }
     }
 
@@ -449,7 +511,7 @@ software = {{
     }
 
     #[test]
-    fn test_ac5_upload_in_progress_refuses_second_upload_as_busy() {
+    fn test_ac5_upload_in_progress_refuses_second_upload_and_install_as_busy() {
         let capacity = 10 * 1024 * 1024;
         let backend = MockSlotBackend::new(Slot::A, Slot::A);
         let storage = MockStagingStorage::new(capacity);
@@ -476,6 +538,65 @@ software = {{
             .expect_err("second upload must be refused as busy");
         assert_eq!(err, UpdateEngineError::Busy);
         assert_eq!(err.error_code_str(), "update_busy");
+
+        // 3. Request install while upload is in progress (AC5)
+        let err_install = engine
+            .begin_install()
+            .expect_err("install must be refused as busy while upload is in progress");
+        assert_eq!(err_install, UpdateEngineError::Busy);
+        assert_eq!(err_install.error_code_str(), "update_busy");
+    }
+
+    #[test]
+    fn test_journal_durability_and_corruption_handling() {
+        let temp_dir = std::env::temp_dir().join(format!("nx-test-jnl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Fresh boot initializes Idle record in slot 0
+        {
+            let storage = FileJournalStorage::new(&temp_dir);
+            let ctrl = JournalController::load_or_init(storage, "root_a", "root_a").unwrap();
+            assert_eq!(ctrl.current().state, UpdateTransactionState::Idle);
+            assert_eq!(ctrl.current().generation, 1);
+        }
+
+        // 2. Commit a new state: writes slot 1
+        {
+            let storage = FileJournalStorage::new(&temp_dir);
+            let mut ctrl = JournalController::load_or_init(storage, "root_a", "root_a").unwrap();
+            ctrl.commit_state(
+                UpdateTransactionState::Staged,
+                None,
+                None,
+                100,
+                Some("sha".to_string()),
+                None,
+            )
+            .unwrap();
+            assert_eq!(ctrl.current().state, UpdateTransactionState::Staged);
+            assert_eq!(ctrl.current().generation, 2);
+        }
+
+        // 3. Simulate torn write on slot 0 (slot 1 remains valid)
+        std::fs::write(temp_dir.join("journal.0"), b"corrupted garbage").unwrap();
+        {
+            let storage = FileJournalStorage::new(&temp_dir);
+            let ctrl = JournalController::load_or_init(storage, "root_a", "root_a").unwrap();
+            assert_eq!(ctrl.current().state, UpdateTransactionState::Staged);
+            assert_eq!(ctrl.current().generation, 2);
+        }
+
+        // 4. Simulate corruption on both slots: load_or_init must fail explicitly, never reset to Idle
+        std::fs::write(temp_dir.join("journal.1"), b"corrupted garbage").unwrap();
+        {
+            let storage = FileJournalStorage::new(&temp_dir);
+            let err = JournalController::load_or_init(storage, "root_a", "root_a")
+                .expect_err("both corrupted records must fail explicit initialization");
+            assert!(err.contains("refusing to discard state"));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

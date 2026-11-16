@@ -54,6 +54,14 @@ pub struct CpioEntry {
     pub data: Vec<u8>,
 }
 
+/// Header metadata for an entry in a CPIO archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpioEntryHeader {
+    pub name: String,
+    pub mode: u32,
+    pub filesize: u64,
+}
+
 fn parse_hex_u32(slice: &[u8]) -> Result<u32, CpioError> {
     let s = std::str::from_utf8(slice).map_err(|_| CpioError::InvalidHeader)?;
     u32::from_str_radix(s, 16).map_err(|_| CpioError::InvalidHeader)
@@ -67,78 +75,150 @@ fn read_exact_or_truncated<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()
     }
 }
 
-/// Reads all entries from a CPIO archive stream.
+/// Reads the next entry header from a CPIO stream.
+/// Returns `Ok(None)` if the archive trailer (`TRAILER!!!`) or clean EOF is reached.
+pub fn read_next_cpio_header<R: Read>(
+    reader: &mut R,
+) -> Result<Option<CpioEntryHeader>, CpioError> {
+    let mut header_buf = [0u8; 110];
+    match reader.read_exact(&mut header_buf) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(CpioError::Truncated);
+        }
+        Err(err) => return Err(CpioError::Io(err.to_string())),
+    }
+
+    let magic = &header_buf[0..6];
+    if magic != CPIO_MAGIC_NEW_ASCII && magic != CPIO_MAGIC_NEW_ASCII_CRC {
+        return Err(CpioError::InvalidMagic);
+    }
+
+    let mode = parse_hex_u32(&header_buf[14..22])?;
+    let filesize = parse_hex_u32(&header_buf[54..62])? as u64;
+    let namesize = parse_hex_u32(&header_buf[94..102])? as usize;
+
+    if namesize == 0 {
+        return Err(CpioError::InvalidHeader);
+    }
+
+    // Read filename
+    let mut name_buf = vec![0u8; namesize];
+    read_exact_or_truncated(reader, &mut name_buf)?;
+
+    // Padding to 4 bytes: (110 + namesize + pad1) % 4 == 0
+    let pad1 = (4 - ((110 + namesize) % 4)) % 4;
+    if pad1 > 0 {
+        let mut pad_buf = vec![0u8; pad1];
+        read_exact_or_truncated(reader, &mut pad_buf)?;
+    }
+
+    // Null-terminated string conversion
+    let name_trimmed = if name_buf.last() == Some(&0) {
+        &name_buf[..name_buf.len() - 1]
+    } else {
+        &name_buf[..]
+    };
+    let name = String::from_utf8(name_trimmed.to_vec()).map_err(|_| CpioError::InvalidHeader)?;
+
+    if name == CPIO_TRAILER_NAME {
+        return Ok(None);
+    }
+
+    Ok(Some(CpioEntryHeader {
+        name,
+        mode,
+        filesize,
+    }))
+}
+
+/// Reads the data for the current entry into memory up to `max_size` bytes,
+/// and consumes the 4-byte padding at the end of the entry.
+pub fn read_entry_bytes<R: Read>(
+    reader: &mut R,
+    filesize: u64,
+    max_size: u64,
+) -> Result<Vec<u8>, CpioError> {
+    if filesize > max_size {
+        return Err(CpioError::Io(format!(
+            "entry size {filesize} exceeds maximum allowed size {max_size}"
+        )));
+    }
+    let mut data_buf = vec![0u8; filesize as usize];
+    read_exact_or_truncated(reader, &mut data_buf)?;
+
+    // Padding to 4 bytes: (filesize + pad2) % 4 == 0
+    let pad2 = (4 - ((filesize as usize) % 4)) % 4;
+    if pad2 > 0 {
+        let mut pad_buf = vec![0u8; pad2];
+        read_exact_or_truncated(reader, &mut pad_buf)?;
+    }
+
+    Ok(data_buf)
+}
+
+/// Streams the entry data through a hasher without buffering the entire file in RAM,
+/// and consumes the 4-byte padding at the end of the entry.
+pub fn stream_and_hash_entry_data<R: Read, F: FnMut(&[u8])>(
+    reader: &mut R,
+    filesize: u64,
+    mut on_chunk: F,
+) -> Result<(), CpioError> {
+    let mut remaining = filesize;
+    let mut chunk = [0u8; 65536];
+
+    while remaining > 0 {
+        let to_read = remaining.min(chunk.len() as u64) as usize;
+        read_exact_or_truncated(reader, &mut chunk[..to_read])?;
+        on_chunk(&chunk[..to_read]);
+        remaining -= to_read as u64;
+    }
+
+    // Padding to 4 bytes: (filesize + pad2) % 4 == 0
+    let pad2 = (4 - ((filesize as usize) % 4)) % 4;
+    if pad2 > 0 {
+        let mut pad_buf = vec![0u8; pad2];
+        read_exact_or_truncated(reader, &mut pad_buf)?;
+    }
+
+    Ok(())
+}
+
+/// Skips the entry data and padding from the stream.
+pub fn skip_entry_data<R: Read>(reader: &mut R, filesize: u64) -> Result<(), CpioError> {
+    let mut remaining = filesize;
+    let mut chunk = [0u8; 65536];
+
+    while remaining > 0 {
+        let to_read = remaining.min(chunk.len() as u64) as usize;
+        read_exact_or_truncated(reader, &mut chunk[..to_read])?;
+        remaining -= to_read as u64;
+    }
+
+    let pad2 = (4 - ((filesize as usize) % 4)) % 4;
+    if pad2 > 0 {
+        let mut pad_buf = vec![0u8; pad2];
+        read_exact_or_truncated(reader, &mut pad_buf)?;
+    }
+
+    Ok(())
+}
+
+/// Reads all entries from a CPIO archive stream (buffered in memory).
 pub fn read_cpio_entries<R: Read>(mut reader: R) -> Result<Vec<CpioEntry>, CpioError> {
     let mut entries = Vec::new();
-    let mut header_buf = [0u8; 110];
 
-    loop {
-        // Read 110-byte fixed header
-        match reader.read_exact(&mut header_buf) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                // If EOF at start of entry and we have read at least one entry, it might be truncated trailer
-                if entries.is_empty() {
-                    return Err(CpioError::Truncated);
-                }
-                return Err(CpioError::Truncated);
-            }
-            Err(err) => return Err(CpioError::Io(err.to_string())),
-        }
-
-        let magic = &header_buf[0..6];
-        if magic != CPIO_MAGIC_NEW_ASCII && magic != CPIO_MAGIC_NEW_ASCII_CRC {
-            return Err(CpioError::InvalidMagic);
-        }
-
-        let mode = parse_hex_u32(&header_buf[14..22])?;
-        let filesize = parse_hex_u32(&header_buf[54..62])? as usize;
-        let namesize = parse_hex_u32(&header_buf[94..102])? as usize;
-
-        if namesize == 0 {
-            return Err(CpioError::InvalidHeader);
-        }
-
-        // Read filename
-        let mut name_buf = vec![0u8; namesize];
-        read_exact_or_truncated(&mut reader, &mut name_buf)?;
-
-        // Padding to 4 bytes: (110 + namesize + pad1) % 4 == 0
-        let pad1 = (4 - ((110 + namesize) % 4)) % 4;
-        if pad1 > 0 {
-            let mut pad_buf = vec![0u8; pad1];
-            read_exact_or_truncated(&mut reader, &mut pad_buf)?;
-        }
-
-        // Null-terminated string conversion
-        let name_trimmed = if name_buf.last() == Some(&0) {
-            &name_buf[..name_buf.len() - 1]
-        } else {
-            &name_buf[..]
-        };
-        let name =
-            String::from_utf8(name_trimmed.to_vec()).map_err(|_| CpioError::InvalidHeader)?;
-
-        if name == CPIO_TRAILER_NAME {
-            break;
-        }
-
-        // Read file contents
-        let mut data_buf = vec![0u8; filesize];
-        read_exact_or_truncated(&mut reader, &mut data_buf)?;
-
-        // Padding to 4 bytes: (filesize + pad2) % 4 == 0
-        let pad2 = (4 - (filesize % 4)) % 4;
-        if pad2 > 0 {
-            let mut pad_buf = vec![0u8; pad2];
-            read_exact_or_truncated(&mut reader, &mut pad_buf)?;
-        }
-
+    while let Some(header) = read_next_cpio_header(&mut reader)? {
+        let data = read_entry_bytes(&mut reader, header.filesize, 500 * 1024 * 1024)?;
         entries.push(CpioEntry {
-            name,
-            mode,
-            data: data_buf,
+            name: header.name,
+            mode: header.mode,
+            data,
         });
+    }
+
+    if entries.is_empty() {
+        return Err(CpioError::Truncated);
     }
 
     Ok(entries)

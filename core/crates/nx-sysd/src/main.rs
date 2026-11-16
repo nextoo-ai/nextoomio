@@ -91,53 +91,83 @@ fn handle_update(args: &[String]) -> ExitCode {
     while i < args.len() {
         match args[i].as_str() {
             "--dir" => {
-                if i + 1 < args.len() {
-                    update_dir = PathBuf::from(&args[i + 1]);
-                    i += 1;
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --dir");
+                    return ExitCode::from(1);
                 }
+                update_dir = PathBuf::from(&args[i + 1]);
+                i += 2;
             }
             "--capacity" => {
-                if i + 1 < args.len() {
-                    if let Ok(c) = args[i + 1].parse::<u64>() {
-                        capacity = c;
-                    }
-                    i += 1;
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --capacity");
+                    return ExitCode::from(1);
                 }
+                match args[i + 1].parse::<u64>() {
+                    Ok(c) => capacity = c,
+                    Err(e) => {
+                        eprintln!("Error: invalid value for --capacity '{}': {e}", args[i + 1]);
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 2;
             }
             "--file" => {
-                if i + 1 < args.len() {
-                    file_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 1;
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --file");
+                    return ExitCode::from(1);
                 }
+                file_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
             }
             "--declared-length" => {
-                if i + 1 < args.len() {
-                    if let Ok(len) = args[i + 1].parse::<u64>() {
-                        declared_length = Some(len);
-                    }
-                    i += 1;
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --declared-length");
+                    return ExitCode::from(1);
                 }
+                match args[i + 1].parse::<u64>() {
+                    Ok(len) => declared_length = Some(len),
+                    Err(e) => {
+                        eprintln!(
+                            "Error: invalid value for --declared-length '{}': {e}",
+                            args[i + 1]
+                        );
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 2;
             }
             "--hardware" => {
-                if i + 1 < args.len() {
-                    hardware = Some(args[i + 1].clone());
-                    i += 1;
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --hardware");
+                    return ExitCode::from(1);
                 }
+                hardware = Some(args[i + 1].clone());
+                i += 2;
             }
             "--schema" => {
-                if i + 1 < args.len() {
-                    if let Ok(s) = args[i + 1].parse::<u32>() {
-                        schema = Some(s);
-                    }
-                    i += 1;
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --schema");
+                    return ExitCode::from(1);
                 }
+                match args[i + 1].parse::<u32>() {
+                    Ok(s) => schema = Some(s),
+                    Err(e) => {
+                        eprintln!("Error: invalid value for --schema '{}': {e}", args[i + 1]);
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 2;
             }
             "--json" => {
                 json_output = true;
+                i += 1;
             }
-            _ => {}
+            unknown => {
+                eprintln!("Error: unrecognized argument '{unknown}'");
+                return ExitCode::from(1);
+            }
         }
-        i += 1;
     }
 
     match subcmd {
