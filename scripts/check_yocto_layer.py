@@ -1,63 +1,78 @@
 #!/usr/bin/env python3
-"""Validate meta-nextoomio Yocto layer, Wic partition layout, hardware profiles, and kas configs."""
+"""Validate meta-nextoomio Yocto layer, Wic partition layout, hardware profiles, and kas configs.
+
+Supports --test to execute automated self-tests verifying that the CI check fails
+on deliberately wrong configurations (AC5).
+"""
 
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
-def main() -> int:
+def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
+    """Run all static validation checks against the given repository root directory."""
     errors: list[str] = []
 
     required_files = [
-        ROOT / "meta-nextoomio/COPYING.MIT",
-        ROOT / "meta-nextoomio/conf/layer.conf",
-        ROOT / "meta-nextoomio/conf/distro/nextoomio.conf",
-        ROOT / "meta-nextoomio/files/wic/nextoomio-ab.wks.in",
-        ROOT / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json",
-        ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb",
-        ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
-        ROOT / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb",
-        ROOT / "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend",
-        ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
-        ROOT / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
-        ROOT / "kas/base.yml",
-        ROOT / "kas/rpi4-64.yml",
-        ROOT / "kas/ci-hosted.yml",
-        ROOT / "meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend",
-        ROOT / "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf",
-        ROOT / "meta-nextoomio/recipes-connectivity/nftables/files/00-default.nft",
-        ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/networkmanager_%.bbappend",
-        ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection",
-        ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset",
-        ROOT / "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend",
-        ROOT / "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
-        ROOT / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
-        ROOT / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
-        ROOT / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
+        root / "meta-nextoomio/COPYING.MIT",
+        root / "meta-nextoomio/conf/layer.conf",
+        root / "meta-nextoomio/conf/distro/nextoomio.conf",
+        root / "meta-nextoomio/files/wic/nextoomio-ab.wks.in",
+        root / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json",
+        root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb",
+        root / "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
+        root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb",
+        root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend",
+        root / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
+        root / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
+        root / "kas/base.yml",
+        root / "kas/rpi4-64.yml",
+        root / "kas/ci-hosted.yml",
+        root / "meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend",
+        root / "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf",
+        root / "meta-nextoomio/recipes-connectivity/nftables/files/00-default.nft",
+        root / "meta-nextoomio/recipes-connectivity/networkmanager/networkmanager_%.bbappend",
+        root / "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection",
+        root / "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset",
+        root / "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend",
+        root / "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
+        root / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
+        root / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
+        root / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
+        root / "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend",
+        root / "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio",
+        root / "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset",
+        root / "meta-nextoomio/recipes-connectivity/openssh/files/10-authorized-keys.conf",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/nextoomio-ssh-keys_0.0.1.bb",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
     ]
 
     for path in required_files:
         if not path.is_file():
-            errors.append(f"Missing required Yocto/kas file: {path.relative_to(ROOT)}")
+            errors.append(f"Missing required Yocto/kas file: {path.relative_to(root)}")
 
-    kas_dir = ROOT / "kas"
+    kas_dir = root / "kas"
     if kas_dir.is_dir():
         for kas_file in sorted(kas_dir.glob("*.yml")):
             for line_idx, line in enumerate(kas_file.read_text(encoding="utf-8").splitlines(), start=1):
                 m = re.match(r"^\s*branch:\s*([0-9]+(?:\.[0-9]+)*)\s*(?:#.*)?$", line)
                 if m:
                     errors.append(
-                        f"{kas_file.relative_to(ROOT)} line {line_idx}: branch value '{m.group(1)}' "
+                        f"{kas_file.relative_to(root)} line {line_idx}: branch value '{m.group(1)}' "
                         f"must be quoted as a string to avoid YAML float parsing"
                     )
 
-    rpi4_kas = ROOT / "kas/rpi4-64.yml"
+    rpi4_kas = root / "kas/rpi4-64.yml"
     if rpi4_kas.is_file():
         rpi4_text = rpi4_kas.read_text(encoding="utf-8")
         if "tryboot_a_b" in rpi4_text:
@@ -66,7 +81,7 @@ def main() -> int:
                 "tryboot_a_b is a property of autoboot.txt (CQ-R2)"
             )
 
-    profile_path = ROOT / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
+    profile_path = root / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
     if profile_path.is_file():
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
         if profile.get("profile_id") != "hifiberry-amp":
@@ -76,17 +91,15 @@ def main() -> int:
         if profile.get("default_logical_volume_percent") != 30:
             errors.append("Default logical volume must be 30% per SPECIFICATION.md section 5.1")
 
-    if (ROOT / "meta-nextoomio/wic").exists():
+    if (root / "meta-nextoomio/wic").exists():
         errors.append(
             "Legacy directory meta-nextoomio/wic must be removed; "
             "wic/wks files must reside in meta-nextoomio/files/wic per OE-core sanity requirements"
         )
 
     # D-004: Validate kernel command line root partition specification
-    # Fails if fixed device nodes (e.g. /dev/mmcblk0p2) are used, if unusable partition/fs labels
-    # (PARTLABEL=/LABEL=) are used on MBR layout, or if not pointing by PARTUUID to slot A (partition 5).
-    distro_conf = ROOT / "meta-nextoomio/conf/distro/nextoomio.conf"
-    cmdline_bbappend = ROOT / "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend"
+    distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
+    cmdline_bbappend = root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend"
 
     if distro_conf.is_file():
         conf_text = distro_conf.read_text(encoding="utf-8")
@@ -169,7 +182,7 @@ def main() -> int:
                 "for Wic bootimg-partition plugin to read partition-specific boot files"
             )
 
-    autoboot_bb = ROOT / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb"
+    autoboot_bb = root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb"
     if autoboot_bb.is_file():
         autoboot_text = autoboot_bb.read_text(encoding="utf-8")
         if "inherit deploy" not in autoboot_text:
@@ -177,7 +190,7 @@ def main() -> int:
         if "autoboot.txt" not in autoboot_text or "[all]" not in autoboot_text or "boot_partition" not in autoboot_text:
             errors.append("rpi-autoboot.bb must generate autoboot.txt with [all] and boot_partition sections")
 
-    image_bb = ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+    image_bb = root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
     if image_bb.is_file():
         image_text = image_bb.read_text(encoding="utf-8")
         if "rpi-autoboot:do_deploy" not in image_text:
@@ -187,7 +200,7 @@ def main() -> int:
             )
 
     # Wic layout verification (ARCHITECTURE.md section 3.6, AC2, AC4, AC5)
-    wks_path = ROOT / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
+    wks_path = root / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
     if wks_path.is_file():
         wks_text = wks_path.read_text(encoding="utf-8")
         for label in ("select", "boot_a", "boot_b", "root_a", "root_b", "data"):
@@ -206,7 +219,7 @@ def main() -> int:
                 f"disk signature '{expected_partuuid}' in rpi-cmdline.bbappend"
             )
 
-        # Verify sizes and slot B emptiness on fresh card (AC5)
+        # Verify sizes, read-only select partition (AC7), and slot B emptiness on fresh card (AC5)
         for line in wks_text.splitlines():
             line_str = line.strip()
             if not line_str or line_str.startswith("#"):
@@ -216,6 +229,9 @@ def main() -> int:
                     errors.append("Wic selector partition must be fixed size 64M")
                 if "--active" not in line_str:
                     errors.append("Wic selector partition must be active/bootable")
+                m_fsopt = re.search(r'--fsoptions\s+["\']([^"\']+)["\']', line_str)
+                if not m_fsopt or "ro" not in [opt.strip() for opt in m_fsopt.group(1).split(",")]:
+                    errors.append("Wic selector partition must be mounted read-only (--fsoptions 'ro', AC7)")
             elif "--label boot_a" in line_str:
                 if "--fixed-size 256M" not in line_str:
                     errors.append("Wic boot_a partition must be fixed size 256M")
@@ -250,7 +266,7 @@ def main() -> int:
         if "timesyncd" not in conf_text:
             errors.append("meta-nextoomio/conf/distro/nextoomio.conf must enable systemd timesyncd (AD-21, AC5)")
 
-    nft_conf = ROOT / "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf"
+    nft_conf = root / "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf"
     if nft_conf.is_file():
         nft_text = nft_conf.read_text(encoding="utf-8")
         if not re.search(r"type\s+filter\s+hook\s+input\s+priority\s+filter\s*;\s*policy\s+drop\s*;", nft_text):
@@ -260,7 +276,7 @@ def main() -> int:
         if 'include "/etc/nftables.d/*.nft"' not in nft_text:
             errors.append("nftables.conf must include '/etc/nftables.d/*.nft' for modular recipe extensions (P0-F2.4)")
 
-    nm_conn = ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection"
+    nm_conn = root / "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection"
     if nm_conn.is_file():
         conn_text = nm_conn.read_text(encoding="utf-8")
         if "type=ethernet" not in conn_text:
@@ -268,24 +284,343 @@ def main() -> int:
         if "method=auto" not in conn_text:
             errors.append("10-default-wired.nmconnection must configure method=auto for DHCP (AC1)")
 
-    nm_preset = ROOT / "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset"
+    nm_preset = root / "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset"
     if nm_preset.is_file():
         preset_text = nm_preset.read_text(encoding="utf-8")
         if "disable NetworkManager-wait-online.service" not in preset_text:
             errors.append("NetworkManager preset must disable NetworkManager-wait-online.service (AD-21, AC4)")
 
-    ts_preset = ROOT / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset"
+    ts_preset = root / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset"
     if ts_preset.is_file():
         ts_text = ts_preset.read_text(encoding="utf-8")
         if "disable systemd-time-wait-sync.service" not in ts_text:
             errors.append("systemd preset must disable systemd-time-wait-sync.service (AD-21, AC5)")
 
+    # D-007 / P0-F3.2 AC4: Image SSH server configuration, single image baseline, and removal of package manager/debug tooling
+    if image_bb.is_file():
+        image_text = image_bb.read_text(encoding="utf-8")
+        m_remove = re.search(r'IMAGE_FEATURES:remove\s*=\s*["\']([^"\']+)["\']', image_text)
+        if m_remove and "ssh-server-openssh" in m_remove.group(1):
+            errors.append(
+                "nextoomio-image.bb: IMAGE_FEATURES:remove must not contain 'ssh-server-openssh'; "
+                "SSH server is installed stopped in the base image and activated via key file (D-007, AD-23)"
+            )
+        if not m_remove or "package-management" not in m_remove.group(1):
+            errors.append(
+                "nextoomio-image.bb: IMAGE_FEATURES:remove must contain 'package-management' (P0-F3.2 AC4)"
+            )
+        if not m_remove or "debug-tweaks" not in m_remove.group(1):
+            errors.append(
+                "nextoomio-image.bb: IMAGE_FEATURES:remove must contain 'debug-tweaks' (P0-F3.2 AC4)"
+            )
+        for pkg in ("openssh-sshd", "openssh-keygen", "nextoomio-ssh-keys"):
+            if pkg not in image_text:
+                errors.append(
+                    f"nextoomio-image.bb: IMAGE_INSTALL must include '{pkg}' for key-activated SSH access (AD-23, P0-F3.1)"
+                )
+
+    # P0-F3.1 / P0-F3.2: OpenSSH hardened server configuration (AC2, AC5, AD-23)
+    sshd_conf = root / "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio"
+    if sshd_conf.is_file():
+        conf_text = sshd_conf.read_text(encoding="utf-8")
+        if re.search(r"^\s*Protocol\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio: Protocol directive is obsolete/ignored and must be omitted (CQ-R14)")
+        if re.search(r"^\s*Subsystem\s+sftp\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio: Subsystem sftp must be omitted because sftp-server is not installed (CQ-R14)")
+        if not re.search(r"^\s*PasswordAuthentication\s+no\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must configure 'PasswordAuthentication no' (AC2, AC5)")
+        if re.search(r"^\s*PasswordAuthentication\s+yes\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must NOT enable 'PasswordAuthentication yes' (AC5)")
+        if not re.search(r"^\s*KbdInteractiveAuthentication\s+no\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must configure 'KbdInteractiveAuthentication no' (AC2, AC5)")
+        if re.search(r"^\s*KbdInteractiveAuthentication\s+yes\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must NOT enable 'KbdInteractiveAuthentication yes' (AC5)")
+        if re.search(r"^\s*PermitRootLogin\s+yes\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must NOT configure 'PermitRootLogin yes' (AC5)")
+        if not re.search(r"^\s*AuthorizedKeysFile\s+/run/ssh/authorized_keys\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must configure 'AuthorizedKeysFile /run/ssh/authorized_keys' for volatile storage (AD-23, AC3)")
+        if not re.search(r"^\s*AllowAgentForwarding\s+no\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must configure 'AllowAgentForwarding no' (AC2)")
+        if not re.search(r"^\s*AllowTcpForwarding\s+no\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must configure 'AllowTcpForwarding no' (AC2)")
+        if not re.search(r"^\s*X11Forwarding\s+no\b", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must configure 'X11Forwarding no' (AC2)")
+        if not re.search(r"^\s*HostKey\s+/data/ssh/", conf_text, re.MULTILINE):
+            errors.append("sshd_config.nextoomio must configure HostKey paths on /data/ssh/ persistent partition (AC5)")
+
+    # P0-F3.1 / P0-F3.2: OpenSSH systemd preset and bbappend (AC1, AC5)
+    ssh_preset = root / "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset"
+    if ssh_preset.is_file():
+        preset_text = ssh_preset.read_text(encoding="utf-8")
+        if not re.search(r"^disable\s+sshd\.service\b", preset_text, re.MULTILINE):
+            errors.append("99-nextoomio-ssh.preset must contain 'disable sshd.service' (AD-23, AC1, AC5)")
+        if re.search(r"^enable\s+sshd\.service\b", preset_text, re.MULTILINE):
+            errors.append("99-nextoomio-ssh.preset must NOT contain 'enable sshd.service' (AC5)")
+        if not re.search(r"^disable\s+sshd\.socket\b", preset_text, re.MULTILINE):
+            errors.append("99-nextoomio-ssh.preset must contain 'disable sshd.socket' (AC1, AC5)")
+        if not re.search(r"^disable\s+sshd@\.service\b", preset_text, re.MULTILINE):
+            errors.append("99-nextoomio-ssh.preset must contain 'disable sshd@.service' (AC1, AC5)")
+
+    ssh_dropin = root / "meta-nextoomio/recipes-connectivity/openssh/files/10-authorized-keys.conf"
+    if ssh_dropin.is_file():
+        dropin_text = ssh_dropin.read_text(encoding="utf-8")
+        if not re.search(r"^ConditionPathExists=/run/ssh/authorized_keys\b", dropin_text, re.MULTILINE):
+            errors.append(
+                "10-authorized-keys.conf must configure 'ConditionPathExists=/run/ssh/authorized_keys' "
+                "to ensure sshd never starts without validated keys (AD-23, AC1, AC5)"
+            )
+
+    ssh_bbappend = root / "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend"
+    if ssh_bbappend.is_file():
+        bbappend_text = ssh_bbappend.read_text(encoding="utf-8")
+        if not re.search(r'SYSTEMD_AUTO_ENABLE:\$\{PN\}-sshd\s*=\s*["\']disable["\']', bbappend_text):
+            errors.append(
+                "openssh_%.bbappend must configure SYSTEMD_AUTO_ENABLE:${PN}-sshd = 'disable' (AD-23, AC1, AC5)"
+            )
+        if re.search(r'SYSTEMD_AUTO_ENABLE:\$\{PN\}-sshd\s*=\s*["\']enable["\']', bbappend_text):
+            errors.append(
+                "openssh_%.bbappend must NOT configure SYSTEMD_AUTO_ENABLE:${PN}-sshd = 'enable' (AC5)"
+            )
+        if "systemd-sshd-service-mode" not in bbappend_text:
+            errors.append(
+                "openssh_%.bbappend must append PACKAGECONFIG with 'systemd-sshd-service-mode' "
+                "to ensure sshd.service unit exists in pinned OE-core release (AC1)"
+            )
+
+    # P0-F3.1 / P0-F3.2: nextoomio-ssh-keys service ordering (CQ-R1, AC1, AC5)
+    ssh_keys_service = root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service"
+    if ssh_keys_service.is_file():
+        service_text = ssh_keys_service.read_text(encoding="utf-8")
+        if not re.search(r"^After=.*\bnftables\.service\b", service_text, re.MULTILINE):
+            errors.append("nextoomio-ssh-keys.service must specify After=... nftables.service (CQ-R1, AC1)")
+        if not re.search(r"^Wants=.*\bnftables\.service\b", service_text, re.MULTILINE):
+            errors.append("nextoomio-ssh-keys.service must specify Wants=... nftables.service (CQ-R1, AC1)")
+        if not re.search(r"^Before=.*\bsshd\.service\b", service_text, re.MULTILINE):
+            errors.append("nextoomio-ssh-keys.service must specify Before=sshd.service (AC1)")
+        if not re.search(r"^RequiresMountsFor=.*(/boot/select|/data)", service_text, re.MULTILINE):
+            errors.append("nextoomio-ssh-keys.service must specify RequiresMountsFor=/boot/select /data")
+
+    # P0-F3.1 / P0-F3.2: Key validator setup script (AC3, AC4, AD-23)
+    setup_script = root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh"
+    if setup_script.is_file():
+        script_text = setup_script.read_text(encoding="utf-8")
+        if re.search(r"nft\s+delete\s+rule\s+inet\s+filter\s+input\s+tcp\s+dport\s+22\s+accept", script_text):
+            errors.append(
+                "nextoomio-ssh-keys-setup.sh contains invalid 'nft delete rule ... accept'; "
+                "nftables rule deletion requires rule handle lookup (CQ-R1, CQ-R2, AC3)"
+            )
+        if not re.search(r"nft\s+delete\s+rule\s+inet\s+filter\s+input\s+handle\b", script_text):
+            errors.append("nextoomio-ssh-keys-setup.sh must delete nftables rules using rule handles (CQ-R1, AC3)")
+        if not re.search(r"missing_validator_utility", script_text):
+            errors.append("nextoomio-ssh-keys-setup.sh must fail closed with diagnostic when ssh-keygen is missing (CQ-R1, AC4)")
+        if "sha256-uncomputed" in script_text:
+            errors.append("nextoomio-ssh-keys-setup.sh must not record uncomputed fingerprints; validation must fail closed (CQ-R1, AC4)")
+        if not re.search(r"missing_host_keys", script_text):
+            errors.append("nextoomio-ssh-keys-setup.sh must fail closed if persistent host keys are missing or unreadable (CQ-R1, AC5)")
+        if not re.search(r'\[\s*"\$FILE_SIZE"\s+-gt\s+16384\s*\]', script_text):
+            errors.append("nextoomio-ssh-keys-setup.sh must enforce 16 KiB size limit (AC4)")
+        if not re.search(r'\[\s*"\$KEY_COUNT"\s+-gt\s+16\s*\]', script_text):
+            errors.append("nextoomio-ssh-keys-setup.sh must enforce maximum 16 keys limit (AC4)")
+        if not re.search(r'\[\s*"\$BITS"\s+-lt\s+3072\s*\]', script_text):
+            errors.append("nextoomio-ssh-keys-setup.sh must enforce minimum 3072 bits for RSA keys (AC4)")
+        if "authorized_keys" not in script_text or "authorized_keys.txt" not in script_text:
+            errors.append("nextoomio-ssh-keys-setup.sh must check for authorized_keys and authorized_keys.txt (AC1)")
+        if "/run/ssh/authorized_keys" not in script_text:
+            errors.append("nextoomio-ssh-keys-setup.sh must install keys to volatile storage /run/ssh/authorized_keys (AD-23)")
+        if "/data/ssh" not in script_text:
+            errors.append("nextoomio-ssh-keys-setup.sh must initialize host keys on /data/ssh (AC5)")
+        if "/run/nextoomio/diagnostics/ssh.json" not in script_text:
+            errors.append("nextoomio-ssh-keys-setup.sh must record diagnostics to /run/nextoomio/diagnostics/ssh.json (AC3, AC4)")
+        if "/run/nextoomio/diagnostics/ssh.txt" not in script_text:
+            errors.append("nextoomio-ssh-keys-setup.sh must record diagnostics text to /run/nextoomio/diagnostics/ssh.txt (AC3)")
+        if "systemctl start --no-block sshd.service" not in script_text:
+            errors.append("nextoomio-ssh-keys-setup.sh must start sshd with --no-block to prevent systemd ordering deadlock (CQ-R1, AC1)")
+
+    # P0-F3.1 / P0-F3.2: Stop script cleanup check (AC3, CQ-R1, CQ-R2)
+    stop_script = root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh"
+    if stop_script.is_file():
+        stop_text = stop_script.read_text(encoding="utf-8")
+        if re.search(r"nft\s+delete\s+rule\s+inet\s+filter\s+input\s+tcp\s+dport\s+22\s+accept", stop_text):
+            errors.append(
+                "nextoomio-ssh-keys-stop.sh contains invalid 'nft delete rule ... accept'; "
+                "nftables rule deletion requires rule handle lookup (CQ-R1, CQ-R2, AC3)"
+            )
+        if not re.search(r"nft\s+delete\s+rule\s+inet\s+filter\s+input\s+handle\b", stop_text):
+            errors.append("nextoomio-ssh-keys-stop.sh must delete nftables rules using rule handles (CQ-R1, AC3)")
+        if "/run/ssh/authorized_keys" not in stop_text:
+            errors.append("nextoomio-ssh-keys-stop.sh must purge volatile keys at /run/ssh/authorized_keys (AC3)")
+        if "/run/nextoomio/diagnostics/ssh.txt" not in stop_text:
+            errors.append("nextoomio-ssh-keys-stop.sh must update diagnostics text at /run/nextoomio/diagnostics/ssh.txt (AC3)")
+
+    # P0-F3.2 AC4: CI workflow artifact upload publishes package manifest
+    yocto_wf = root / ".github/workflows/yocto-build.yml"
+    if yocto_wf.is_file():
+        wf_text = yocto_wf.read_text(encoding="utf-8")
+        if "*.manifest" not in wf_text and "*.rootfs.manifest" not in wf_text:
+            errors.append(
+                ".github/workflows/yocto-build.yml: artifact upload must publish package manifest (*.manifest, AC4)"
+            )
+
+    # Component register check in ARCHITECTURE.md section 10
+    arch_doc = root / "ARCHITECTURE.md"
+    if arch_doc.is_file():
+        arch_text = arch_doc.read_text(encoding="utf-8")
+        if not re.search(r"\|\s*OpenSSH\s*\|\s*v0\.0\.1\s*\|", arch_text):
+            errors.append("ARCHITECTURE.md section 10 register must record OpenSSH row (DoD item 4)")
+
+    return errors
+
+
+def run_self_tests() -> int:
+    """Run AC5 automated self-tests verifying check failures on deliberately wrong configurations."""
+    print("Running check_yocto_layer self-tests (AC5 automated CI verification)...")
+
+    # Baseline: valid repo must pass
+    baseline_errors = validate_layer(ROOT)
+    assert not baseline_errors, f"Baseline layer validation failed: {baseline_errors}"
+    print("  test_check_passes_on_valid_configuration: OK")
+
+    def copy_repo_subset(src: pathlib.Path, dst: pathlib.Path, rel_paths: list[str]) -> None:
+        for rp in rel_paths:
+            src_f = src / rp
+            dst_f = dst / rp
+            dst_f.parent.mkdir(parents=True, exist_ok=True)
+            dst_f.write_text(src_f.read_text(encoding="utf-8"), encoding="utf-8")
+
+    all_layer_files = [
+        "meta-nextoomio/COPYING.MIT",
+        "meta-nextoomio/conf/layer.conf",
+        "meta-nextoomio/conf/distro/nextoomio.conf",
+        "meta-nextoomio/files/wic/nextoomio-ab.wks.in",
+        "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json",
+        "meta-nextoomio/recipes-core/images/nextoomio-image.bb",
+        "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
+        "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb",
+        "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend",
+        "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
+        "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
+        "kas/base.yml",
+        "kas/rpi4-64.yml",
+        "kas/ci-hosted.yml",
+        "meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend",
+        "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf",
+        "meta-nextoomio/recipes-connectivity/nftables/files/00-default.nft",
+        "meta-nextoomio/recipes-connectivity/networkmanager/networkmanager_%.bbappend",
+        "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection",
+        "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset",
+        "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend",
+        "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
+        "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
+        "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
+        "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
+        "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend",
+        "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio",
+        "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset",
+        "meta-nextoomio/recipes-connectivity/openssh/files/10-authorized-keys.conf",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/nextoomio-ssh-keys_0.0.1.bb",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
+        ".github/workflows/yocto-build.yml",
+        "ARCHITECTURE.md",
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp_str:
+        tmp_root = pathlib.Path(tmp_str)
+        copy_repo_subset(ROOT, tmp_root, all_layer_files)
+
+        # 1. AC5: Fail when 10-authorized-keys.conf drop-in is missing ConditionPathExists
+        dropin = tmp_root / "meta-nextoomio/recipes-connectivity/openssh/files/10-authorized-keys.conf"
+        orig_dropin = dropin.read_text(encoding="utf-8")
+        dropin.write_text("[Unit]\n# missing condition\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("ConditionPathExists" in e for e in errs), f"Expected ConditionPathExists failure: {errs}"
+        dropin.write_text(orig_dropin, encoding="utf-8")
+        print("  test_check_fails_when_sshd_condition_missing: OK")
+
+        # 2. AC5: Fail when 99-nextoomio-ssh.preset enables sshd.service
+        preset = tmp_root / "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset"
+        orig_preset = preset.read_text(encoding="utf-8")
+        preset.write_text("enable sshd.service\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("enable sshd.service" in e for e in errs), f"Expected enable sshd.service failure: {errs}"
+        preset.write_text(orig_preset, encoding="utf-8")
+        print("  test_check_fails_when_sshd_preset_enables_service: OK")
+
+        # 3. AC5: Fail when SYSTEMD_AUTO_ENABLE:${PN}-sshd is set to enable
+        bbappend = tmp_root / "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend"
+        orig_bbappend = bbappend.read_text(encoding="utf-8")
+        bbappend.write_text(orig_bbappend.replace('"disable"', '"enable"'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("SYSTEMD_AUTO_ENABLE" in e for e in errs), f"Expected SYSTEMD_AUTO_ENABLE failure: {errs}"
+        bbappend.write_text(orig_bbappend, encoding="utf-8")
+        print("  test_check_fails_when_sshd_auto_enable_active: OK")
+
+        # 4. AC5: Fail when PasswordAuthentication yes is configured
+        sshd_conf = tmp_root / "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio"
+        orig_sshd_conf = sshd_conf.read_text(encoding="utf-8")
+        sshd_conf.write_text(orig_sshd_conf.replace("PasswordAuthentication no", "PasswordAuthentication yes"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("PasswordAuthentication" in e for e in errs), f"Expected PasswordAuthentication failure: {errs}"
+        sshd_conf.write_text(orig_sshd_conf, encoding="utf-8")
+        print("  test_check_fails_when_password_authentication_enabled: OK")
+
+        # 5. AC5: Fail when KbdInteractiveAuthentication yes is configured
+        sshd_conf.write_text(orig_sshd_conf.replace("KbdInteractiveAuthentication no", "KbdInteractiveAuthentication yes"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("KbdInteractiveAuthentication" in e for e in errs), f"Expected KbdInteractive failure: {errs}"
+        sshd_conf.write_text(orig_sshd_conf, encoding="utf-8")
+        print("  test_check_fails_when_kbd_interactive_enabled: OK")
+
+        # 6. AC5: Fail when PermitRootLogin yes is configured
+        sshd_conf.write_text(orig_sshd_conf.replace("PermitRootLogin prohibit-password", "PermitRootLogin yes"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("PermitRootLogin" in e for e in errs), f"Expected PermitRootLogin failure: {errs}"
+        sshd_conf.write_text(orig_sshd_conf, encoding="utf-8")
+        print("  test_check_fails_when_permit_root_login_yes: OK")
+
+        # 7. AC4: Fail when package-management is not removed from nextoomio-image.bb
+        img_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_img_bb = img_bb.read_text(encoding="utf-8")
+        img_bb.write_text(orig_img_bb.replace("package-management", ""), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("package-management" in e for e in errs), f"Expected package-management failure: {errs}"
+        img_bb.write_text(orig_img_bb, encoding="utf-8")
+        print("  test_check_fails_when_package_management_not_removed: OK")
+
+        # 8. AC4: Fail when package manifest artifact is missing from yocto-build.yml
+        wf = tmp_root / ".github/workflows/yocto-build.yml"
+        orig_wf = wf.read_text(encoding="utf-8")
+        wf.write_text(orig_wf.replace(".manifest", ".nomatch"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("package manifest" in e for e in errs), f"Expected package manifest failure: {errs}"
+        wf.write_text(orig_wf, encoding="utf-8")
+        print("  test_check_fails_when_manifest_artifact_missing: OK")
+
+        # 9. AC3: Fail when diagnostics text (/run/nextoomio/diagnostics/ssh.txt) is missing from setup script
+        setup_sh = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh"
+        orig_setup_sh = setup_sh.read_text(encoding="utf-8")
+        setup_sh.write_text(orig_setup_sh.replace("/run/nextoomio/diagnostics/ssh.txt", "/tmp/ignored.txt"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("diagnostics text" in e for e in errs), f"Expected diagnostics text failure: {errs}"
+        setup_sh.write_text(orig_setup_sh, encoding="utf-8")
+        print("  test_check_fails_when_diagnostics_text_missing: OK")
+
+    print("OK: all AC5 automated self-tests passed.")
+    return 0
+
+
+def main() -> int:
+    if "--test" in sys.argv:
+        return run_self_tests()
+
+    errors = validate_layer(ROOT)
     if errors:
         for err in errors:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005 rules validated.")
+    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2 rules validated.")
     return 0
 
 
