@@ -22,6 +22,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 import unittest
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,7 @@ class PowerLossMockDevice(SshRunner):
         initial_version: str = "0.0.1-powerloss-base",
         target_version: str = "0.0.1-powerloss-target",
         fail_recovery: bool = False,
+        power_ctrl: Optional[MockPowerController] = None,
     ):
         self.host = "192.0.2.1"
         self.active_slot = initial_slot
@@ -73,6 +75,7 @@ class PowerLossMockDevice(SshRunner):
         self.current_version = initial_version
         self.target_version = target_version
         self.fail_recovery = fail_recovery
+        self.power_ctrl = power_ctrl
 
         # Power state
         self.is_powered = True
@@ -81,11 +84,13 @@ class PowerLossMockDevice(SshRunner):
 
         # Update state machine
         self.update_state = "Idle"
-        self.trial_attempts = 0
+        self.trial_attempts: Optional[int] = 0
         self.uploaded_bytes = 0
         self.current_phase = "idle"
         self.last_interrupted_phase: Optional[str] = None
         self.commands_executed: List[str] = []
+        self.mount_options = "ro,relatime"
+        self.mount_device_override: Optional[str] = None
 
     def handle_power_cut(self) -> None:
         """Called when power outlet is switched OFF."""
@@ -121,7 +126,7 @@ class PowerLossMockDevice(SshRunner):
         elif interrupted == "trial":
             # Trial attempt consumed. Cold power cycle boots default slot (tryboot one-shot)
             self.active_slot = self.default_slot
-            self.trial_attempts = max(1, self.trial_attempts + 1)
+            self.trial_attempts = max(1, (self.trial_attempts or 0) + 1)
             self.update_state = "Failed" if self.trial_attempts >= 2 else "TrialInterrupted"
 
         elif interrupted == "commit":
@@ -146,6 +151,13 @@ class PowerLossMockDevice(SshRunner):
             return SshCommandResult(255, "", "SSH connection lost: host down")
 
         self.current_phase = "upload"
+        if self.power_ctrl and self.power_ctrl.pending_cut_phase == "upload":
+            start = time.monotonic()
+            while self.is_powered and (time.monotonic() - start < 0.2):
+                time.sleep(0.002)
+            if not self.is_powered:
+                return SshCommandResult(255, "", "SSH connection lost: host down")
+
         self.uploaded_bytes = local_file.stat().st_size
         self.update_state = "Staged"
         return SshCommandResult(0, "Staged successfully", "")
@@ -159,8 +171,12 @@ class PowerLossMockDevice(SshRunner):
             return SshCommandResult(0, "", "")
 
         if "mount" in cmd:
-            part = "mmcblk0p5" if self.active_slot == "root_a" else "mmcblk0p6"
-            return SshCommandResult(0, f"/dev/{part} on / type ext4 (ro,relatime)\n", "")
+            if self.mount_device_override:
+                dev = self.mount_device_override
+            else:
+                part = "mmcblk0p5" if self.active_slot == "root_a" else "mmcblk0p6"
+                dev = f"/dev/{part}"
+            return SshCommandResult(0, f"{dev} on / type ext4 ({self.mount_options})\n", "")
 
         if "cat /proc/sys/kernel/random/boot_id" in cmd:
             return SshCommandResult(0, self.boot_id, "")
@@ -178,8 +194,9 @@ class PowerLossMockDevice(SshRunner):
                 "state": self.update_state,
                 "active_slot": self.active_slot,
                 "default_slot": self.default_slot,
-                "trial_attempts": self.trial_attempts,
             }
+            if self.trial_attempts is not None:
+                data["trial_attempts"] = self.trial_attempts
             return SshCommandResult(0, json.dumps(data), "")
 
         if "nx-sysd update validate" in cmd:
@@ -188,13 +205,19 @@ class PowerLossMockDevice(SshRunner):
 
         if "nx-sysd update install" in cmd:
             self.current_phase = "install"
+            if self.power_ctrl and self.power_ctrl.pending_cut_phase == "install":
+                start = time.monotonic()
+                while self.is_powered and (time.monotonic() - start < 0.2):
+                    time.sleep(0.002)
+                if not self.is_powered:
+                    return SshCommandResult(255, "", "SSH connection lost: host down")
             self.update_state = "Installed"
             return SshCommandResult(0, '{"state": "Installed"}', "")
 
         if "nx-sysd update trial" in cmd:
             self.current_phase = "trial"
             self.update_state = "Trial"
-            self.trial_attempts += 1
+            self.trial_attempts = (self.trial_attempts or 0) + 1
             # Trial armed: reboot toggles active slot and activates target version
             self.active_slot = opposite_slot(self.active_slot)
             self.current_version = self.target_version
@@ -204,6 +227,12 @@ class PowerLossMockDevice(SshRunner):
 
         if "nx-sysd update confirm" in cmd or "nx-sysd update commit" in cmd:
             self.current_phase = "commit"
+            if self.power_ctrl and self.power_ctrl.pending_cut_phase == "commit":
+                start = time.monotonic()
+                while self.is_powered and (time.monotonic() - start < 0.2):
+                    time.sleep(0.002)
+                if not self.is_powered:
+                    return SshCommandResult(255, "", "SSH connection lost: host down")
             self.default_slot = self.active_slot
             self.current_version = self.target_version
             self.update_state = "Committed"
@@ -229,8 +258,8 @@ class TestPowerLossTool(unittest.TestCase):
         trials_per_case: int = 1,
         fail_recovery: bool = False,
     ) -> Tuple[PowerLossRunner, PowerLossMockDevice, MockPowerController]:
-        mock_dev = PowerLossMockDevice(fail_recovery=fail_recovery)
         mock_power = MockPowerController(verbose=False)
+        mock_dev = PowerLossMockDevice(fail_recovery=fail_recovery, power_ctrl=mock_power)
         mock_power.on_cut_callback = mock_dev.handle_power_cut
         mock_power.on_restore_callback = mock_dev.handle_power_restore
 
@@ -313,8 +342,66 @@ class TestPowerLossTool(unittest.TestCase):
         self.assertIn(trial.device_state, ("committed", "failed", "rolled_back"))
         self.assertNotIn(trial.device_state, ("undefined", "unknown", "corrupt"))
 
+    def test_ac1_fails_when_rootfs_mounted_read_write(self) -> None:
+        """AC1: _verify_complete_image rejects rootfs mounted read-write or with mismatched partition."""
+        runner, dev, _ = self._create_runner_and_mock(cases=["upload"], trials_per_case=1)
+
+        # Baseline: root_a mounted ro passes
+        self.assertTrue(runner._verify_complete_image("root_a"))
+
+        # Failed case 1: mounted rw instead of ro
+        dev.mount_options = "rw,relatime"
+        self.assertFalse(runner._verify_complete_image("root_a"))
+
+        # Failed case 2: mounted ro but wrong partition device
+        dev.mount_options = "ro,relatime"
+        dev.mount_device_override = "/dev/mmcblk0p9"
+        self.assertFalse(runner._verify_complete_image("root_a"))
+
+    def test_ac2_trial_missing_or_zero_attempts_fails(self) -> None:
+        """AC2: Interrupted trial with missing or zero trial_attempts fails consistency check."""
+        runner, dev, _ = self._create_runner_and_mock(cases=["trial"], trials_per_case=1)
+
+        # Zero attempts must fail
+        ok, details = runner._verify_ac2_state_consistency(
+            "trial", "root_a", "root_b", "root_a", "trialinterrupted", {"trial_attempts": 0}
+        )
+        self.assertFalse(ok)
+        self.assertIn("did not consume attempt", details)
+
+        # Missing attempts must fail
+        ok, details = runner._verify_ac2_state_consistency(
+            "trial", "root_a", "root_b", "root_a", "trialinterrupted", {}
+        )
+        self.assertFalse(ok)
+        self.assertIn("missing required 'trial_attempts'", details)
+
+    def test_unreachable_device_before_trial_records_physical_access_and_blocks_gate(self) -> None:
+        """AC3: Unreachable bench device before trial start is recorded as failed trial requiring physical access."""
+        runner, dev, _ = self._create_runner_and_mock(cases=["upload"], trials_per_case=1)
+        dev.is_powered = False  # Unreachable before trial start
+
+        report = runner.run()
+        self.assertEqual(len(report.trials), 1)
+        trial = report.trials[0]
+        self.assertFalse(trial.success)
+        self.assertTrue(trial.physical_access_needed)
+        self.assertEqual(report.physical_access_count, 1)
+        self.assertEqual(report.failed_trials, 1)
+        self.assertFalse(report.meets_gate_criteria)
+
+    def test_upload_finished_before_cut_raises_error(self) -> None:
+        """CQ-R1: Upload completing before scheduled power cut raises error and is not marked as upload interruption."""
+        runner, dev, _ = self._create_runner_and_mock(cases=["upload"], trials_per_case=1)
+        # Prevent mock device from waiting for cut during upload
+        dev.power_ctrl = None  # Will return immediately before power cut fires
+
+        trial = runner.run_trial("upload", 1)
+        self.assertFalse(trial.success)
+        self.assertIn("finished before scheduled power cut", trial.error_message or "")
+
     def test_ac3_ten_trials_varied_moments_all_cases(self) -> None:
-        """AC3: 10 trials per case across all 4 cases (40 total) with varied seeded delays and 0 physical access."""
+        """AC3: 10 trials per case across all 4 cases (40 total) with varied seeded delays."""
         runner, dev, _ = self._create_runner_and_mock(
             cases=list(VALID_CASES), trials_per_case=DEFAULT_TRIALS_PER_CASE
         )
@@ -324,19 +411,34 @@ class TestPowerLossTool(unittest.TestCase):
         self.assertEqual(report.passed_trials, 40)
         self.assertEqual(report.failed_trials, 0)
         self.assertEqual(report.physical_access_count, 0)
-        self.assertTrue(report.meets_gate_criteria)
+        self.assertTrue(report.is_mock_power)
+        # Mock power controller cannot satisfy hardware gate (CQ-R14, CQ-R2)
+        self.assertFalse(report.meets_gate_criteria)
+
+        # Real execution with same 40 passed trials passes hardware gate
+        real_report = PowerLossReport(
+            cases=list(VALID_CASES),
+            trials_per_case=DEFAULT_TRIALS_PER_CASE,
+            seed=42,
+            start_time="",
+            end_time="",
+            total_duration=10.0,
+            trials=report.trials,
+            is_mock_power=False,
+        )
+        self.assertTrue(real_report.meets_gate_criteria)
 
         # Verify delay values are varied
         delays = [t.delay_seconds for t in report.trials]
         self.assertGreater(len(set(delays)), 10, "Delays should be varied across trials")
 
-        # Verify markdown table formatting includes all 40 trials
+        # Verify markdown table formatting includes all 40 trials and non-gate status for mock
         md = report.format_markdown()
         self.assertIn("| `upload` | 10 |", md)
         self.assertIn("| `install` | 10 |", md)
         self.assertIn("| `trial` | 10 |", md)
         self.assertIn("| `commit` | 10 |", md)
-        self.assertIn("**PASS**", md)
+        self.assertIn("NON-GATE (Simulated Power Controller)", md)
 
     def test_ac3_device_failure_flags_physical_access_and_blocks_gate(self) -> None:
         """AC3: Failure of device to recover flags physical access requirement and blocks gate."""
@@ -395,24 +497,29 @@ class TestPowerLossTool(unittest.TestCase):
         """CQ-R7: Targets with option injection or shell metacharacters are rejected."""
         parser = build_parser()
 
+        # Missing both --power-cmd and --mock-power rejected
+        with self.assertRaises(SystemExit) as cm:
+            parse_arguments(parser, ["192.0.2.1", "--swu", str(self.swu_path)])
+        self.assertEqual(cm.exception.code, 2)
+
         # Target starting with '-' passed via '--' option delimiter
         with self.assertRaises(SystemExit) as cm:
-            parse_arguments(parser, ["--", "-badtarget", "--swu", str(self.swu_path)])
+            parse_arguments(parser, ["--mock-power", "--", "-badtarget", "--swu", str(self.swu_path)])
         self.assertEqual(cm.exception.code, 2)
 
         # User starting with '-'
         with self.assertRaises(SystemExit) as cm:
-            parse_arguments(parser, ["192.0.2.1", "--swu", str(self.swu_path), "--user", "-baduser"])
+            parse_arguments(parser, ["192.0.2.1", "--mock-power", "--swu", str(self.swu_path), "--user", "-baduser"])
         self.assertEqual(cm.exception.code, 2)
 
         # Host with semicolon / command injection
         with self.assertRaises(SystemExit) as cm:
-            parse_arguments(parser, ["host;rm -rf /", "--swu", str(self.swu_path)])
+            parse_arguments(parser, ["host;rm -rf /", "--mock-power", "--swu", str(self.swu_path)])
         self.assertEqual(cm.exception.code, 2)
 
         # Negative trials
         with self.assertRaises(SystemExit) as cm:
-            parse_arguments(parser, ["192.0.2.1", "--swu", str(self.swu_path), "--trials", "0"])
+            parse_arguments(parser, ["192.0.2.1", "--mock-power", "--swu", str(self.swu_path), "--trials", "0"])
         self.assertEqual(cm.exception.code, 2)
 
     def test_json_and_markdown_report_structure(self) -> None:

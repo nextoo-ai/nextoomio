@@ -167,6 +167,10 @@ class PowerController(abc.ABC):
     def get_status(self) -> str:
         """Query outlet status ('on' or 'off')."""
 
+    def notify_cut_scheduled(self, delay: float, phase: str) -> None:
+        """Hook called when a power cut is scheduled."""
+        pass
+
 
 class CommandPowerController(PowerController):
     """Power controller invoking an external power command (e.g. scripts/bench/power.sh)."""
@@ -251,11 +255,16 @@ class MockPowerController(PowerController):
         self.is_on = True
         self.verbose = verbose
         self.power_cuts: List[Dict[str, Any]] = []
+        self.pending_cut_phase: Optional[str] = None
         self.on_cut_callback: Optional[Callable[[], None]] = None
         self.on_restore_callback: Optional[Callable[[], None]] = None
 
+    def notify_cut_scheduled(self, delay: float, phase: str) -> None:
+        self.pending_cut_phase = phase
+
     def power_off(self) -> None:
         self.is_on = False
+        self.pending_cut_phase = None
         record = {"action": "off", "timestamp": time.time()}
         self.power_cuts.append(record)
         if self.verbose:
@@ -372,6 +381,7 @@ class PowerLossReport:
         trials: List[PowerLossTrialResult],
         failing_step: Optional[str] = None,
         error_message: Optional[str] = None,
+        is_mock_power: bool = False,
     ):
         self.cases = cases
         self.trials_per_case = trials_per_case
@@ -382,6 +392,7 @@ class PowerLossReport:
         self.trials = trials
         self.failing_step = failing_step
         self.error_message = error_message
+        self.is_mock_power = is_mock_power
 
     @property
     def total_trials(self) -> int:
@@ -401,6 +412,9 @@ class PowerLossReport:
 
     @property
     def meets_gate_criteria(self) -> bool:
+        # A mock power controller cannot satisfy hardware gate criteria (CQ-R14, CQ-R2)
+        if self.is_mock_power:
+            return False
         # Gate requires all 4 cases, at least 10 trials per case, 0 failures, 0 physical interventions
         if self.trials_per_case < DEFAULT_TRIALS_PER_CASE:
             return False
@@ -421,6 +435,7 @@ class PowerLossReport:
                 "cases": self.cases,
                 "trials_per_case": self.trials_per_case,
                 "seed": self.seed,
+                "is_mock_power": self.is_mock_power,
                 "total_trials": self.total_trials,
                 "passed_trials": self.passed_trials,
                 "failed_trials": self.failed_trials,
@@ -433,6 +448,11 @@ class PowerLossReport:
         }
 
     def format_text(self) -> str:
+        gate_verdict = (
+            "PASS"
+            if self.meets_gate_criteria
+            else ("NON-GATE (Simulated Power)" if self.is_mock_power else "FAILED / NON-GATE")
+        )
         lines = [
             "=== nextoomio Power-Loss Resilience Report (P0-F4.8) ===",
             f"Execution Window: {self.start_time} -> {self.end_time} ({self.total_duration:.1f}s)",
@@ -442,7 +462,7 @@ class PowerLossReport:
             f"Passed Trials:    {self.passed_trials}/{self.total_trials}",
             f"Failed Trials:    {self.failed_trials}/{self.total_trials}",
             f"Physical Access:  {self.physical_access_count} (Must be 0 for Gate)",
-            f"Gate Verdict:     {'PASS' if self.meets_gate_criteria else 'FAILED / NON-GATE'}",
+            f"Gate Verdict:     {gate_verdict}",
         ]
         if self.error_message:
             lines.append(f"Halt Error:       {self.error_message}")
@@ -462,7 +482,13 @@ class PowerLossReport:
         return "\n".join(lines)
 
     def format_markdown(self) -> str:
-        gate_status = "PASS" if self.meets_gate_criteria else "FAILED (Non-Gate)"
+        if self.is_mock_power:
+            gate_status = "NON-GATE (Simulated Power Controller)"
+        elif self.meets_gate_criteria:
+            gate_status = "PASS"
+        else:
+            gate_status = "FAILED (Non-Gate)"
+
         lines = [
             "# Power-Loss Resilience Verification Report (P0-F4.8)",
             "",
@@ -475,6 +501,7 @@ class PowerLossReport:
             f"- **Trials per case:** {self.trials_per_case}",
             f"- **Total trials:** {self.total_trials}",
             f"- **Random seed:** {self.seed}",
+            f"- **Power controller:** {'Mock / Simulated (NON-GATE)' if self.is_mock_power else 'Command / Physical Outlet'}",
             f"- **Passed trials:** {self.passed_trials}",
             f"- **Failed trials:** {self.failed_trials}",
             f"- **Physical access interventions:** {self.physical_access_count} (AC3 requirement: 0)",
@@ -516,7 +543,7 @@ class PowerLossReport:
             f"- **AC2 (State consistent with running slot):** "
             f"{'Demonstrated across all trials (interrupted upload/install not installable/bootable, trial attempt consumed, commit resolved cleanly)' if all(t.ac2_state_consistent for t in self.trials) else 'FAILED'}.",
             f"- **AC3 (Ten trials per case at varied moments, 0 physical access):** "
-            f"{'Met: ' + str(self.total_trials) + ' trials executed with varied seeded delays, 0 physical interventions' if self.meets_gate_criteria else 'FAILED or fewer than 10 trials per case'}.",
+            f"{'Met: ' + str(self.total_trials) + ' trials executed with varied seeded delays, 0 physical interventions' if self.meets_gate_criteria else ('SIMULATED (Non-Gate): hardware execution required' if self.is_mock_power else 'FAILED or fewer than 10 trials per case')}.",
             f"- **AC4 (Subsequent valid deploy succeeds in every case):** "
             f"{'Demonstrated across all trials' if all(t.ac4_subsequent_deploy for t in self.trials) else 'FAILED'}.",
             "",
@@ -527,6 +554,49 @@ class PowerLossReport:
 # ==============================================================================
 # Power-Loss Resilience Test Runner
 # ==============================================================================
+
+
+class PowerCutScheduler:
+    """Manages scheduling, execution tracking, and synchronization of power cuts."""
+
+    def __init__(self, delay: float, power_ctrl: PowerController, phase: str):
+        self.delay = delay
+        self.power_ctrl = power_ctrl
+        self.phase = phase
+        self.cut_executed = threading.Event()
+        self.cut_timestamp: Optional[str] = None
+        self.command_active = False
+        self.landed_while_active = False
+        self._timer: Optional[threading.Timer] = None
+
+    def start(self) -> None:
+        self.command_active = True
+        self.power_ctrl.notify_cut_scheduled(self.delay, self.phase)
+        self._timer = threading.Timer(self.delay, self._on_timer)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _on_timer(self) -> None:
+        self.cut_timestamp = datetime.datetime.now().isoformat()
+        self.landed_while_active = self.command_active
+        try:
+            self.power_ctrl.power_off()
+        finally:
+            self.cut_executed.set()
+
+    def mark_command_finished(self) -> None:
+        """Mark that the phase command completed."""
+        self.command_active = False
+
+    def wait_for_cut(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the scheduled power cut to finish executing before restoring power."""
+        if timeout is None:
+            timeout = self.delay + 10.0
+        return self.cut_executed.wait(timeout=timeout)
+
+    def cancel(self) -> None:
+        if self._timer:
+            self._timer.cancel()
 
 
 class PowerLossRunner:
@@ -559,6 +629,7 @@ class PowerLossRunner:
         if delay_ranges:
             self.delay_ranges.update(delay_ranges)
         self.verbose = verbose
+        self.is_mock_power = isinstance(self.power_ctrl, MockPowerController)
 
         # Validate cases
         for c in self.cases:
@@ -627,18 +698,74 @@ class PowerLossRunner:
         )
 
     def _verify_complete_image(self, running_slot: str) -> bool:
-        """Verify AC1: running slot holds a complete image with basic system services healthy."""
-        # Check systemd PID 1 is running and filesystem is mounted
-        res_pid1 = self.runner.run("kill -0 1", timeout=5.0)
-        if not res_pid1.ok:
+        """Verify AC1: running slot holds a complete image with basic system services healthy.
+
+        Checks:
+        1. systemd PID 1 is responsive.
+        2. Rootfs entry in 'mount' output is active, mounted read-only ('ro' in options),
+           and points to the partition matching the active running slot (SYS-04).
+        """
+        if running_slot not in ("root_a", "root_b"):
+            self._log(f"AC1 check failed: running slot '{running_slot}' invalid")
             return False
 
-        # Check rootfs mount is active and read-only
-        res_mount = self.runner.run("mount", timeout=5.0)
-        if not res_mount.ok:
+        # 1. Check systemd PID 1 is responsive
+        res_pid1 = self.runner.run("kill -0 1", timeout=5.0)
+        if not res_pid1.ok:
+            self._log("AC1 check failed: systemd PID 1 not responsive")
             return False
-        # Root partition for slot must be mounted read-only (SYS-04)
-        if running_slot not in ("root_a", "root_b"):
+
+        # 2. Check rootfs mount is active, points to running slot, and is mounted read-only (SYS-04)
+        res_mount = self.runner.run("mount", timeout=5.0)
+        if not res_mount.ok or not res_mount.stdout:
+            self._log("AC1 check failed: 'mount' command failed or empty output")
+            return False
+
+        root_line: Optional[str] = None
+        for line in res_mount.stdout.splitlines():
+            tokens = line.strip().split()
+            # Match: '<source> on / type <fstype> (<options>)'
+            if len(tokens) >= 3 and tokens[1] == "on" and tokens[2] == "/":
+                root_line = line.strip()
+                break
+
+        if not root_line:
+            self._log("AC1 check failed: no mount entry found for root filesystem ('/')")
+            return False
+
+        # Parse mount options in parentheses
+        open_paren = root_line.rfind("(")
+        close_paren = root_line.rfind(")")
+        if open_paren == -1 or close_paren == -1 or close_paren <= open_paren:
+            self._log(f"AC1 check failed: cannot parse options in root mount line: '{root_line}'")
+            return False
+
+        raw_opts = root_line[open_paren + 1 : close_paren]
+        options = [opt.strip() for opt in raw_opts.split(",") if opt.strip()]
+
+        # Must be read-only (ro)
+        if "ro" not in options:
+            self._log(f"AC1 check failed: rootfs not mounted read-only (options: {options})")
+            return False
+
+        # Verify source matches running slot (partition 5 for root_a, 6 for root_b)
+        source = root_line.split()[0]
+        expected_part = "p5" if running_slot == "root_a" else "p6"
+        expected_part_num = "5" if running_slot == "root_a" else "6"
+        expected_name = running_slot
+        expected_uuid_part = "4e58544d-05" if running_slot == "root_a" else "4e58544d-06"
+
+        source_matches = (
+            expected_part in source
+            or source.endswith(expected_part_num)
+            or expected_name in source
+            or expected_uuid_part in source
+            or source == "/dev/root"
+        )
+        if not source_matches:
+            self._log(
+                f"AC1 check failed: root device '{source}' does not match expected slot '{running_slot}'"
+            )
             return False
 
         return True
@@ -674,15 +801,8 @@ class PowerLossRunner:
 
         self._log(f"--- Starting {case.upper()} Trial {trial_idx}/{self.trials_per_case} (Delay: {delay}s) ---")
 
-        # Step 0: Ensure bench is reachable and read initial state
-        if not self.runner.check_reachability(timeout=5.0):
-            raise DeviceRecoveryError("Bench device is not reachable before trial start")
-
-        initial_slot, initial_version, initial_state = self.query_device_state()
-        if initial_slot not in ("root_a", "root_b"):
-            raise DeviceRecoveryError(f"Could not determine valid active slot from device (got '{initial_slot}')")
-        target_slot = opposite_slot(initial_slot)
-
+        initial_slot = "unknown"
+        target_slot = "unknown"
         power_cut_ts = ""
         power_cut_moment = ""
         recovery_time = 0.0
@@ -698,6 +818,15 @@ class PowerLossRunner:
         error_msg: Optional[str] = None
 
         try:
+            # Step 0: Ensure bench is reachable and read initial state (AC3 tracking)
+            if not self.runner.check_reachability(timeout=5.0):
+                raise DeviceRecoveryError("Bench device is not reachable before trial start")
+
+            initial_slot, initial_version, initial_state = self.query_device_state()
+            if initial_slot not in ("root_a", "root_b"):
+                raise DeviceRecoveryError(f"Could not determine valid active slot from device (got '{initial_slot}')")
+            target_slot = opposite_slot(initial_slot)
+
             # Dispatch to case-specific interruption sequence
             if case == "upload":
                 power_cut_ts, power_cut_moment = self._run_upload_cut(delay)
@@ -708,7 +837,7 @@ class PowerLossRunner:
             elif case == "commit":
                 power_cut_ts, power_cut_moment = self._run_commit_cut(delay, target_slot)
 
-            # Step: Restore power
+            # Step: Restore power (scheduled cut is guaranteed complete before this point)
             self._log(f"Restoring power via outlet (cycle delay {self.power_cycle_delay}s)...")
             time.sleep(self.power_cycle_delay)
             self.power_ctrl.power_on()
@@ -741,7 +870,7 @@ class PowerLossRunner:
         except Exception as exc:
             error_msg = str(exc)
             self._log(f"Trial failed: {error_msg}")
-            # If device never recovered, physical access might be required
+            # If device never recovered or was unreachable, physical access is required (AC3)
             if isinstance(exc, DeviceRecoveryError):
                 physical_needed = True
 
@@ -768,17 +897,10 @@ class PowerLossRunner:
             error_message=error_msg,
         )
 
-    def _schedule_cut(self, delay: float) -> threading.Timer:
-        """Schedule power off in a background thread timer."""
-        timer = threading.Timer(delay, self.power_ctrl.power_off)
-        timer.daemon = True
-        timer.start()
-        return timer
-
     def _run_upload_cut(self, delay: float) -> Tuple[str, str]:
         """Case 1: Cut power while update payload is streaming to staging buffer."""
         self._log(f"Starting upload stream; power cut scheduled in {delay}s...")
-        cut_timer = self._schedule_cut(delay)
+        scheduler = PowerCutScheduler(delay, self.power_ctrl, "upload")
         moment = f"upload stream at t={delay}s"
 
         upload_cmd = (
@@ -786,13 +908,28 @@ class PowerLossRunner:
             "cat > /data/update/staging.upload.swu && "
             "nx-sysd update stage --file /data/update/staging.upload.swu"
         )
-        # Stream upload (this is expected to terminate abruptly when power is cut)
-        ts = datetime.datetime.now().isoformat()
+        scheduler.start()
         try:
-            self.runner.stream_upload(self.swu_path, upload_cmd, timeout=30.0)
+            res = self.runner.stream_upload(self.swu_path, upload_cmd, timeout=30.0)
+            if res.ok:
+                scheduler.mark_command_finished()
         except Exception:
             pass
-        cut_timer.join(timeout=1.0)
+        finally:
+            scheduler.mark_command_finished()
+
+        # Wait until scheduled cut has actually executed (CQ-R1, CQ-R4)
+        if not scheduler.wait_for_cut(timeout=delay + 10.0):
+            scheduler.cancel()
+            raise PowerLossError(f"Power cut timer did not execute within {delay + 10.0}s")
+
+        if not scheduler.landed_while_active:
+            raise PowerLossError(
+                f"Upload stream finished before scheduled power cut at {delay}s; "
+                "cut did not land in upload phase"
+            )
+
+        ts = scheduler.cut_timestamp or datetime.datetime.now().isoformat()
         return ts, moment
 
     def _run_install_cut(self, delay: float, target_slot: str) -> Tuple[str, str]:
@@ -812,14 +949,31 @@ class PowerLossRunner:
             raise PowerLossError(f"Pre-install validate failed: {res_val.stderr}")
 
         self._log(f"Triggering install to {target_slot}; power cut scheduled in {delay}s...")
-        cut_timer = self._schedule_cut(delay)
+        scheduler = PowerCutScheduler(delay, self.power_ctrl, "install")
         moment = f"raw partition write to {target_slot} at t={delay}s"
-        ts = datetime.datetime.now().isoformat()
+
+        scheduler.start()
         try:
-            self.runner.run("nx-sysd update install", timeout=30.0)
+            res_install = self.runner.run("nx-sysd update install", timeout=30.0)
+            if res_install.ok:
+                scheduler.mark_command_finished()
         except Exception:
             pass
-        cut_timer.join(timeout=1.0)
+        finally:
+            scheduler.mark_command_finished()
+
+        # Wait until scheduled cut has actually executed
+        if not scheduler.wait_for_cut(timeout=delay + 10.0):
+            scheduler.cancel()
+            raise PowerLossError(f"Power cut timer did not execute within {delay + 10.0}s")
+
+        if not scheduler.landed_while_active:
+            raise PowerLossError(
+                f"Install partition write finished before scheduled power cut at {delay}s; "
+                "cut did not land in install phase"
+            )
+
+        ts = scheduler.cut_timestamp or datetime.datetime.now().isoformat()
         return ts, moment
 
     def _run_trial_cut(self, delay: float, target_slot: str) -> Tuple[str, str]:
@@ -830,20 +984,39 @@ class PowerLossRunner:
             "cat > /data/update/staging.upload.swu && "
             "nx-sysd update stage --file /data/update/staging.upload.swu"
         )
-        self.runner.stream_upload(self.swu_path, upload_cmd, timeout=30.0)
-        self.runner.run("nx-sysd update validate", timeout=15.0)
-        self.runner.run("nx-sysd update install", timeout=30.0)
+        res_up = self.runner.stream_upload(self.swu_path, upload_cmd, timeout=30.0)
+        if not res_up.ok:
+            raise PowerLossError(f"Pre-trial stage failed: {res_up.stderr}")
+        res_val = self.runner.run("nx-sysd update validate", timeout=15.0)
+        if not res_val.ok:
+            raise PowerLossError(f"Pre-trial validate failed: {res_val.stderr}")
+        res_inst = self.runner.run("nx-sysd update install", timeout=30.0)
+        if not res_inst.ok:
+            raise PowerLossError(f"Pre-trial install failed: {res_inst.stderr}")
 
         self._log(f"Arming trial boot; power cut scheduled in {delay}s during trial...")
-        cut_timer = self._schedule_cut(delay)
+        scheduler = PowerCutScheduler(delay, self.power_ctrl, "trial")
         moment = f"trial boot window for {target_slot} at t={delay}s"
-        ts = datetime.datetime.now().isoformat()
+
+        scheduler.start()
         try:
             trial_cmd = "nx-sysd update trial --remote-confirm && (nohup systemctl reboot >/dev/null 2>&1 &)"
-            self.runner.run(trial_cmd, timeout=15.0)
-        except Exception:
-            pass
-        cut_timer.join(timeout=1.0)
+            res_trial = self.runner.run(trial_cmd, timeout=15.0)
+            if not res_trial.ok:
+                scheduler.cancel()
+                raise PowerLossError(f"Arming trial boot failed: {res_trial.stderr}")
+        except Exception as exc:
+            if not isinstance(exc, PowerLossError):
+                scheduler.cancel()
+                raise PowerLossError(f"Failed to initiate trial boot: {exc}")
+            raise
+
+        # Wait until scheduled cut has actually executed
+        if not scheduler.wait_for_cut(timeout=delay + 10.0):
+            scheduler.cancel()
+            raise PowerLossError(f"Power cut timer did not execute within {delay + 10.0}s")
+
+        ts = scheduler.cut_timestamp or datetime.datetime.now().isoformat()
         return ts, moment
 
     def _run_commit_cut(self, delay: float, target_slot: str) -> Tuple[str, str]:
@@ -854,23 +1027,52 @@ class PowerLossRunner:
             "cat > /data/update/staging.upload.swu && "
             "nx-sysd update stage --file /data/update/staging.upload.swu"
         )
-        self.runner.stream_upload(self.swu_path, upload_cmd, timeout=30.0)
-        self.runner.run("nx-sysd update validate", timeout=15.0)
-        self.runner.run("nx-sysd update install", timeout=30.0)
-        self.runner.run("nx-sysd update trial --remote-confirm && (nohup systemctl reboot >/dev/null 2>&1 &)", timeout=15.0)
+        res_up = self.runner.stream_upload(self.swu_path, upload_cmd, timeout=30.0)
+        if not res_up.ok:
+            raise PowerLossError(f"Pre-commit stage failed: {res_up.stderr}")
+        res_val = self.runner.run("nx-sysd update validate", timeout=15.0)
+        if not res_val.ok:
+            raise PowerLossError(f"Pre-commit validate failed: {res_val.stderr}")
+        res_inst = self.runner.run("nx-sysd update install", timeout=30.0)
+        if not res_inst.ok:
+            raise PowerLossError(f"Pre-commit install failed: {res_inst.stderr}")
+
+        res_trial = self.runner.run(
+            "nx-sysd update trial --remote-confirm && (nohup systemctl reboot >/dev/null 2>&1 &)",
+            timeout=15.0,
+        )
+        if not res_trial.ok:
+            raise PowerLossError(f"Pre-commit trial arm failed: {res_trial.stderr}")
 
         # Wait for trial slot to boot
         self._wait_for_device_recovery()
 
         self._log(f"Executing commit; power cut scheduled in {delay}s at commit boundary...")
-        cut_timer = self._schedule_cut(delay)
+        scheduler = PowerCutScheduler(delay, self.power_ctrl, "commit")
         moment = f"commit selector write at t={delay}s"
-        ts = datetime.datetime.now().isoformat()
+
+        scheduler.start()
         try:
-            self.runner.run("nx-sysd update commit", timeout=15.0)
+            res_commit = self.runner.run("nx-sysd update commit", timeout=15.0)
+            if res_commit.ok:
+                scheduler.mark_command_finished()
         except Exception:
             pass
-        cut_timer.join(timeout=1.0)
+        finally:
+            scheduler.mark_command_finished()
+
+        # Wait until scheduled cut has actually executed
+        if not scheduler.wait_for_cut(timeout=delay + 10.0):
+            scheduler.cancel()
+            raise PowerLossError(f"Power cut timer did not execute within {delay + 10.0}s")
+
+        if not scheduler.landed_while_active:
+            raise PowerLossError(
+                f"Commit command completed before scheduled power cut at {delay}s; "
+                "cut did not land in commit phase"
+            )
+
+        ts = scheduler.cut_timestamp or datetime.datetime.now().isoformat()
         return ts, moment
 
     def _verify_ac2_state_consistency(
@@ -882,28 +1084,48 @@ class PowerLossRunner:
         device_state: str,
         status_dict: Dict[str, Any],
     ) -> Tuple[bool, str]:
-        """Verify AC2 consistency invariants for the given case."""
+        """Verify AC2 consistency invariants for the given case in accordance with ARCHITECTURE.md 3.6."""
+        default_slot = normalize_slot(status_dict.get("default_slot") or "unknown")
+
+        # In accordance with ARCHITECTURE.md section 3.6 and nx-protocol UpdateTransactionState:
+        # Valid state sequence: idle -> receiving -> staged -> validated -> installing -> installed -> trial -> committing -> committed, failed.
+
         # AC2 rule 1: Interrupted upload
         if case == "upload":
             if resulting_slot != initial_slot:
                 return False, f"Interrupted upload booted unexpected slot '{resulting_slot}' (expected '{initial_slot}')"
-            if device_state in ("installed", "trial", "committed"):
-                return False, f"Interrupted upload left bootable/installed state '{device_state}'"
-            return True, "Interrupted upload: running original slot, incomplete payload discarded/not bootable"
+            # Inactive slot must not be bootable: default boot selector must remain initial_slot
+            if default_slot != initial_slot:
+                return False, f"Interrupted upload changed default boot slot to '{default_slot}' (expected '{initial_slot}')"
+            # Inactive slot must not be installable or bootable:
+            # Metadata is invalidated; state must be idle or failed, never staged, validated, installing, installed, trial, or committed
+            if device_state in ("staged", "validated", "installing", "installed", "trial", "committing", "committed"):
+                return False, f"Interrupted upload left installable/bootable state '{device_state}' (expected 'idle' or 'failed')"
+            if status_dict.get("inactive_bootable") is True:
+                return False, "Interrupted upload reports inactive slot as bootable"
+            return True, "Interrupted upload: running original slot, default selector unchanged, incomplete payload not installable or bootable"
 
         # AC2 rule 2: Interrupted install
         if case == "install":
             if resulting_slot != initial_slot:
                 return False, f"Interrupted install booted unexpected slot '{resulting_slot}' (expected '{initial_slot}')"
-            if device_state in ("installed", "trial", "committed"):
-                return False, f"Interrupted install left bootable state '{device_state}'"
-            return True, "Interrupted install: running original slot, partial partition write not installable or bootable"
+            # Inactive slot must not be bootable: default boot selector must remain initial_slot
+            if default_slot != initial_slot:
+                return False, f"Interrupted install changed default boot slot to '{default_slot}' (expected '{initial_slot}')"
+            # Partial partition write must not be trial-bootable: state must be failed or idle, never installed, trial, or committed
+            if device_state in ("installed", "trial", "committing", "committed"):
+                return False, f"Interrupted install left trial-bootable state '{device_state}' (expected 'failed' or 'idle')"
+            if status_dict.get("inactive_bootable") is True:
+                return False, "Interrupted install reports inactive slot as bootable"
+            return True, "Interrupted install: running original slot, default selector unchanged, partial write not trial-bootable"
 
         # AC2 rule 3: Interrupted trial
         if case == "trial":
-            attempts = status_dict.get("trial_attempts") or 1
-            if attempts < 1:
-                return False, f"Interrupted trial did not consume attempt (attempts={attempts})"
+            attempts = status_dict.get("trial_attempts")
+            if attempts is None:
+                return False, "Interrupted trial status missing required 'trial_attempts' field"
+            if not isinstance(attempts, int) or attempts < 1:
+                return False, f"Interrupted trial did not consume attempt (trial_attempts={attempts})"
             # Interrupted trial must boot either original slot (if trial aborted) or target slot (if tryboot engaged)
             if resulting_slot not in (initial_slot, target_slot):
                 return False, f"Interrupted trial booted unknown slot '{resulting_slot}'"
@@ -965,6 +1187,7 @@ class PowerLossRunner:
             trials=all_trials,
             failing_step=failing_step,
             error_message=error_message,
+            is_mock_power=self.is_mock_power,
         )
 
 
@@ -1014,13 +1237,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--power-cmd",
         dest="power_cmd",
-        default="scripts/bench/power.sh",
-        help="Power command or template used to switch outlet (default: scripts/bench/power.sh)",
+        default=None,
+        help="Command template to switch power outlet ({action} placeholder replaced with 'off' or 'on'). Must be provided by user or bench setup (issue #31).",
     )
     parser.add_argument(
         "--mock-power",
         action="store_true",
-        help="Use in-memory simulated power controller instead of executing external command",
+        help="Use in-memory simulated power controller (marks report as NON-GATE / simulation)",
     )
     parser.add_argument(
         "--power-cycle-delay",
@@ -1103,6 +1326,13 @@ def parse_arguments(
     if args.trials_per_case < 1:
         sys.stderr.write(
             f"Error: --trials must be at least 1 (got {args.trials_per_case})\n"
+        )
+        sys.exit(2)
+
+    if not args.mock_power and not args.power_cmd:
+        sys.stderr.write(
+            "Error: Either --power-cmd <template> or --mock-power must be specified. "
+            "Remote power control depends on bench setup (issue #31).\n"
         )
         sys.exit(2)
 

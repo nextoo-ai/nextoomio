@@ -25,9 +25,9 @@ The automated tooling (`scripts/bench/power_loss.py`) orchestrates the power cut
 
 | Criterion | Requirement Summary | Implementation & Verification |
 | :--- | :--- | :--- |
-| **AC1** | Power removed through switched outlet during upload, inactive slot writing, trial boot, and commit; in every case device boots, is reachable, and runs a complete image. | `PowerLossRunner` triggers power cuts across all 4 phases via `PowerController`. Upon power restoration, verifies device boots within timeout (120s), answers SSH, runs systemd PID 1, and mounts rootfs read-only on the active slot. |
-| **AC2** | Update state read afterwards is consistent with running slot: interrupted upload/install is not installable or bootable, interrupted trial consumed its attempt, interrupted commit is completed or returned to previous slot, never undefined. | `_verify_ac2_state_consistency()` queries `nx-sysd update status --json` after reboot and checks state machine invariants: interrupted upload/install resets to `idle`/`failed` with inactive slot unbootable; interrupted trial increments `trial_attempts`; interrupted commit is atomically committed or rolled back, never undefined. |
-| **AC3** | Each case repeated at least ten times at varied moments; none needed physical access; any that did is recorded and blocks phase exit. | 10 repetitions per case (40 total) executed with seeded random delays generated via `random.Random(seed)` over phase-specific delay windows. Physical access count is tracked; any non-zero value marks the run as NON-GATE / FAILED. |
+| **AC1** | Power removed through switched outlet during upload, inactive slot writing, trial boot, and commit; in every case device boots, is reachable, and runs a complete image. | `PowerLossRunner` triggers power cuts across all 4 phases via `PowerController`. Upon power restoration, verifies device boots within timeout (120s), answers SSH, runs systemd PID 1 (`kill -0 1`), and parses `mount` output to confirm the rootfs is mounted read-only (`ro` in mount options) on the partition matching the active running slot (SYS-04). |
+| **AC2** | Update state read afterwards is consistent with running slot: interrupted upload/install is not installable or bootable, interrupted trial consumed its attempt, interrupted commit is completed or returned to previous slot, never undefined. | `_verify_ac2_state_consistency()` queries `nx-sysd update status --json` after reboot and checks state machine invariants against `ARCHITECTURE.md` section 3.6: interrupted upload/install resets to `idle`/`failed` with default boot slot unchanged and inactive slot unbootable/not installable; interrupted trial increments `trial_attempts >= 1`; interrupted commit is atomically committed or rolled back, never undefined. |
+| **AC3** | Each case repeated at least ten times at varied moments; none needed physical access; any that did is recorded and blocks phase exit. | 10 repetitions per case (40 total) executed with seeded random delays generated via `random.Random(seed)` over phase-specific delay windows. `PowerCutScheduler` ensures cuts finish executing before power restore and verifies cuts land while commands are in progress. Unreachability before trial start is recorded as a failed trial with `physical_access_needed = True`; any non-zero count or simulated power controller marks the run as NON-GATE. |
 | **AC4** | Given power loss in any case, when a new valid update is deployed afterwards, then it succeeds. | Following recovery and consistency verification in each trial, `_execute_subsequent_deploy()` deploys a valid `.swu` to completion with remote confirmation (`nx-sysd update confirm`), verifying active slot alternation and durable commit. |
 
 ---
@@ -94,7 +94,7 @@ In accordance with [ARCHITECTURE.md](../../ARCHITECTURE.md) section 3.6:
 Power-loss resilience tests are orchestrated via `scripts/bench/power_loss.py`.
 
 ```bash
-# Full 4-case resilience run (10 trials per case, 40 total) with mock power controller
+# Full 4-case resilience run (10 trials per case, 40 total) with simulated power controller (NON-GATE report)
 python3 scripts/bench/power_loss.py 192.168.1.50 \
   --swu build/nextoomio-image-raspberrypi4-64.swu \
   --mock-power \
@@ -102,10 +102,10 @@ python3 scripts/bench/power_loss.py 192.168.1.50 \
   --seed 42 \
   --report power-loss-report.md
 
-# Real bench hardware execution using external power command
+# Real bench hardware execution using external power command (user/bench setup supplies command, issue #31)
 python3 scripts/bench/power_loss.py 192.168.1.50 \
   --swu build/nextoomio-image-raspberrypi4-64.swu \
-  --power-cmd "scripts/bench/power.sh {action}" \
+  --power-cmd "shelly-plug --action {action}" \
   --power-cycle-delay 5.0 \
   --trials 10 \
   --seed 42 \
@@ -147,6 +147,6 @@ The seed (default: `42`) and each trial's exact delay value are recorded in the 
 
 In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1:
 1. **Zero Brick Guarantee:** Every power cut trial must recover automatically without requiring physical on-site intervention (e.g., reflashing SD card, serial console recovery). Any trial requiring physical access sets `physical_access_needed = True` and **blocks phase exit**.
-2. **AC1 Image Integrity:** Recovered slot must be running Linux kernel, systemd PID 1, and read-only rootfs mount.
+2. **AC1 Image Integrity:** Recovered slot must be running Linux kernel, systemd PID 1 (`kill -0 1`), and active slot rootfs mounted read-only (mount option `ro` and device partition matching active slot).
 3. **AC2 State Machine Integrity:** The updater state must never be undefined or contradictory.
 4. **AC4 Deployability:** The system must be fully receptive to a subsequent deployment following any power cut.
