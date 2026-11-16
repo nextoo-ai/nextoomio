@@ -256,8 +256,11 @@ def test_credential_redaction_cq_r6() -> None:
     """CQ-R6: Credentials and tokens never appear in stdout, stderr, or JSON reports."""
     print("Testing credential redaction in logs and reports (CQ-R6)...")
     secret_token = "ultra-secret-bearer-token-xyz"
-    secret_password = "super-secret-password-abc"
+    secret_password = "super@secret@password@abc"
+    query_token = "secret-query-token-123"
+    body_secret = "secret-in-error-body-456"
 
+    # 1. URL credentials with '@' and sensitive query parameter
     cfg = {
         "driver": "http",
         "host": f"http://admin:{secret_password}@outlet.local:8080",
@@ -266,7 +269,11 @@ def test_credential_redaction_cq_r6() -> None:
             "token": secret_token,
         },
         "actions": {
-            "on": {"method": "GET", "path": "/relay/0?turn=on"},
+            "on": {
+                "method": "GET",
+                "path": f"/relay/0?turn=on&token={query_token}&api_key=secret-api-key",
+                "success_pattern": r'"ison":\s*true',
+            },
             "off": {"method": "GET", "path": "/relay/0?turn=off"},
         },
     }
@@ -293,8 +300,37 @@ def test_credential_redaction_cq_r6() -> None:
 
         assert secret_token not in logged_text, "Secret token leaked in logged text!"
         assert secret_password not in logged_text, "Secret password leaked in logged text!"
+        assert query_token not in logged_text, "Query token leaked in logged text!"
+        assert "secret-api-key" not in logged_text, "Secret API key leaked in logged text!"
         assert secret_token not in json_report, "Secret token leaked in JSON report!"
         assert secret_password not in json_report, "Secret password leaked in JSON report!"
+        assert query_token not in json_report, "Query token leaked in JSON report!"
+
+    # 2. HTTPError response body redaction
+    def mock_http_err_with_secret(req: urllib.request.Request, timeout: float = 10.0):
+        fp = io.BytesIO(f'{{"error": "Unauthorized", "token": "{body_secret}"}}'.encode("utf-8"))
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, fp)
+
+    with mock.patch("urllib.request.urlopen", side_effect=mock_http_err_with_secret):
+        try:
+            power.execute_power_action(driver, "on", quiet=True)
+            assert False, "Expected HttpError"
+        except power.HttpError as exc:
+            assert body_secret not in exc.message, "Secret in error body leaked in HttpError message!"
+            assert body_secret not in str(exc), "Secret leaked in HttpError string representation!"
+
+    # 3. Success pattern mismatch body redaction
+    mismatch_secret = "secret-mismatch-token-789"
+    def mock_mismatch_body(req: urllib.request.Request, timeout: float = 10.0) -> DummyHttpResponse:
+        return DummyHttpResponse(200, f'{{"ison": false, "token": "{mismatch_secret}"}}'.encode("utf-8"))
+
+    with mock.patch("urllib.request.urlopen", side_effect=mock_mismatch_body):
+        try:
+            power.execute_power_action(driver, "on", quiet=True)
+            assert False, "Expected PowerError on pattern mismatch"
+        except power.PowerError as exc:
+            assert mismatch_secret not in exc.message, "Secret in mismatch body leaked in PowerError message!"
+            assert mismatch_secret not in str(exc), "Secret leaked in PowerError string representation!"
 
     print("  test_credential_redaction_cq_r6: PASSED")
 

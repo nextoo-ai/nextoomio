@@ -48,26 +48,29 @@ EXIT_NETWORK_ERROR = 2
 EXIT_HTTP_ERROR = 3
 EXIT_ACTION_FAILED = 4
 
-SENSITIVE_KEY_RE = re.compile(
-    r"(?:auth|token|secret|password|key|credential)", re.IGNORECASE
+SENSITIVE_PARAM_RE = re.compile(
+    r"(?i)(?<=[?&])(token|secret|password|passwd|api_key|key|auth|access_token)=([^&#\s]+)"
 )
-URL_CREDENTIALS_RE = re.compile(r"://([^:@]+):([^@]+)@")
+URL_CREDENTIALS_RE = re.compile(
+    r"://([^/:@]+):(.*?)@(?=[^/@:\s]+(?::\d+)?(?:/|$|\s))"
+)
+BEARER_AUTH_RE = re.compile(
+    r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*"
+)
+JSON_KEYVAL_RE = re.compile(
+    r"""(?i)["']?\b(token|secret|password|passwd|api_key|key|auth|access_token)["']?\s*[:=]\s*["']?([^"',\s}]+)["']?"""
+)
 
 
 def redact_text(text: str) -> str:
-    """Redact embedded username:password in URLs."""
-    return URL_CREDENTIALS_RE.sub(r"://\1:***@", text)
-
-
-def redact_headers(headers: Dict[str, str]) -> Dict[str, str]:
-    """Redact sensitive header values such as Authorization."""
-    redacted = {}
-    for key, value in headers.items():
-        if SENSITIVE_KEY_RE.search(key):
-            redacted[key] = "[REDACTED]"
-        else:
-            redacted[key] = value
-    return redacted
+    """Redact embedded credentials, tokens, query parameters, and secrets."""
+    if not text:
+        return text
+    t = URL_CREDENTIALS_RE.sub(r"://\1:***@", text)
+    t = SENSITIVE_PARAM_RE.sub(r"\1=***", t)
+    t = BEARER_AUTH_RE.sub(r"\1 ***", t)
+    t = JSON_KEYVAL_RE.sub(r'"\1": "***"', t)
+    return t
 
 
 class PowerError(Exception):
@@ -232,14 +235,16 @@ class HttpOutletDriver(OutletDriver):
                 return status, body, resp_headers
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="replace")
+            safe_err = redact_text(err_body[:200])
             raise HttpError(
-                f"Outlet returned HTTP error {exc.code} for action '{action_name}': {err_body[:200]}",
+                f"Outlet returned HTTP error {exc.code} for action '{action_name}': {safe_err}",
                 status_code=exc.code,
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", str(exc))
+            safe_reason = redact_text(str(reason))
             raise NetworkError(
-                f"Failed to reach outlet at '{self.safe_target}' for action '{action_name}': {reason}"
+                f"Failed to reach outlet at '{self.safe_target}' for action '{action_name}': {safe_reason}"
             ) from exc
 
     def turn_on(self) -> Tuple[bool, str, Optional[int]]:
@@ -250,7 +255,8 @@ class HttpOutletDriver(OutletDriver):
         body_text = body.decode("utf-8", errors="replace")
         success_pattern = act.get("success_pattern")
         if success_pattern and not re.search(success_pattern, body_text):
-            return False, f"Outlet response did not match expected success pattern: {body_text[:100]}", status
+            safe_body = redact_text(body_text[:100])
+            return False, f"Outlet response did not match expected success pattern: {safe_body}", status
         return True, f"Outlet turned ON (HTTP {status})", status
 
     def turn_off(self) -> Tuple[bool, str, Optional[int]]:
@@ -261,7 +267,8 @@ class HttpOutletDriver(OutletDriver):
         body_text = body.decode("utf-8", errors="replace")
         success_pattern = act.get("success_pattern")
         if success_pattern and not re.search(success_pattern, body_text):
-            return False, f"Outlet response did not match expected success pattern: {body_text[:100]}", status
+            safe_body = redact_text(body_text[:100])
+            return False, f"Outlet response did not match expected success pattern: {safe_body}", status
         return True, f"Outlet turned OFF (HTTP {status})", status
 
     def get_status(self) -> Tuple[bool, str, Optional[str]]:

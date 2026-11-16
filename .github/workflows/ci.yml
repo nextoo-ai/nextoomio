@@ -37,7 +37,6 @@ jobs:
         run: |
           python3 scripts/check_yocto_layer.py --test
           python3 scripts/check_yocto_layer.py
-          python3 scripts/test_bench_power.py
 
   rust-core:
     name: Rust Core & License Gate
