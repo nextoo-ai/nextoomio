@@ -36,4 +36,6 @@ build-webui:
 yocto-validate:
 	python3 scripts/check_yocto_layer.py --test
 	python3 scripts/check_yocto_layer.py
+	python3 scripts/test_tone_check.py
+	python3 scripts/test_data_partition.py
 	python3 scripts/test_bench_power.py

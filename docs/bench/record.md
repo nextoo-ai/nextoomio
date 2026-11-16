@@ -15,13 +15,13 @@ In accordance with acceptance criterion AC1 of issue #31, the table below lists 
 
 | Item | Component | Model | Revision / Rating | Interface / Connection | Status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | **Board** | *not yet recorded* (reference target: Raspberry Pi 4 Model B per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1) | *not yet recorded* | 40-pin GPIO header, Gigabit Ethernet | not yet recorded (pending physical hardware assembly) |
-| 2 | **Sound card** | *not yet recorded* (reference target: HiFiBerry Amp+ / `hifiberry-amp` per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1 and [ARCHITECTURE.md](../../ARCHITECTURE.md) section 5.3) | *not yet recorded* | 40-pin GPIO; DC power input | not yet recorded (pending physical hardware assembly) |
-| 3 | **Speaker** | *not yet recorded* (reference target: passive test speaker per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1 and [ROADMAP.md](../../ROADMAP.md) section 2.1) | *not yet recorded* | Speaker terminals on sound card | not yet recorded (pending physical hardware assembly) |
-| 4 | **Storage card** | *not yet recorded* (reference target: MicroSD card, minimum 16 GB per [ARCHITECTURE.md](../../ARCHITECTURE.md) section 3.6) | *not yet recorded* | MicroSD slot on board | not yet recorded (pending physical hardware assembly) |
-| 5 | **Power supply** | *not yet recorded* (reference target: dedicated DC bench supply per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1) | *not yet recorded* | DC power connection to sound card | not yet recorded (pending physical hardware assembly) |
-| 6 | **Network connection** | *not yet recorded* (reference target: wired Gigabit Ethernet `eth0` per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1) | *not yet recorded* | Ethernet cable to local network | not yet recorded (pending physical hardware assembly) |
-| 7 | **Switched outlet** | *not yet recorded* (reference target: smart outlet controlled via `scripts/bench/power.sh` per [ROADMAP.md](../../ROADMAP.md) section 2.1) | *not yet recorded* | AC mains outlet to bench power supply | not yet recorded (pending physical hardware assembly) |
+| 1 | **Board** | *not yet recorded* (reference target: Raspberry Pi 4 Model B per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1) | *not yet recorded* | not yet recorded | not yet recorded (pending physical hardware assembly) |
+| 2 | **Sound card** | *not yet recorded* (reference target: HiFiBerry Amp+ / `hifiberry-amp` per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1 and [ARCHITECTURE.md](../../ARCHITECTURE.md) section 5.3) | *not yet recorded* | not yet recorded | not yet recorded (pending physical hardware assembly) |
+| 3 | **Speaker** | *not yet recorded* (reference target: passive speaker per [ROADMAP.md](../../ROADMAP.md) section 2.1) | *not yet recorded* | not yet recorded | not yet recorded (pending physical hardware assembly) |
+| 4 | **Storage card** | *not yet recorded* (reference target: MicroSD card, minimum 16 GB per [ARCHITECTURE.md](../../ARCHITECTURE.md) section 3.6) | *not yet recorded* | not yet recorded | not yet recorded (pending physical hardware assembly) |
+| 5 | **Power supply** | *not yet recorded* (reference target: amplifier supply powering the board through the sound card per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1) | *not yet recorded* | not yet recorded | not yet recorded (pending physical hardware assembly) |
+| 6 | **Network connection** | *not yet recorded* (reference target: wired Ethernet per [ROADMAP.md](../../ROADMAP.md) section 2.1) | *not yet recorded* | not yet recorded | not yet recorded (pending physical hardware assembly) |
+| 7 | **Switched outlet** | *not yet recorded* (reference target: smart outlet controlled via `scripts/bench/power.sh` per [ROADMAP.md](../../ROADMAP.md) section 2.1) | *not yet recorded* | not yet recorded | not yet recorded (pending physical hardware assembly) |
 
 ---
 
@@ -35,7 +35,7 @@ In accordance with acceptance criterion AC1 of issue #31, the table below lists 
 - **Board Revision:** *not yet recorded*
 - **Board Serial:** *not yet recorded*
 - **Effective OTP Revision:** *not yet recorded*
-- **MAC Address (`eth0`):** *not yet recorded*
+- **MAC Address:** *not yet recorded*
 - **Bootloader:** *not yet recorded* (Raspberry Pi EEPROM firmware with `tryboot` A/B selection support per [ARCHITECTURE.md](../../ARCHITECTURE.md) section 3.6)
 
 ### 2.2 Sound Card (HiFiBerry Amp+)
@@ -49,10 +49,10 @@ In accordance with acceptance criterion AC1 of issue #31, the table below lists 
 
 ### 2.3 Passive Speaker
 
-- **Model:** *not yet recorded* (reference target: passive test speaker per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1 and [ROADMAP.md](../../ROADMAP.md) section 2.1)
+- **Model:** *not yet recorded* (reference target: passive speaker per [ROADMAP.md](../../ROADMAP.md) section 2.1)
 - **Impedance:** *not yet recorded*
 - **Power Handling:** *not yet recorded*
-- **Connection:** *not yet recorded* (reference target: wired directly to speaker terminals on the sound card)
+- **Connection:** *not yet recorded*
 
 ### 2.4 Storage Card
 
@@ -75,12 +75,12 @@ In accordance with acceptance criterion AC1 of issue #31, the table below lists 
 
 - **Model:** *not yet recorded*
 - **Input Voltage:** *not yet recorded*
-- **Output Voltage & Current:** *not yet recorded* (reference target: dedicated DC supply powering the board through the sound card per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1 and [ARCHITECTURE.md](../../ARCHITECTURE.md) section 5.3)
+- **Output Voltage & Current:** *not yet recorded* (reference target: amplifier supply powering the board through the sound card per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1 and [ARCHITECTURE.md](../../ARCHITECTURE.md) section 5.3)
 - **Connector:** *not yet recorded*
 
 ### 2.6 Network Connection
 
-- **Interface:** *not yet recorded* (reference target: built-in wired Gigabit Ethernet controller `eth0` per [SPECIFICATION.md](../../SPECIFICATION.md) section 2.1)
+- **Interface:** *not yet recorded* (reference target: wired Ethernet per [ROADMAP.md](../../ROADMAP.md) section 2.1)
 - **Cabling:** *not yet recorded*
 - **IP Configuration:** *not yet recorded* (reference target: Ethernet/DHCP per [ARCHITECTURE.md](../../ARCHITECTURE.md) section 5.2)
 - **Remote Access:** *not yet recorded* (reference target: key-only OpenSSH server active when key file is present on partition 1 per [ROADMAP.md](../../ROADMAP.md) section 2.1 and decision AD-23 in [ARCHITECTURE.md](../../ARCHITECTURE.md) section 2 and section 4.1)
@@ -103,20 +103,20 @@ In accordance with acceptance criterion AC1 of issue #31, the table below lists 
 [ Switched Outlet (Smart Plug / PDU) ]  <─── Control: scripts/bench/power.sh (via HTTP)
           │ (AC Power)
           ▼
-[ Dedicated DC Bench Power Supply ]
+[ Power Supply ]
           │ (DC Power Connection)
           ▼
 ┌─────────────────────────────────────────────────────────┐
 │ HiFiBerry Amp+ Sound Card                                │
 │   - DC Power Input                                      │
 │   - Amplifier Stage                                     │
-│   - Speaker Terminals ────► [ Passive Test Speaker ]    │
+│   - Speaker Connection ───► [ Passive Speaker ]         │
 └──────────────────────────┬──────────────────────────────┘
-                           │ (40-pin GPIO bus: audio & power)
+                           │ (interface: not yet recorded)
                            ▼
 ┌─────────────────────────────────────────────────────────┐
 │ Raspberry Pi 4 Model B                                  │
-│   - Wired Ethernet (eth0) ──► [ Local Bench Network ]   │
+│   - Wired Ethernet ────────► [ Local Bench Network ]    │
 │   - MicroSD Card ──────────► [ Storage Card (A/B) ]     │
 └─────────────────────────────────────────────────────────┘
 ```
