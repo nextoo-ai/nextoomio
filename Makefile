@@ -1,8 +1,8 @@
-.PHONY: all check check-docs check-doc-versions check-evidence check-i18n check-core test-core build-webui yocto-validate
+.PHONY: all check check-docs check-doc-versions check-evidence check-i18n check-bench check-core test-core build-webui yocto-validate
 
 all: check
 
-check: check-docs check-doc-versions check-evidence check-i18n yocto-validate
+check: check-docs check-doc-versions check-evidence check-i18n check-bench yocto-validate
 
 check-docs:
 	python3 scripts/check_traceability.py
@@ -16,6 +16,9 @@ check-evidence:
 
 check-i18n:
 	node scripts/check_i18n.mjs
+
+check-bench:
+	python3 scripts/test_bench_power.py
 
 check-core:
 	cargo check --locked --manifest-path core/Cargo.toml --all-targets
