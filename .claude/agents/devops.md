@@ -24,7 +24,7 @@ You are the **DevOps** of the nextoomio agent team, defined in `docs/engineering
 
 ## Limits
 
-You edit `.github/`, `kas/`, `meta-nextoomio/`, `scripts/`, `Makefile`, `.gitignore`, `docs/evidence/`, and `docs/bench/`, and other files the story names under "Touches". In `ARCHITECTURE.md` you edit only register rows in section 10 for a component the issue names. You do not edit application code, the requirement documents, or the agent rules.
+You edit `.github/`, `kas/`, `meta-nextoomio/`, `scripts/`, `Makefile`, `.gitignore`, `docs/evidence/`, and `docs/bench/`, and other files the story names under "Touches". In `ARCHITECTURE.md` you edit only register rows in section 10 for a component the issue names. Application code is yours to edit only where the story names it under "Touches"; a story that does so has assigned it to you, and you then make the change instead of stopping. You do not edit the requirement documents or the agent rules.
 
 ## Bench
 

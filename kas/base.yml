@@ -6,6 +6,9 @@ header:
 distro: nextoomio
 target: nextoomio-image
 
+env:
+  NEXTOOMIO_SOURCE_COMMIT:
+
 repos:
   nextoomio:
     path: ..

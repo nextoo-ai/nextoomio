@@ -86,10 +86,12 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
         root / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
         root / "meta-nextoomio/recipes-core/base-files/files/fstab",
+        root / "meta-nextoomio/classes/nextoomio-image-version.bbclass",
         root / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
         root / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
         root / "meta-nextoomio/recipes-core/systemd/systemd-conf_%.bbappend",
         root / "meta-nextoomio/recipes-core/systemd/files/10-nextoomio-journald.conf",
+        root / "meta-nextoomio/recipes-nextoomio/nx-sysd/files/nextoomio-device-id.service",
         root / "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend",
         root / "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio",
         root / "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset",
@@ -278,10 +280,16 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "selector partition must hold only the boot-selection file (D-005)"
             )
 
-        m_incompat = re.search(r'^\s*INCOMPATIBLE_LICENSE\s*=\s*["\']([^"\']*)["\']', conf_text, re.MULTILINE)
+        if re.search(r'^\s*INCOMPATIBLE_LICENSE(?:[:_][\w${}+-]+)*\s*(?:[?+: .]*=)', conf_text, re.MULTILINE):
+            errors.append("meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must not be set in the distro configuration (D-069)")
+
+    image_license_bb = root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+    if image_license_bb.is_file():
+        img_license_text = image_license_bb.read_text(encoding="utf-8")
+        m_incompat = re.search(r'^\s*INCOMPATIBLE_LICENSE\s*=\s*["\']([^"\']*)["\']', img_license_text, re.MULTILINE)
         if not m_incompat:
             errors.append(
-                "meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must be configured "
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: INCOMPATIBLE_LICENSE must be configured "
                 "with hard assignment '=' to reject unaccepted licenses (AC4)"
             )
         else:
@@ -290,7 +298,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             missing_licenses = required_licenses - set(incompat_val)
             if missing_licenses:
                 errors.append(
-                    f"meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must include "
+                    f"meta-nextoomio/recipes-core/images/nextoomio-image.bb: INCOMPATIBLE_LICENSE must include "
                     f"AGPL licenses {sorted(required_licenses)} (missing: {sorted(missing_licenses)}) (AC4)"
                 )
 
@@ -492,6 +500,51 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         ts_text = ts_preset.read_text(encoding="utf-8")
         if "disable systemd-time-wait-sync.service" not in ts_text:
             errors.append("systemd preset must disable systemd-time-wait-sync.service (AD-21, AC5)")
+
+    # P0-F2.3: Validate device identity, image version release metadata, and persistent device ID
+    distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
+    if distro_conf.is_file():
+        dist_text = distro_conf.read_text(encoding="utf-8")
+        if "NEXTOOMIO_SOURCE_COMMIT" not in dist_text:
+            errors.append("nextoomio.conf must define NEXTOOMIO_SOURCE_COMMIT baseline (AC1, AC4, P0-F2.3)")
+        if re.search(r"^\s*def\s+", dist_text, re.MULTILINE):
+            errors.append("nextoomio.conf must not define Python functions (BitBake .conf parse error; CQ-R1)")
+
+    image_version_class = root / "meta-nextoomio/classes/nextoomio-image-version.bbclass"
+    if image_version_class.is_file():
+        iv_text = image_version_class.read_text(encoding="utf-8")
+        if "IMAGE_PREPROCESS_COMMAND" not in iv_text or "nextoomio-release" not in iv_text:
+            errors.append("nextoomio-image-version.bbclass must write /etc/nextoomio-release via IMAGE_PREPROCESS_COMMAND")
+        if "nextoomio_derive_source_commit" not in iv_text or "NEXTOOMIO_SOURCE_COMMIT" not in iv_text:
+            errors.append("nextoomio-image-version.bbclass must derive NEXTOOMIO_SOURCE_COMMIT at build time (AC1, AC4, P0-F2.3)")
+
+    image_bb = root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+    if image_bb.is_file():
+        img_text = image_bb.read_text(encoding="utf-8")
+        if "nextoomio-image-version" not in img_text:
+            errors.append("nextoomio-image.bb must inherit nextoomio-image-version (AC1, AC4)")
+
+    devid_service = root / "meta-nextoomio/recipes-nextoomio/nx-sysd/files/nextoomio-device-id.service"
+    if devid_service.is_file():
+        svc_text = devid_service.read_text(encoding="utf-8")
+        if "ExecStart=/usr/bin/nx-sysd init-device-id" not in svc_text:
+            errors.append("nextoomio-device-id.service must execute '/usr/bin/nx-sysd init-device-id' (AC3)")
+        if "Requires=data.mount" not in svc_text or "After=data.mount" not in svc_text:
+            errors.append("nextoomio-device-id.service must depend on data.mount (AC3)")
+        if "RequiresMountsFor=/data" not in svc_text:
+            errors.append("nextoomio-device-id.service must specify RequiresMountsFor=/data (AC3)")
+
+    nx_sysd_bb = root / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb"
+    if nx_sysd_bb.is_file():
+        sysd_text = nx_sysd_bb.read_text(encoding="utf-8")
+        if "nextoomio-device-id.service" not in sysd_text:
+            errors.append("nx-sysd_0.0.1.bb must package nextoomio-device-id.service (AC3)")
+
+    base_files_append = root / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend"
+    if base_files_append.is_file():
+        bf_text = base_files_append.read_text(encoding="utf-8")
+        if "/data" not in bf_text:
+            errors.append("base-files_%.bbappend must include /data mount point directory (SYS-04, AC3)")
 
     # D-007 / P0-F3.2 AC4: Image SSH server configuration, single image baseline, and removal of package manager/debug tooling
     if image_bb.is_file():
@@ -1626,18 +1679,21 @@ def run_self_tests() -> int:
         image_bb.write_text(orig_image_bb, encoding="utf-8")
         print("  test_check_fails_when_image_rootfs_maxsize_invalid: OK")
 
-        # 50. AC4: Fail when INCOMPATIBLE_LICENSE is missing, weakly assigned, or omits AGPL
+        # D-069: the gate belongs to the image, and must reject all listed AGPL variants.
+        image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_image_bb = image_bb.read_text(encoding="utf-8")
+        image_bb.write_text(re.sub(r"^\s*INCOMPATIBLE_LICENSE\b[^\n]*\n", "", orig_image_bb, flags=re.MULTILINE), encoding="utf-8")
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in validate_layer(tmp_root))
+        image_bb.write_text(re.sub(r"INCOMPATIBLE_LICENSE\s*=", "INCOMPATIBLE_LICENSE ?=", orig_image_bb), encoding="utf-8")
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in validate_layer(tmp_root))
+        image_bb.write_text(re.sub(r'INCOMPATIBLE_LICENSE\s*=\s*"[^"]*"', 'INCOMPATIBLE_LICENSE = "GPL-3.0"', orig_image_bb), encoding="utf-8")
+        assert any("INCOMPATIBLE_LICENSE must include AGPL licenses" in e for e in validate_layer(tmp_root))
+        image_bb.write_text(orig_image_bb, encoding="utf-8")
         distro_conf = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
         orig_distro_conf = distro_conf.read_text(encoding="utf-8")
-        distro_conf.write_text(re.sub(r"^\s*INCOMPATIBLE_LICENSE\b[^\n]*\n", "", orig_distro_conf, flags=re.MULTILINE), encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected license gate error: {errs}"
-        distro_conf.write_text(re.sub(r"INCOMPATIBLE_LICENSE\s*=", "INCOMPATIBLE_LICENSE ?=", orig_distro_conf), encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected weak assignment failure: {errs}"
-        distro_conf.write_text(re.sub(r'INCOMPATIBLE_LICENSE\s*=\s*"[^"]*"', 'INCOMPATIBLE_LICENSE = "GPL-3.0"', orig_distro_conf), encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("INCOMPATIBLE_LICENSE must include AGPL licenses" in e for e in errs), f"Expected missing AGPL license failure: {errs}"
+        for assignment in ('INCOMPATIBLE_LICENSE = "AGPL-3.0-only"', 'INCOMPATIBLE_LICENSE:append = " AGPL-3.0-only"'):
+            distro_conf.write_text(orig_distro_conf + "\n" + assignment + "\n", encoding="utf-8")
+            assert any("INCOMPATIBLE_LICENSE must not be set" in e for e in validate_layer(tmp_root))
         distro_conf.write_text(orig_distro_conf, encoding="utf-8")
         print("  test_check_fails_when_incompatible_license_invalid: OK")
 

@@ -5,15 +5,13 @@
 
 pub mod cpio;
 pub mod engine;
+pub mod identity;
 pub mod journal;
 pub mod sha256;
 pub mod sw_description;
 pub mod system;
 
-pub use engine::{
-    UpdateEngine, UpdateEngineError, UpdateStatus, DEFAULT_HARDWARE_MODEL,
-    DEFAULT_STAGING_RESERVATION,
-};
+pub use engine::{UpdateEngine, UpdateEngineError, UpdateStatus, DEFAULT_STAGING_RESERVATION};
 pub use journal::{
     FileJournalStorage, JournalController, JournalRecord, JournalStorage, MemoryJournalStorage,
     ReconcileOutcome,
@@ -1659,8 +1657,15 @@ software =
         init.checksum = init.compute_checksum();
         journal.write_record(0, &init).unwrap();
 
-        let mut engine =
-            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+        let mut engine = UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some("test-hardware".into()),
+            None,
+            Some(capacity),
+        )
+        .unwrap();
 
         // AC1: When a trial is requested, attempt number is stored durably before reboot,
         // device boots target slot once, and previous slot remains default.
@@ -1708,8 +1713,15 @@ software =
         init.checksum = init.compute_checksum();
         journal.write_record(0, &init).unwrap();
 
-        let mut engine =
-            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+        let mut engine = UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some("test-hardware".into()),
+            None,
+            Some(capacity),
+        )
+        .unwrap();
 
         let err = engine.request_trial(false).unwrap_err();
         match err {
@@ -1823,8 +1835,15 @@ software =
         init.checksum = init.compute_checksum();
         journal.write_record(0, &init).unwrap();
 
-        let mut engine =
-            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+        let mut engine = UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some("test-hardware".into()),
+            None,
+            Some(capacity),
+        )
+        .unwrap();
 
         let err = engine.run_trial_watchdog(120, 50).unwrap_err();
         assert_eq!(err, UpdateEngineError::TrialDeadlineExceeded);
@@ -1858,8 +1877,15 @@ software =
         init.checksum = init.compute_checksum();
         journal.write_record(0, &init).unwrap();
 
-        let mut engine =
-            UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+        let mut engine = UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some("test-hardware".into()),
+            None,
+            Some(capacity),
+        )
+        .unwrap();
 
         // Spawn background thread to simulate another process committing the transaction after 60ms
         let update_dir_clone = update_dir.clone();
@@ -1910,7 +1936,7 @@ software =
             backend1,
             storage.clone(),
             journal1,
-            None,
+            Some("test-hardware".into()),
             None,
             Some(capacity),
         )
@@ -1932,8 +1958,15 @@ software =
         // Boot previous slot (Slot A) again after attempt 2 failure
         let mut backend2 = MockSlotBackend::new(Slot::A, Slot::A);
         backend2.trial_armed = Some(Slot::B); // Previously armed
-        let mut engine2 =
-            UpdateEngine::new(backend2, storage, journal2, None, None, Some(capacity)).unwrap();
+        let mut engine2 = UpdateEngine::new(
+            backend2,
+            storage,
+            journal2,
+            Some("test-hardware".into()),
+            None,
+            Some(capacity),
+        )
+        .unwrap();
 
         let outcome2 = engine2.reconcile_boot().unwrap();
         assert_eq!(outcome2, ReconcileOutcome::TrialExhausted);
@@ -1972,8 +2005,15 @@ software =
             let backend = MockSlotBackend::new(Slot::A, Slot::A);
             let storage = FileStagingStorage::new(&update_dir, capacity);
             let journal = FileJournalStorage::new(&update_dir);
-            let mut engine =
-                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("test-hardware".into()),
+                None,
+                Some(capacity),
+            )
+            .unwrap();
 
             // Setup installed record
             engine
@@ -1997,8 +2037,15 @@ software =
             let backend = MockSlotBackend::new(Slot::A, Slot::A);
             let storage = FileStagingStorage::new(&update_dir, capacity);
             let journal = FileJournalStorage::new(&update_dir);
-            let engine =
-                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+            let engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("test-hardware".into()),
+                None,
+                Some(capacity),
+            )
+            .unwrap();
 
             assert_eq!(engine.status().consumed_attempts, 1);
             assert_eq!(engine.status().state, UpdateTransactionState::Trial);
@@ -2009,8 +2056,15 @@ software =
             let backend = MockSlotBackend::new(Slot::A, Slot::A);
             let storage = FileStagingStorage::new(&update_dir, capacity);
             let journal = FileJournalStorage::new(&update_dir);
-            let mut engine =
-                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+            let mut engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("test-hardware".into()),
+                None,
+                Some(capacity),
+            )
+            .unwrap();
 
             let outcome = engine.reconcile_boot().unwrap();
             assert_eq!(outcome, ReconcileOutcome::SecondTrialRequested);
@@ -2022,8 +2076,15 @@ software =
             let backend = MockSlotBackend::new(Slot::A, Slot::A);
             let storage = FileStagingStorage::new(&update_dir, capacity);
             let journal = FileJournalStorage::new(&update_dir);
-            let engine =
-                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+            let engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("test-hardware".into()),
+                None,
+                Some(capacity),
+            )
+            .unwrap();
 
             // Consumed attempts must still be 2, never lower
             assert_eq!(engine.status().consumed_attempts, 2);
@@ -2036,8 +2097,15 @@ software =
             let backend = MockSlotBackend::new(Slot::A, Slot::A);
             let storage = FileStagingStorage::new(&update_dir, capacity);
             let journal = FileJournalStorage::new(&update_dir);
-            let engine =
-                UpdateEngine::new(backend, storage, journal, None, None, Some(capacity)).unwrap();
+            let engine = UpdateEngine::new(
+                backend,
+                storage,
+                journal,
+                Some("test-hardware".into()),
+                None,
+                Some(capacity),
+            )
+            .unwrap();
 
             // Engine loads intact journal.1; consumed attempts remains 2, never lower (AC5)
             assert_eq!(engine.status().consumed_attempts, 2);
@@ -2067,7 +2135,7 @@ software =
             backend1,
             storage.clone(),
             journal1,
-            None,
+            Some("test-hardware".into()),
             None,
             Some(capacity),
         )
@@ -2099,7 +2167,7 @@ software =
             backend2,
             storage.clone(),
             journal2,
-            None,
+            Some("test-hardware".into()),
             None,
             Some(capacity),
         )
@@ -2128,7 +2196,7 @@ software =
             backend3,
             storage.clone(),
             journal3,
-            None,
+            Some("test-hardware".into()),
             None,
             Some(capacity),
         )
@@ -2163,7 +2231,7 @@ software =
             backend4.clone(),
             file_storage,
             file_journal,
-            None,
+            Some("test-hardware".into()),
             None,
             Some(capacity),
         ) {
