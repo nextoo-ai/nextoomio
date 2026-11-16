@@ -20,24 +20,35 @@ S = "${WORKDIR}/sources"
 UNPACKDIR = "${S}"
 
 do_compile() {
-    # Derive boot include from selected hardware profile (D-011, ARCHITECTURE.md section 3.8)
+    # Derive boot include from selected hardware profile (D-011, ARCHITECTURE.md section 3.8, CQ-R1)
     if [ -n "${NEXTOOMIO_AUDIO_PROFILE}" ] && [ -f "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" ]; then
-        OVERLAY=$(grep -o '"dtoverlay"[^,]*' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | sed -e 's/"dtoverlay"[[:space:]]*:[[:space:]]*"//' -e 's/"//' | tr -d '[:space:]')
-        PARAMS=$(grep -A 5 '"dtoverlay_params"' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | grep '"' | sed -e 's/.*"\(.*\)".*/\1/' | tr '\n' ',' | sed 's/,$//')
-        ALSA_CARD_ID=$(grep -o '"alsa_card_id"[^,]*' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | sed -e 's/"alsa_card_id"[[:space:]]*:[[:space:]]*"//' -e 's/"//' | tr -cd 'a-zA-Z0-9_-')
+        python3 -c '
+import json
+import sys
 
-        echo "# nextoomio sound card hardware overlay include (ARCHITECTURE.md section 3.8, D-011)" > "${B}/nextoomio-hardware.txt"
-        echo "# Derived from hardware profile: ${NEXTOOMIO_AUDIO_PROFILE}" >> "${B}/nextoomio-hardware.txt"
-        if [ -n "$ALSA_CARD_ID" ]; then
-            echo "# Expected ALSA card ID: ${ALSA_CARD_ID}" >> "${B}/nextoomio-hardware.txt"
-        fi
-        if [ -n "$OVERLAY" ]; then
-            if [ -n "$PARAMS" ]; then
-                echo "dtoverlay=${OVERLAY},${PARAMS}" >> "${B}/nextoomio-hardware.txt"
-            else
-                echo "dtoverlay=${OVERLAY}" >> "${B}/nextoomio-hardware.txt"
-            fi
-        fi
+profile_path = sys.argv[1]
+profile_id = sys.argv[2]
+out_path = sys.argv[3]
+
+with open(profile_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+overlay = data.get("dtoverlay") or ""
+raw_params = data.get("dtoverlay_params") or []
+params = [str(p).strip() for p in raw_params if str(p).strip()]
+card_id = data.get("alsa_card_id") or ""
+
+with open(out_path, "w", encoding="utf-8") as out:
+    out.write("# nextoomio sound card hardware overlay include (ARCHITECTURE.md section 3.8, D-011)\n")
+    out.write("# Derived from hardware profile: %s\n" % profile_id)
+    if card_id:
+        out.write("# Expected ALSA card ID: %s\n" % card_id)
+    if overlay:
+        if params:
+            out.write("dtoverlay=%s,%s\n" % (overlay, ",".join(params)))
+        else:
+            out.write("dtoverlay=%s\n" % overlay)
+' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" "${NEXTOOMIO_AUDIO_PROFILE}" "${B}/nextoomio-hardware.txt"
     else
         echo "# No audio hardware profile configured" > "${B}/nextoomio-hardware.txt"
     fi

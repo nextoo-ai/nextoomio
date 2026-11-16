@@ -186,9 +186,6 @@ if [ -n "$MIXER_CONTROL" ] && [ "$MIXER_CONTROL" != "none" ]; then
        amixer -c "$CARD_NAME" set "$MIXER_CONTROL" "${FIXED_LEVEL}%" unmute >/dev/null 2>&1 || \
        amixer -c "$CARD_INDEX" sset "$MIXER_CONTROL" "${FIXED_LEVEL}%" unmute >/dev/null 2>&1 || \
        amixer -c "$CARD_INDEX" set "$MIXER_CONTROL" "${FIXED_LEVEL}%" unmute >/dev/null 2>&1; then
-        if command -v alsactl >/dev/null 2>&1; then
-            alsactl store "$CARD_NAME" >/dev/null 2>&1 || alsactl store "$CARD_INDEX" >/dev/null 2>&1 || alsactl store >/dev/null 2>&1 || true
-        fi
         write_diagnostics_configured "$PROFILE_ID" "$CARD_NAME" "$MIXER_CONTROL" "$FIXED_LEVEL" "configured"
         echo "nextoomio-audio-profile: Initialized sound card '${CARD_NAME}' mixer '${MIXER_CONTROL}' to fixed ${FIXED_LEVEL}%."
         exit 0

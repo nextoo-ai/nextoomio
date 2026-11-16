@@ -11,10 +11,42 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def derive_hardware_boot_include_from_recipe(
+    recipe_path: pathlib.Path,
+    profile_path: pathlib.Path,
+    profile_id: str,
+) -> tuple[str, str | None]:
+    """Execute recipe do_compile derivation logic against profile_path and return (generated_include, error)."""
+    recipe_text = recipe_path.read_text(encoding="utf-8")
+    m = re.search(r"do_compile\s*\(\)\s*\{(.*?)\n\}", recipe_text, re.DOTALL)
+    if not m:
+        return "", "do_compile function not found in recipe"
+
+    compile_body = m.group(1)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_p = pathlib.Path(tmp_dir)
+        script = f"""
+        S="{profile_path.parent}"
+        B="{tmp_p}"
+        NEXTOOMIO_AUDIO_PROFILE="{profile_id}"
+        {compile_body}
+        """
+        proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+        if proc.returncode != 0:
+            return "", f"do_compile execution failed (exit code {proc.returncode}): {proc.stderr.strip()}"
+
+        out_file = tmp_p / "nextoomio-hardware.txt"
+        if not out_file.is_file():
+            return "", "do_compile did not generate nextoomio-hardware.txt"
+
+        return out_file.read_text(encoding="utf-8"), None
 
 
 def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
@@ -535,6 +567,34 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("nextoomio-audio-profile_0.0.1.bb must install hardware-profile.json to /etc/nextoomio/ (D-011)")
         if "SYSTEMD_SERVICE:${PN}" not in ap_text or "nextoomio-audio-profile.service" not in ap_text:
             errors.append("nextoomio-audio-profile_0.0.1.bb must declare SYSTEMD_SERVICE:${PN} = 'nextoomio-audio-profile.service'")
+        if "grep -A" in ap_text:
+            errors.append(
+                "nextoomio-audio-profile_0.0.1.bb: must not use 'grep -A' to parse JSON profile; "
+                "use python3 -c / json (CQ-R1, CQ-R2)"
+            )
+        if "python3" not in ap_text or "json" not in ap_text:
+            errors.append(
+                "nextoomio-audio-profile_0.0.1.bb: do_compile must use python3 and json to parse hardware profile (CQ-R1)"
+            )
+
+        # CQ-R1 / CQ-R2 / CQ-R4 / CQ-M7: Test actual derivation of nextoomio-hardware.txt from reference profile
+        if profile_path.is_file():
+            include_text, err = derive_hardware_boot_include_from_recipe(ap_bb, profile_path, "hifiberry-amp")
+            if err:
+                errors.append(f"nextoomio-audio-profile_0.0.1.bb: failed to derive boot include: {err}")
+            else:
+                overlay_lines = [line.strip() for line in include_text.splitlines() if line.strip().startswith("dtoverlay=")]
+                if not overlay_lines:
+                    errors.append(
+                        "nextoomio-audio-profile_0.0.1.bb: derived nextoomio-hardware.txt missing 'dtoverlay=' entry"
+                    )
+                else:
+                    for ol in overlay_lines:
+                        if ol != "dtoverlay=hifiberry-amp":
+                            errors.append(
+                                f"nextoomio-audio-profile_0.0.1.bb: derived invalid overlay line '{ol}'; "
+                                f"expected 'dtoverlay=hifiberry-amp' for hifiberry-amp profile (CQ-R1, CQ-R2)"
+                            )
 
     ap_service = root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile.service"
     if ap_service.is_file():
@@ -773,6 +833,28 @@ def run_self_tests() -> int:
         assert any("must address sound card explicitly via 'amixer -c'" in e for e in errs), f"Expected amixer -c failure: {errs}"
         ap_sh_path.write_text(orig_ap_sh, encoding="utf-8")
         print("  test_check_fails_when_audio_setup_omits_card_flag: OK")
+
+        # 17. CQ-R1 / CQ-R2 / CQ-R4 / CQ-M7: Fail when do_compile generates invalid dtoverlay line (e.g. grep -A bug)
+        ap_bb_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb"
+        orig_ap_bb = ap_bb_path.read_text(encoding="utf-8")
+        bad_do_compile = '''do_compile() {
+    if [ -n "${NEXTOOMIO_AUDIO_PROFILE}" ] && [ -f "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" ]; then
+        OVERLAY=$(grep -o '"dtoverlay"[^,]*' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | sed -e 's/"dtoverlay"[[:space:]]*:[[:space:]]*"//' -e 's/"//' | tr -d '[:space:]')
+        PARAMS=$(grep -A 5 '"dtoverlay_params"' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | grep '"' | sed -e 's/.*"\\(.*\\)".*/\\1/' | tr '\\n' ',' | sed 's/,$//')
+        if [ -n "$PARAMS" ]; then
+            echo "dtoverlay=${OVERLAY},${PARAMS}" > "${B}/nextoomio-hardware.txt"
+        else
+            echo "dtoverlay=${OVERLAY}" > "${B}/nextoomio-hardware.txt"
+        fi
+    fi
+}'''
+        m_dc = re.search(r"do_compile\s*\(\)\s*\{.*?\n\}", orig_ap_bb, re.DOTALL)
+        assert m_dc, "do_compile pattern not found in test"
+        ap_bb_path.write_text(orig_ap_bb[:m_dc.start()] + bad_do_compile + orig_ap_bb[m_dc.end():], encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("derived invalid overlay line" in e or "must not use 'grep -A'" in e for e in errs), f"Expected derivation failure: {errs}"
+        ap_bb_path.write_text(orig_ap_bb, encoding="utf-8")
+        print("  test_check_fails_when_do_compile_derives_invalid_overlay: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0
