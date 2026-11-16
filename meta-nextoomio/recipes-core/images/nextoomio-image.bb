@@ -40,4 +40,5 @@ IMAGE_INSTALL:append = " \
     openssh-keygen \
     nextoomio-ssh-keys \
     nextoomio-audio-profile \
+    nextoomio-tone-check \
 "

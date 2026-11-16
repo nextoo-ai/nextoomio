@@ -25,12 +25,14 @@ on:
     paths:
       - 'kas/**'
       - 'meta-nextoomio/**'
+      - 'core/**'
       - '.github/workflows/yocto-build.yml'
   push:
     branches: [main]
     paths:
       - 'kas/**'
       - 'meta-nextoomio/**'
+      - 'core/**'
       - '.github/workflows/yocto-build.yml'
 
 concurrency:
