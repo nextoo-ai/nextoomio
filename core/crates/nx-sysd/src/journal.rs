@@ -348,9 +348,12 @@ impl<S: JournalStorage> JournalController<S> {
         Ok(rec)
     }
 
-    /// Reconciles state after reboot: if upload was interrupted while receiving, marks failed (AC4).
+    /// Reconciles state after reboot: if upload was interrupted while receiving (AC4)
+    /// or install was interrupted while installing (AC5), marks transaction failed.
     pub fn reconcile_boot(&mut self) -> Result<(), String> {
-        if self.latest_record.state == UpdateTransactionState::Receiving {
+        if self.latest_record.state == UpdateTransactionState::Receiving
+            || self.latest_record.state == UpdateTransactionState::Installing
+        {
             self.commit_state(
                 UpdateTransactionState::Failed,
                 None,

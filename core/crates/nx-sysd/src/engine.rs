@@ -8,7 +8,7 @@ use crate::cpio::{
 use crate::journal::{JournalController, JournalStorage};
 use crate::sha256::Sha256;
 use crate::sw_description::parse_sw_description;
-use crate::system::{SlotBackend, StagingError, StagingStorage};
+use crate::system::{PartitionType, Slot, SlotBackend, StagingError, StagingStorage};
 use nx_protocol::{ErrorCode, UpdateTransactionState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -273,7 +273,383 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
                 to: UpdateTransactionState::Installing,
             });
         }
-        // In Phase 0 story #19, install execution is out of scope (P0-F4.4 / #20).
+        Ok(())
+    }
+
+    /// Installs a validated update image into the inactive system slot (AC1..AC5, SYS-05, UPD-05).
+    ///
+    /// 1. Verifies state is Validated (AC3) and not busy (AC5).
+    /// 2. Commits 'installing' state to the durable journal (AC5, AR-01).
+    /// 3. Computes active slot partition checksums before writing (AC1).
+    /// 4. Streams boot and root artifacts from staged container into ONLY the inactive slot partitions (AC1).
+    /// 5. Flushes and syncs partition writes.
+    /// 6. Verifies active slot partition checksums are identical before and after (AC1).
+    /// 7. Reads back inactive partitions and verifies written artifact SHA-256 checksums (AC2).
+    /// 8. Copies running sound-card selection (nextoomio-hardware.txt) into the newly written boot slot (AC4).
+    /// 9. Commits 'installed' state only upon complete verification (AC2).
+    /// 10. Resets staging payload metadata while retaining preallocated extents (AC6).
+    pub fn install(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
+        self.begin_install()?;
+
+        let (tx_id, payload_len, payload_sha) = {
+            let curr = self.journal.current();
+            (
+                curr.tx_id.clone(),
+                curr.payload_len,
+                curr.payload_sha256.clone(),
+            )
+        };
+
+        let active_slot = self
+            .backend
+            .get_active_slot()
+            .map_err(UpdateEngineError::Storage)?;
+        let target_slot = active_slot.inactive();
+
+        // 1. Commit state: Installing (AC5, AR-01, section 3.6 step 3)
+        // If interrupted by power loss or reboot during install, reconcile_boot transitions to Failed.
+        self.journal
+            .commit_state(
+                UpdateTransactionState::Installing,
+                tx_id.clone(),
+                Some(target_slot.name().to_string()),
+                payload_len,
+                payload_sha.clone(),
+                None,
+            )
+            .map_err(UpdateEngineError::Storage)?;
+
+        if let Err(e) =
+            self.execute_install(active_slot, target_slot, &tx_id, payload_len, &payload_sha)
+        {
+            let _ = self.fail_install(&e);
+            return Err(e);
+        }
+
+        Ok(self.status())
+    }
+
+    fn execute_install(
+        &mut self,
+        active_slot: Slot,
+        target_slot: Slot,
+        tx_id: &Option<String>,
+        payload_len: u64,
+        payload_sha: &Option<String>,
+    ) -> Result<(), UpdateEngineError> {
+        // Step 1: Pre-install active slot partition checksums (AC1)
+        let active_boot_before = self
+            .backend
+            .checksum_partition(active_slot, PartitionType::Boot)
+            .map_err(UpdateEngineError::Storage)?;
+        let active_root_before = self
+            .backend
+            .checksum_partition(active_slot, PartitionType::Root)
+            .map_err(UpdateEngineError::Storage)?;
+
+        // Step 2: Open staged payload reader and parse sw-description
+        let mut reader = self
+            .storage
+            .open_payload_reader()
+            .map_err(UpdateEngineError::Storage)?;
+
+        let first_header = match read_next_cpio_header(&mut reader) {
+            Ok(Some(h)) => h,
+            Ok(None) | Err(CpioError::Truncated) => {
+                return Err(UpdateEngineError::Truncated(
+                    "CPIO stream ended prematurely".to_string(),
+                ));
+            }
+            Err(e) => return Err(UpdateEngineError::InvalidFormat(e.to_string())),
+        };
+
+        if first_header.name != "sw-description" {
+            return Err(UpdateEngineError::InvalidFormat(format!(
+                "first entry must be 'sw-description', found '{}'",
+                first_header.name
+            )));
+        }
+
+        let desc_bytes = read_entry_bytes(&mut reader, first_header.filesize, 10 * 1024 * 1024)
+            .map_err(|e| UpdateEngineError::InvalidFormat(e.to_string()))?;
+        let desc_text = std::str::from_utf8(&desc_bytes).map_err(|_| {
+            UpdateEngineError::InvalidFormat("sw-description is not valid UTF-8".to_string())
+        })?;
+        let sw_desc = parse_sw_description(desc_text).map_err(|e| {
+            UpdateEngineError::InvalidFormat(format!("malformed sw-description: {e}"))
+        })?;
+
+        let target_boot_device = target_slot.boot_device();
+        let target_root_device = target_slot.root_device();
+
+        let boot_img_decl = sw_desc
+            .images
+            .iter()
+            .find(|img| {
+                img.device == target_boot_device
+                    || img.device.ends_with(target_boot_device)
+                    || (img.device.is_empty() && img.filename.to_lowercase().contains("boot"))
+                    || img
+                        .filename
+                        .to_lowercase()
+                        .contains(&format!("{}_boot", target_slot.name()))
+            })
+            .or_else(|| {
+                sw_desc
+                    .images
+                    .iter()
+                    .find(|img| img.filename.to_lowercase().contains("boot"))
+            })
+            .cloned();
+
+        let root_img_decl = sw_desc
+            .images
+            .iter()
+            .find(|img| {
+                img.device == target_root_device
+                    || img.device.ends_with(target_root_device)
+                    || (img.device.is_empty() && img.filename.to_lowercase().contains("root"))
+                    || img
+                        .filename
+                        .to_lowercase()
+                        .contains(&format!("{}_root", target_slot.name()))
+            })
+            .or_else(|| {
+                sw_desc
+                    .images
+                    .iter()
+                    .find(|img| img.filename.to_lowercase().contains("root"))
+            })
+            .cloned();
+
+        let boot_decl = boot_img_decl.ok_or_else(|| {
+            UpdateEngineError::InvalidFormat(format!(
+                "missing boot artifact declaration for target slot '{target_slot}' in sw-description"
+            ))
+        })?;
+        let root_decl = root_img_decl.ok_or_else(|| {
+            UpdateEngineError::InvalidFormat(format!(
+                "missing root artifact declaration for target slot '{target_slot}' in sw-description"
+            ))
+        })?;
+
+        // Step 3: Stream entries and write ONLY inactive slot partitions (AC1)
+        let mut wrote_boot = false;
+        let mut wrote_root = false;
+        let mut boot_artifact_size = 0u64;
+        let mut root_artifact_size = 0u64;
+
+        loop {
+            let header = match read_next_cpio_header(&mut reader) {
+                Ok(Some(h)) => h,
+                Ok(None) => break,
+                Err(CpioError::Truncated) => {
+                    return Err(UpdateEngineError::Truncated(
+                        "CPIO stream ended prematurely during install".to_string(),
+                    ));
+                }
+                Err(e) => return Err(UpdateEngineError::InvalidFormat(e.to_string())),
+            };
+
+            if header.name == boot_decl.filename && !wrote_boot {
+                struct BoundedReader<'a, R: Read> {
+                    inner: &'a mut R,
+                    remaining: u64,
+                }
+                impl<'a, R: Read> Read for BoundedReader<'a, R> {
+                    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                        if self.remaining == 0 {
+                            return Ok(0);
+                        }
+                        let to_read = (self.remaining as usize).min(buf.len());
+                        let n = self.inner.read(&mut buf[..to_read])?;
+                        self.remaining -= n as u64;
+                        Ok(n)
+                    }
+                }
+
+                let mut entry_reader = BoundedReader {
+                    inner: &mut reader,
+                    remaining: header.filesize,
+                };
+
+                self.backend
+                    .write_partition(
+                        target_slot,
+                        PartitionType::Boot,
+                        &mut entry_reader,
+                        header.filesize,
+                    )
+                    .map_err(UpdateEngineError::Storage)?;
+
+                boot_artifact_size = header.filesize;
+                wrote_boot = true;
+
+                let pad = (4 - (header.filesize % 4)) % 4;
+                if pad > 0 {
+                    let mut p = [0u8; 4];
+                    let _ = reader.read_exact(&mut p[..pad as usize]);
+                }
+            } else if header.name == root_decl.filename && !wrote_root {
+                struct BoundedReader<'a, R: Read> {
+                    inner: &'a mut R,
+                    remaining: u64,
+                }
+                impl<'a, R: Read> Read for BoundedReader<'a, R> {
+                    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                        if self.remaining == 0 {
+                            return Ok(0);
+                        }
+                        let to_read = (self.remaining as usize).min(buf.len());
+                        let n = self.inner.read(&mut buf[..to_read])?;
+                        self.remaining -= n as u64;
+                        Ok(n)
+                    }
+                }
+
+                let mut entry_reader = BoundedReader {
+                    inner: &mut reader,
+                    remaining: header.filesize,
+                };
+
+                self.backend
+                    .write_partition(
+                        target_slot,
+                        PartitionType::Root,
+                        &mut entry_reader,
+                        header.filesize,
+                    )
+                    .map_err(UpdateEngineError::Storage)?;
+
+                root_artifact_size = header.filesize;
+                wrote_root = true;
+
+                let pad = (4 - (header.filesize % 4)) % 4;
+                if pad > 0 {
+                    let mut p = [0u8; 4];
+                    let _ = reader.read_exact(&mut p[..pad as usize]);
+                }
+            } else {
+                skip_entry_data(&mut reader, header.filesize)
+                    .map_err(|e| UpdateEngineError::InvalidFormat(e.to_string()))?;
+            }
+        }
+
+        if !wrote_boot || !wrote_root {
+            return Err(UpdateEngineError::InvalidFormat(
+                "declared boot or root artifact missing from container".to_string(),
+            ));
+        }
+
+        // Flush all writes before verification (ARCHITECTURE.md section 3.6 step 3)
+        self.backend
+            .sync_partitions()
+            .map_err(UpdateEngineError::Storage)?;
+
+        // Step 4: Verify active slot checksums are identical before and after (AC1)
+        let active_boot_after = self
+            .backend
+            .checksum_partition(active_slot, PartitionType::Boot)
+            .map_err(UpdateEngineError::Storage)?;
+        let active_root_after = self
+            .backend
+            .checksum_partition(active_slot, PartitionType::Root)
+            .map_err(UpdateEngineError::Storage)?;
+
+        if active_boot_before != active_boot_after || active_root_before != active_root_after {
+            return Err(UpdateEngineError::Storage(
+                "active slot partition checksum changed during installation".to_string(),
+            ));
+        }
+
+        // Step 5: Read back written artifacts from inactive slot and compare checksums (AC2)
+        let boot_readback_sha256 = self
+            .backend
+            .read_partition_checksum(target_slot, PartitionType::Boot, boot_artifact_size)
+            .map_err(UpdateEngineError::Storage)?;
+
+        if boot_readback_sha256.to_lowercase() != boot_decl.sha256.to_lowercase() {
+            return Err(UpdateEngineError::CorruptedArtifact {
+                file: boot_decl.filename.clone(),
+                expected: boot_decl.sha256.clone(),
+                actual: boot_readback_sha256,
+            });
+        }
+
+        let root_readback_sha256 = self
+            .backend
+            .read_partition_checksum(target_slot, PartitionType::Root, root_artifact_size)
+            .map_err(UpdateEngineError::Storage)?;
+
+        if root_readback_sha256.to_lowercase() != root_decl.sha256.to_lowercase() {
+            return Err(UpdateEngineError::CorruptedArtifact {
+                file: root_decl.filename.clone(),
+                expected: root_decl.sha256.clone(),
+                actual: root_readback_sha256,
+            });
+        }
+
+        // Step 6: Copy sound-card selection of running slot into newly written boot slot (AC4)
+        if let Some(sound_card_cfg) = self
+            .backend
+            .get_active_sound_card_selection()
+            .map_err(UpdateEngineError::Storage)?
+        {
+            self.backend
+                .set_sound_card_selection(target_slot, &sound_card_cfg)
+                .map_err(UpdateEngineError::Storage)?;
+
+            self.backend
+                .sync_partitions()
+                .map_err(UpdateEngineError::Storage)?;
+
+            let written_cfg = self
+                .backend
+                .get_sound_card_selection(target_slot)
+                .map_err(UpdateEngineError::Storage)?;
+
+            if written_cfg.as_deref() != Some(sound_card_cfg.as_str()) {
+                return Err(UpdateEngineError::Storage(
+                    "sound-card selection verification failed on newly written boot slot"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Step 7: Persist 'installed' state (AC2)
+        self.journal
+            .commit_state(
+                UpdateTransactionState::Installed,
+                tx_id.clone(),
+                Some(target_slot.name().to_string()),
+                payload_len,
+                payload_sha.clone(),
+                None,
+            )
+            .map_err(UpdateEngineError::Storage)?;
+
+        // Cleanup staging payload metadata while retaining reservation (AC6, AR-08)
+        let _ = self.storage.cleanup();
+
+        Ok(())
+    }
+
+    fn fail_install(&mut self, error: &UpdateEngineError) -> Result<(), UpdateEngineError> {
+        let code = error.error_code_str().to_string();
+        let payload_len = self.journal.current().payload_len;
+
+        self.journal
+            .commit_state(
+                UpdateTransactionState::Failed,
+                None,
+                None,
+                payload_len,
+                None,
+                Some(code),
+            )
+            .map_err(UpdateEngineError::Storage)?;
+
+        let _ = self.storage.cleanup();
         Ok(())
     }
 

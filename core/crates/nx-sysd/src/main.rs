@@ -21,6 +21,7 @@ fn print_usage() {
         nx-sysd update init-staging [--dir <path>] [--capacity <bytes>]\n  \
         nx-sysd update stage --file <path> [--declared-length <bytes>] [--dir <path>]\n  \
         nx-sysd update validate [--dir <path>] [--hardware <id>] [--schema <n>]\n  \
+        nx-sysd update install [--dir <path>] [--hardware <id>] [--schema <n>] [--capacity <bytes>]\n  \
         nx-sysd update status [--dir <path>] [--json]\n  \
         nx-sysd update abort [--dir <path>]\n"
     );
@@ -250,6 +251,33 @@ fn handle_update(args: &[String]) -> ExitCode {
                 }
                 Err(err) => {
                     eprintln!("Validation failed: {err}");
+                    let mut status = engine.status();
+                    status.error_code = Some(err.error_code_str().to_string());
+                    status.message = Some(err.to_string());
+                    let _ = serde_json::to_string_pretty(&status).map(|j| eprintln!("{j}"));
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "install" => {
+            let mut engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+
+            match engine.install() {
+                Ok(status) => {
+                    match serde_json::to_string_pretty(&status) {
+                        Ok(j) => println!("{j}"),
+                        Err(e) => eprintln!("Serialization error: {e}"),
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Install failed: {err}");
                     let mut status = engine.status();
                     status.error_code = Some(err.error_code_str().to_string());
                     status.message = Some(err.to_string());

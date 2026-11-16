@@ -9,11 +9,28 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// System boot slot identity (Slot A or Slot B) per ARCHITECTURE.md section 3.6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Slot {
     A,
     B,
+}
+
+/// Partition type within a system slot (boot or root) per ARCHITECTURE.md section 3.6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionType {
+    Boot,
+    Root,
+}
+
+impl PartitionType {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Boot => "boot",
+            Self::Root => "root",
+        }
+    }
 }
 
 impl Slot {
@@ -35,6 +52,15 @@ impl Slot {
         match self {
             Self::A => "/dev/mmcblk0p5",
             Self::B => "/dev/mmcblk0p6",
+        }
+    }
+
+    pub const fn partition_device(self, part: PartitionType) -> &'static str {
+        match (self, part) {
+            (Self::A, PartitionType::Boot) => "/dev/mmcblk0p2",
+            (Self::A, PartitionType::Root) => "/dev/mmcblk0p5",
+            (Self::B, PartitionType::Boot) => "/dev/mmcblk0p3",
+            (Self::B, PartitionType::Root) => "/dev/mmcblk0p6",
         }
     }
 
@@ -67,13 +93,45 @@ impl fmt::Display for Slot {
     }
 }
 
-/// Abstract slot interface for inspecting active and default boot slots (AC2, AC3).
+/// Abstract slot interface for inspecting slots, writing partitions, and hardware includes (AC1..AC4).
 pub trait SlotBackend: Send + Sync {
     /// Returns the currently running system slot.
     fn get_active_slot(&self) -> Result<Slot, String>;
 
     /// Returns the currently configured default boot slot.
     fn get_default_slot(&self) -> Result<Slot, String>;
+
+    /// Computes the SHA-256 checksum of an entire partition's current contents (AC1).
+    fn checksum_partition(&self, slot: Slot, partition: PartitionType) -> Result<String, String>;
+
+    /// Streams artifact bytes into the target partition (AC1, SYS-05, UPD-05).
+    fn write_partition<R: Read>(
+        &mut self,
+        slot: Slot,
+        partition: PartitionType,
+        reader: R,
+        size: u64,
+    ) -> Result<(), String>;
+
+    /// Reads back data up to `length` bytes from the slot partition and computes SHA-256 (AC2).
+    fn read_partition_checksum(
+        &self,
+        slot: Slot,
+        partition: PartitionType,
+        length: u64,
+    ) -> Result<String, String>;
+
+    /// Retrieves the sound-card selection (nextoomio-hardware.txt) from the running boot slot (AC4).
+    fn get_active_sound_card_selection(&self) -> Result<Option<String>, String>;
+
+    /// Retrieves the sound-card selection (nextoomio-hardware.txt) from the specified slot (AC4).
+    fn get_sound_card_selection(&self, slot: Slot) -> Result<Option<String>, String>;
+
+    /// Writes the sound-card selection (nextoomio-hardware.txt) to the inactive boot slot (AC4).
+    fn set_sound_card_selection(&mut self, slot: Slot, content: &str) -> Result<(), String>;
+
+    /// Flushes and syncs all partition writes to persistent storage (ARCHITECTURE.md section 3.6).
+    fn sync_partitions(&mut self) -> Result<(), String>;
 }
 
 /// Mock slot backend for unit tests.
@@ -81,13 +139,33 @@ pub trait SlotBackend: Send + Sync {
 pub struct MockSlotBackend {
     pub active_slot: Slot,
     pub default_slot: Slot,
+    pub partitions: std::collections::HashMap<(Slot, PartitionType), Vec<u8>>,
+    pub sound_card_selections: std::collections::HashMap<Slot, Option<String>>,
+    pub written_partitions: Vec<(Slot, PartitionType)>,
+    pub corrupt_readback: bool,
+    pub write_active_slot_glitch: bool,
 }
 
 impl MockSlotBackend {
     pub fn new(active: Slot, default: Slot) -> Self {
+        let mut partitions = std::collections::HashMap::new();
+        partitions.insert((Slot::A, PartitionType::Boot), vec![0x11; 1024]);
+        partitions.insert((Slot::A, PartitionType::Root), vec![0x22; 4096]);
+        partitions.insert((Slot::B, PartitionType::Boot), vec![0x33; 1024]);
+        partitions.insert((Slot::B, PartitionType::Root), vec![0x44; 4096]);
+
+        let mut sound_card_selections = std::collections::HashMap::new();
+        sound_card_selections.insert(Slot::A, Some("dtoverlay=hifiberry-amp\n".to_string()));
+        sound_card_selections.insert(Slot::B, None);
+
         Self {
             active_slot: active,
             default_slot: default,
+            partitions,
+            sound_card_selections,
+            written_partitions: Vec::new(),
+            corrupt_readback: false,
+            write_active_slot_glitch: false,
         }
     }
 }
@@ -100,11 +178,102 @@ impl SlotBackend for MockSlotBackend {
     fn get_default_slot(&self) -> Result<Slot, String> {
         Ok(self.default_slot)
     }
+
+    fn checksum_partition(&self, slot: Slot, partition: PartitionType) -> Result<String, String> {
+        let data = self
+            .partitions
+            .get(&(slot, partition))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        Ok(crate::sha256::Sha256::hex(data))
+    }
+
+    fn write_partition<R: Read>(
+        &mut self,
+        slot: Slot,
+        partition: PartitionType,
+        mut reader: R,
+        size: u64,
+    ) -> Result<(), String> {
+        self.written_partitions.push((slot, partition));
+        let mut buf = vec![0u8; size as usize];
+        reader.read_exact(&mut buf).map_err(|e| {
+            format!("cannot read payload for partition {slot:?}/{partition:?}: {e}")
+        })?;
+        self.partitions.insert((slot, partition), buf);
+
+        if self.write_active_slot_glitch && slot == self.active_slot.inactive() {
+            // Simulate a forbidden write leak into the active slot
+            if let Some(active_root) = self
+                .partitions
+                .get_mut(&(self.active_slot, PartitionType::Root))
+            {
+                active_root.push(0xFF);
+            }
+        }
+        Ok(())
+    }
+
+    fn read_partition_checksum(
+        &self,
+        slot: Slot,
+        partition: PartitionType,
+        length: u64,
+    ) -> Result<String, String> {
+        if self.corrupt_readback {
+            return Ok(crate::sha256::Sha256::hex(b"corrupted_readback_data"));
+        }
+        let data = self
+            .partitions
+            .get(&(slot, partition))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let read_len = (length as usize).min(data.len());
+        Ok(crate::sha256::Sha256::hex(&data[..read_len]))
+    }
+
+    fn get_active_sound_card_selection(&self) -> Result<Option<String>, String> {
+        Ok(self
+            .sound_card_selections
+            .get(&self.active_slot)
+            .cloned()
+            .flatten())
+    }
+
+    fn get_sound_card_selection(&self, slot: Slot) -> Result<Option<String>, String> {
+        Ok(self.sound_card_selections.get(&slot).cloned().flatten())
+    }
+
+    fn set_sound_card_selection(&mut self, slot: Slot, content: &str) -> Result<(), String> {
+        self.sound_card_selections
+            .insert(slot, Some(content.to_string()));
+        Ok(())
+    }
+
+    fn sync_partitions(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
-/// Physical slot backend reading from Linux kernel cmdline and mount tables.
+/// Physical slot backend reading from Linux kernel cmdline, mount tables, and block devices.
 #[derive(Debug, Clone, Default)]
 pub struct PhysicalSlotBackend;
+
+impl PhysicalSlotBackend {
+    fn get_device_path(&self, slot: Slot, partition: PartitionType) -> PathBuf {
+        let env_var = match (slot, partition) {
+            (Slot::A, PartitionType::Boot) => "NEXTOOMIO_SLOT_A_BOOT",
+            (Slot::A, PartitionType::Root) => "NEXTOOMIO_SLOT_A_ROOT",
+            (Slot::B, PartitionType::Boot) => "NEXTOOMIO_SLOT_B_BOOT",
+            (Slot::B, PartitionType::Root) => "NEXTOOMIO_SLOT_B_ROOT",
+        };
+        if let Ok(val) = std::env::var(env_var) {
+            PathBuf::from(val)
+        } else {
+            PathBuf::from(slot.partition_device(partition))
+        }
+    }
+}
 
 impl SlotBackend for PhysicalSlotBackend {
     fn get_active_slot(&self) -> Result<Slot, String> {
@@ -166,6 +335,181 @@ impl SlotBackend for PhysicalSlotBackend {
             }
         }
         self.get_active_slot()
+    }
+
+    fn checksum_partition(&self, slot: Slot, partition: PartitionType) -> Result<String, String> {
+        let path = self.get_device_path(slot, partition);
+        if !path.exists() {
+            return Err(format!(
+                "partition device {} does not exist",
+                path.display()
+            ));
+        }
+        let mut file =
+            File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let mut hasher = crate::sha256::Sha256::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .map_err(|e| format!("read error on {}: {e}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher.hex_digest())
+    }
+
+    fn write_partition<R: Read>(
+        &mut self,
+        slot: Slot,
+        partition: PartitionType,
+        mut reader: R,
+        size: u64,
+    ) -> Result<(), String> {
+        let path = self.get_device_path(slot, partition);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("cannot open partition {}: {e}", path.display()))?;
+
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek error on {}: {e}", path.display()))?;
+
+        let mut remaining = size;
+        let mut buf = [0u8; 65536];
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            let n = reader
+                .read(&mut buf[..to_read])
+                .map_err(|e| format!("stream read error: {e}"))?;
+            if n == 0 {
+                return Err(format!(
+                    "unexpected EOF while writing partition {}: {remaining} bytes remaining",
+                    path.display()
+                ));
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("write error on {}: {e}", path.display()))?;
+            remaining -= n as u64;
+        }
+
+        file.sync_all()
+            .map_err(|e| format!("sync error on {}: {e}", path.display()))?;
+        Ok(())
+    }
+
+    fn read_partition_checksum(
+        &self,
+        slot: Slot,
+        partition: PartitionType,
+        length: u64,
+    ) -> Result<String, String> {
+        let path = self.get_device_path(slot, partition);
+        let mut file =
+            File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek error on {}: {e}", path.display()))?;
+
+        let mut hasher = crate::sha256::Sha256::new();
+        let mut remaining = length;
+        let mut buf = [0u8; 65536];
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            let n = file
+                .read(&mut buf[..to_read])
+                .map_err(|e| format!("read error on {}: {e}", path.display()))?;
+            if n == 0 {
+                return Err(format!(
+                    "unexpected EOF while reading back partition {}: {remaining} bytes remaining",
+                    path.display()
+                ));
+            }
+            hasher.update(&buf[..n]);
+            remaining -= n as u64;
+        }
+
+        Ok(hasher.hex_digest())
+    }
+
+    fn get_active_sound_card_selection(&self) -> Result<Option<String>, String> {
+        let boot_dir = std::env::var("NEXTOOMIO_ACTIVE_BOOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/boot"));
+        let hw_file = boot_dir.join("nextoomio-hardware.txt");
+        if hw_file.exists() {
+            fs::read_to_string(&hw_file)
+                .map(Some)
+                .map_err(|e| format!("cannot read {}: {e}", hw_file.display()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_sound_card_selection(&self, slot: Slot) -> Result<Option<String>, String> {
+        let active = self.get_active_slot()?;
+        let boot_dir = if slot == active {
+            std::env::var("NEXTOOMIO_ACTIVE_BOOT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/boot"))
+        } else {
+            std::env::var("NEXTOOMIO_INACTIVE_BOOT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/run/nextoomio/boot_inactive"))
+        };
+        let hw_file = boot_dir.join("nextoomio-hardware.txt");
+        if hw_file.exists() {
+            fs::read_to_string(&hw_file)
+                .map(Some)
+                .map_err(|e| format!("cannot read {}: {e}", hw_file.display()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn set_sound_card_selection(&mut self, slot: Slot, content: &str) -> Result<(), String> {
+        let active = self.get_active_slot()?;
+        let boot_dir = if slot == active {
+            std::env::var("NEXTOOMIO_ACTIVE_BOOT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/boot"))
+        } else {
+            std::env::var("NEXTOOMIO_INACTIVE_BOOT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/run/nextoomio/boot_inactive"))
+        };
+        fs::create_dir_all(&boot_dir)
+            .map_err(|e| format!("cannot create dir {}: {e}", boot_dir.display()))?;
+        let hw_file = boot_dir.join("nextoomio-hardware.txt");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&hw_file)
+            .map_err(|e| format!("cannot open {}: {e}", hw_file.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", hw_file.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync error {}: {e}", hw_file.display()))?;
+        Ok(())
+    }
+
+    fn sync_partitions(&mut self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn sync();
+            }
+            // SAFETY: sync(2) is a standard POSIX system call taking no arguments and cannot cause undefined behavior.
+            unsafe {
+                sync();
+            }
+        }
+        Ok(())
     }
 }
 
