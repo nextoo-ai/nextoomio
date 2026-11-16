@@ -66,6 +66,10 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend",
         root / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/data.mount.d/10-condition.conf",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.sh",
+        root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.service",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/nextoomio-audio-profile_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile.service",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile-setup.sh",
@@ -81,8 +85,11 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend",
         root / "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
         root / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
+        root / "meta-nextoomio/recipes-core/base-files/files/fstab",
         root / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
         root / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
+        root / "meta-nextoomio/recipes-core/systemd/systemd-conf_%.bbappend",
+        root / "meta-nextoomio/recipes-core/systemd/files/10-nextoomio-journald.conf",
         root / "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend",
         root / "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio",
         root / "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset",
@@ -301,6 +308,30 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         for label in ("select", "boot_a", "boot_b", "root_a", "root_b", "data"):
             if f"--label {label}" not in wks_text:
                 errors.append(f"Wic layout missing partition label '{label}'")
+        if re.search(r"part\s+/data\s+.*--fixed-size", wks_text):
+            errors.append("Wic layout /data partition must not use --fixed-size (D-006: grown on first boot)")
+        for mpoint in ("/boot/select", "/boot/firmware", "/data"):
+            if not re.search(rf"part\s+{re.escape(mpoint)}\s+.*--no-fstab-update", wks_text):
+                errors.append(f"Wic layout partition {mpoint} must specify --no-fstab-update")
+        if re.search(r"part\s+/boot\s+", wks_text):
+            errors.append("Wic layout must not specify /boot as mountpoint; use /boot/firmware (AC1)")
+
+    image_path = root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+    if image_path.is_file():
+        image_text = image_path.read_text(encoding="utf-8")
+        if "nextoomio-data" not in image_text:
+            errors.append("nextoomio-image.bb must install nextoomio-data package")
+
+    data_recipe_path = root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb"
+    if data_recipe_path.is_file():
+        data_recipe_text = data_recipe_path.read_text(encoding="utf-8")
+        for unit in ("nextoomio-boot-mount.service", "nextoomio-data-grow.service", "nextoomio-data-check.service", "nextoomio-data-init.service"):
+            if unit not in data_recipe_text:
+                errors.append(f"nextoomio-data_0.0.1.bb missing systemd unit registration: {unit}")
+        if 'S = "${WORKDIR}"' in data_recipe_text:
+            errors.append('nextoomio-data_0.0.1.bb must not use S = "${WORKDIR}" (unsupported in modern BitBake)')
+        if "data.mount.d/10-condition.conf" not in data_recipe_text:
+            errors.append("nextoomio-data_0.0.1.bb missing data.mount condition drop-in installation")
 
         if "--ptable msdos" not in wks_text:
             errors.append("Wic layout must use MBR partition table (--ptable msdos) per ARCHITECTURE.md section 3.6")
@@ -348,8 +379,41 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 if "--source" in line_str:
                     errors.append("Wic root_b partition must have no --source on initial image (empty slot B, AC5)")
             elif "--label data" in line_str:
-                if "--fixed-size 1536M" not in line_str:
-                    errors.append("Wic data partition must be fixed size 1536M initial size")
+                if "--size 1536M" not in line_str:
+                    errors.append("Wic data partition must specify initial size 1536M (--size 1536M, D-006)")
+
+    # P0-F2.2 / SYS-04: Validate boot mount target and ensure no fstab line or unit mounts on /boot itself (AC1)
+    boot_mount_sh = root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.sh"
+    if boot_mount_sh.is_file():
+        bm_text = boot_mount_sh.read_text(encoding="utf-8")
+        if not re.search(r'NEXTOOMIO_BOOT_DIR:-(?:/boot/firmware)\b', bm_text):
+            errors.append("nextoomio-boot-mount.sh target must default to /boot/firmware (AC1)")
+
+    fstab_path = root / "meta-nextoomio/recipes-core/base-files/files/fstab"
+    if fstab_path.is_file():
+        fstab_text = fstab_path.read_text(encoding="utf-8")
+        for line in fstab_text.splitlines():
+            line_str = line.strip()
+            if not line_str or line_str.startswith("#"):
+                continue
+            parts = line_str.split()
+            if len(parts) >= 2 and parts[1] == "/boot":
+                errors.append(f"fstab must not mount anything on /boot itself; active boot partition is mounted at /boot/firmware: {line_str}")
+
+    base_files_bb = root / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend"
+    if base_files_bb.is_file():
+        bf_text = base_files_bb.read_text(encoding="utf-8")
+        if "/boot/firmware" not in bf_text:
+            errors.append("base-files_%.bbappend must include /boot/firmware in dirs755")
+        if "/boot/select" not in bf_text:
+            errors.append("base-files_%.bbappend must include /boot/select in dirs755")
+
+    meta_dir = root / "meta-nextoomio"
+    if meta_dir.is_dir():
+        for unit_file in meta_dir.rglob("*.mount"):
+            unit_text = unit_file.read_text(encoding="utf-8")
+            if re.search(r"^\s*Where\s*=\s*/boot\s*$", unit_text, re.MULTILINE):
+                errors.append(f"{unit_file.relative_to(root)}: unit must not mount on /boot itself; active boot partition is mounted at /boot/firmware")
 
     # P0-F2.4: Validate network baseline, firewall rules, and hostname configuration
     if distro_conf.is_file():
@@ -818,9 +882,16 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset",
         "meta-nextoomio/recipes-connectivity/avahi/avahi_%.bbappend",
         "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-data/nextoomio-data_0.0.1.bb",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/data.mount.d/10-condition.conf",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.sh",
+        "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.service",
         "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
+        "meta-nextoomio/recipes-core/base-files/files/fstab",
         "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
         "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
+        "meta-nextoomio/recipes-core/systemd/systemd-conf_%.bbappend",
+        "meta-nextoomio/recipes-core/systemd/files/10-nextoomio-journald.conf",
         "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend",
         "meta-nextoomio/recipes-connectivity/openssh/files/sshd_config.nextoomio",
         "meta-nextoomio/recipes-connectivity/openssh/files/99-nextoomio-ssh.preset",
@@ -1125,6 +1196,33 @@ def run_self_tests() -> int:
         assert any("must configure signal/exit cleanup trap" in e for e in errs), f"Expected cleanup trap failure: {errs}"
         tc_sh_path.write_text(orig_tc_trap, encoding="utf-8")
         print("  test_check_fails_when_tone_check_omits_cleanup_trap: OK")
+
+        # 29. AC1: Fail when nextoomio-boot-mount.sh target is not /boot/firmware
+        bm_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-data/files/nextoomio-boot-mount.sh"
+        orig_bm = bm_path.read_text(encoding="utf-8")
+        bm_path.write_text(orig_bm.replace("/boot/firmware", "/boot"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("nextoomio-boot-mount.sh target must default to /boot/firmware" in e for e in errs), f"Expected boot target failure: {errs}"
+        bm_path.write_text(orig_bm, encoding="utf-8")
+        print("  test_check_fails_when_boot_mount_sh_target_not_boot_firmware: OK")
+
+        # 30. AC1: Fail when fstab mounts on /boot itself
+        fstab_file = tmp_root / "meta-nextoomio/recipes-core/base-files/files/fstab"
+        orig_fstab = fstab_file.read_text(encoding="utf-8")
+        fstab_file.write_text(orig_fstab + "LABEL=boot_a /boot vfat defaults 0 0\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("fstab must not mount anything on /boot itself" in e for e in errs), f"Expected fstab /boot failure: {errs}"
+        fstab_file.write_text(orig_fstab, encoding="utf-8")
+        print("  test_check_fails_when_fstab_mounts_on_boot: OK")
+
+        # 31. AC1: Fail when wic specifies /boot as mountpoint
+        wks_file = tmp_root / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
+        orig_wks = wks_file.read_text(encoding="utf-8")
+        wks_file.write_text(orig_wks.replace("/boot/firmware", "/boot"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("Wic layout must not specify /boot as mountpoint" in e for e in errs), f"Expected wic /boot failure: {errs}"
+        wks_file.write_text(orig_wks, encoding="utf-8")
+        print("  test_check_fails_when_wic_specifies_boot_mountpoint: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0

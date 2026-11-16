@@ -1,0 +1,16 @@
+[Unit]
+Description=nextoomio Initialize Persistent Data Directories and Reservations
+Documentation=file:///ARCHITECTURE.md#3.5
+DefaultDependencies=no
+Conflicts=shutdown.target
+Wants=data.mount
+After=data.mount
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nextoomio-data-init
+
+[Install]
+WantedBy=multi-user.target
