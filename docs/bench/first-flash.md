@@ -52,7 +52,7 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
 
 1. **Workflow source:**
    - Full BitBake Wic image builds are executed by the workflow `.github/workflows/yocto-build.yml` ("Yocto Image Build").
-   - Full images are built and uploaded on every `push` to `main` modifying build paths (`kas/**`, `meta-nextoomio/**`, `.github/workflows/yocto-build.yml`), or via manual `workflow_dispatch` with input `mode: full-image`.
+   - Full images are built and uploaded on every `push` to `main` modifying build paths (`kas/**`, `meta-nextoomio/**`, `core/**`, `.github/workflows/yocto-build.yml`), or via manual `workflow_dispatch` with input `mode: full-image`.
    - Build artifacts are retained for 14 days. Pick the latest successful run on `main` (or a specific tagged release/commit).
 
 2. **Download the artifact:**
@@ -70,9 +70,9 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
      gh run download <RUN_ID> -p "nextoomio-rpi4-64-*" --dir nextoomio-rpi4-64
 
      # Change into the extracted artifact directory
-     cd nextoomio-rpi4-64
+     cd nextoomio-rpi4-64/nextoomio-rpi4-64-*
      ```
-     `gh run download` extracts the artifact contents directly. Only one artifact matches the pattern `nextoomio-rpi4-64-*` for a given run; using `--dir nextoomio-rpi4-64` ensures its files are placed into that dedicated directory rather than the current working directory. No separate `unzip` command is needed when using `gh`.
+     With `-p`, `gh run download` extracts each matching artifact into a subdirectory named after the artifact under `--dir`. Confirm that exactly one artifact matches before changing into it. No separate `unzip` command is needed when using `gh`.
 
    - **Using the GitHub Web UI:**
      1. Navigate to the repository's **Actions** tab.
