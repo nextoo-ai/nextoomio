@@ -33,14 +33,14 @@ Physical access to the microSD card is required only for:
     - Partition 3 (`boot_b`): 256 MiB (FAT)
     - Partition 5 (`root_a`): 3072 MiB / 3 GiB (ext4)
     - Partition 6 (`root_b`): 3072 MiB / 3 GiB (ext4)
-    - Partition 7 (`data`): 1536 MiB initial (ext4, grown on first boot to fill the remainder of the card)
-    - Total fixed initial layout consumes 8256 MiB, which is about 8.06 GiB (8.66 GB). A card of at least 16 GB ensures sufficient capacity for the initial layout and the grown `/data` storage partition.
+    - Partition 7 (`data`): 1536 MiB initial (ext4; planned: grown on first boot per [ARCHITECTURE.md](../../ARCHITECTURE.md) section 3.6; not implemented in the current image)
+    - Total fixed initial layout consumes 8256 MiB, which is about 8.06 GiB (8.66 GB). Standard nominal "8 GB" cards provide only ~7.45 GiB usable capacity and cannot fit the 8256 MiB layout, so a card of at least 16 GB is required for the initial layout alone.
 
 ### Workstation Prerequisites
 
 - MicroSD card reader/writer.
 - Workstation flashing utility: `bmaptool` (recommended for block-mapped writing) or `dd`.
-- Decompressed Wic image artifact (`*.wic.bz2`) and matching block map (`*.wic.bmap`) obtained from the CI build workflow (see Section 3.1).
+- Compressed Wic image artifact (`*.wic.bz2`) and matching block map (`*.wic.bmap`) obtained from the CI build workflow (see Section 3.1).
 - A developer SSH public key file (e.g., `~/.ssh/id_ed25519.pub`).
 - GitHub CLI (`gh`) or a web browser to download CI build artifacts.
 
@@ -56,28 +56,45 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
    - Build artifacts are retained for 14 days. Pick the latest successful run on `main` (or a specific tagged release/commit).
 
 2. **Download the artifact:**
+
    - **Using GitHub CLI (`gh`):**
      ```bash
      # List recent successful Yocto image runs on main
      gh run list --workflow=yocto-build.yml --status=success --branch=main
 
-     # Download the artifact from the selected run ID into the current working directory
+     # Download the artifact from the selected run ID
      gh run download <RUN_ID> -n "nextoomio-rpi4-64-*"
+
+     # Change into the extracted artifact directory
+     cd nextoomio-rpi4-64-*
      ```
+     `gh run download` extracts the artifact contents directly into a subdirectory named after the artifact (e.g., `nextoomio-rpi4-64-<sha>/`). No separate `unzip` command is needed when using `gh`.
+
    - **Using the GitHub Web UI:**
      1. Navigate to the repository's **Actions** tab.
      2. In the left sidebar, select the **Yocto Image Build** workflow.
      3. Select the latest successful run on the `main` branch.
      4. Scroll to the **Artifacts** section at the bottom of the summary page.
-     5. Download the artifact named `nextoomio-rpi4-64-<sha>` (packaged as a `.zip` archive).
+     5. Download the artifact named `nextoomio-rpi4-64-<sha>` (downloaded through the browser as a `.zip` archive).
+     6. Unpack the zip archive on your workstation:
+        ```bash
+        unzip nextoomio-rpi4-64-*.zip
+        ```
 
-3. **Extract and identify the Wic image and block map:**
+3. **Identify the Wic image and block map:**
+
+   The downloaded artifact directory contains the compressed Wic image (`*.wic.bz2`), block map (`*.wic.bmap`), rootfs manifest (`*.rootfs.manifest`), SBOM archive, and license manifest.
+
+   > [!IMPORTANT]
+   > Keep both the `*.wic.bz2` image and its matching `*.wic.bmap` block map in the same directory. When invoked, `bmaptool copy` looks for the matching `.wic.bmap` file in the same directory as the image.
+
+   In BitBake/OpenEmbedded builds, image files are named with a build timestamp (for example, `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bz2` and matching `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bmap`, or symlink `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2`).
+
+   List the directory contents and identify your exact filename:
    ```bash
-   unzip nextoomio-rpi4-64-*.zip
+   ls -la nextoomio-image-raspberrypi4-64*
    ```
-   The archive contains the compressed Wic image (`*.wic.bz2`), block map (`*.wic.bmap`), rootfs manifest (`*.rootfs.manifest`), SBOM archive, and license manifest.
-
-   In BitBake/OpenEmbedded builds, image files are named after the recipe and machine, typically with a build timestamp (e.g., `nextoomio-image-raspberrypi4-64-<timestamp>.rootfs.wic.bz2` or symlink `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2`, along with the corresponding `.wic.bmap`). Identify the `.wic.bz2` file and its matching `.wic.bmap` for flashing.
+   In the flashing commands in Section 3.3, substitute your actual filename (e.g. `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bz2`) for `<IMAGE_FILE>`.
 
 ### 3.2 Identifying the Target MicroSD Card Node
 
@@ -95,14 +112,15 @@ Write the image artifact to the card using either `bmaptool` or `dd`:
 
 - **Using `bmaptool` (recommended, fast and verified):**
   ```bash
-  sudo bmaptool copy nextoomio-image-raspberrypi4-64.rootfs.wic.bz2 /dev/sdX
+  sudo bmaptool copy nextoomio-image-raspberrypi4-64-*.rootfs.wic.bz2 /dev/sdX
   ```
-  *(Replace `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2` with the exact path to your unpacked `.wic.bz2` file and `/dev/sdX` with your card device node.)*
+  *(Substitute your actual `.wic.bz2` filename, e.g. `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bz2`, and replace `/dev/sdX` with your microSD device node. As long as both the `.wic.bz2` and `.wic.bmap` files reside in the same directory, `bmaptool` automatically discovers and uses the block map. If they are in different locations, pass `--bmap <path-to-bmap>` explicitly.)*
 
-- **Using `bunzip2` and `dd`:**
+- **Using `bzcat` and `dd`:**
   ```bash
-  bzcat nextoomio-image-raspberrypi4-64.rootfs.wic.bz2 | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+  bzcat nextoomio-image-raspberrypi4-64-*.rootfs.wic.bz2 | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
   ```
+  *(Substitute your actual compressed `.wic.bz2` filename and replace `/dev/sdX` with your card device node.)*
 
 Flush buffers to disk:
 ```bash
@@ -119,12 +137,13 @@ Inspect the written card with `lsblk` or `fdisk -l /dev/sdX`:
 
 1. Partition table type must be MBR (`msdos`) with fixed disk identifier `0x4e58544d` ([ARCHITECTURE.md](../../ARCHITECTURE.md) section 3.6).
 2. The card must present seven partition entries matching the specification:
-   - **Partition 1 (`select`):** 64 MiB, type FAT (`vfat`), bootable / active flag set.
-   - **Partition 2 (`boot_a`):** 256 MiB, type FAT (`vfat`), labeled `boot_a`.
-   - **Partition 3 (`boot_b`):** 256 MiB, type FAT (`vfat`), labeled `boot_b` (empty formatted filesystem).
-   - **Partition 5 (`root_a`):** 3072 MiB (3 GiB), type ext4, labeled `root_a`.
-   - **Partition 6 (`root_b`):** 3072 MiB (3 GiB), type ext4, labeled `root_b` (empty formatted filesystem).
-   - **Partition 7 (`data`):** 1536 MiB initial, type ext4, labeled `data`.
+   - **Partition 1 (`select`):** 64 MiB, primary FAT (`vfat`), bootable / active flag set.
+   - **Partition 2 (`boot_a`):** 256 MiB, primary FAT (`vfat`), labeled `boot_a`.
+   - **Partition 3 (`boot_b`):** 256 MiB, primary FAT (`vfat`), labeled `boot_b` (empty formatted filesystem).
+   - **Partition 4 (Extended container):** Extended partition container (type `Extended` / `W95 Ext'd (LBA)`) enclosing the logical partitions 5–7.
+   - **Partition 5 (`root_a`):** 3072 MiB (3 GiB), logical ext4, labeled `root_a`.
+   - **Partition 6 (`root_b`):** 3072 MiB (3 GiB), logical ext4, labeled `root_b` (empty formatted filesystem).
+   - **Partition 7 (`data`):** 1536 MiB initial, logical ext4, labeled `data`.
 
 ### Partition 1 (`select`) Content Check
 
