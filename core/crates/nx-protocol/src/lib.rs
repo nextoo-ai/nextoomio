@@ -176,6 +176,43 @@ pub enum ErrorCode {
     UpdateIncompatibleHardware,
     UpdateIncompatibleSchema,
     UpdateBusy,
+    UpdateTruncated,
+    UpdateCorruptedArtifact,
+}
+
+impl ErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SetupRequired => "setup_required",
+            Self::SetupAlreadyCompleted => "setup_already_completed",
+            Self::Unauthenticated => "unauthenticated",
+            Self::CsrfInvalid => "csrf_invalid",
+            Self::CommandUnsupported => "command_unsupported",
+            Self::WaitingForClient => "waiting_for_client",
+            Self::SourceUnreachable => "source_unreachable",
+            Self::FormatUnsupported => "format_unsupported",
+            Self::PlaylistInvalid => "playlist_invalid",
+            Self::NasUnreachable => "nas_unreachable",
+            Self::ClockNotSet => "clock_not_set",
+            Self::DataUnavailable => "data_unavailable",
+            Self::SelfMasterRejected => "self_master_rejected",
+            Self::TopologyCycleRejected => "topology_cycle_rejected",
+            Self::GroupLevelDisabled => "group_level_disabled",
+            Self::UpdateOversized => "update_oversized",
+            Self::UpdateInvalidFormat => "update_invalid_format",
+            Self::UpdateIncompatibleHardware => "update_incompatible_hardware",
+            Self::UpdateIncompatibleSchema => "update_incompatible_schema",
+            Self::UpdateBusy => "update_busy",
+            Self::UpdateTruncated => "update_truncated",
+            Self::UpdateCorruptedArtifact => "update_corrupted_artifact",
+        }
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Durable update transaction states (`ARCHITECTURE.md` section 3.6, `AR-01`, `AR-08`).
@@ -260,5 +297,31 @@ mod tests {
         assert!(Staged.can_transition_to(Validated));
         assert!(!Staged.can_transition_to(Installing));
         assert!(!Receiving.can_transition_to(Trial));
+    }
+
+    #[test]
+    fn update_error_codes_serialize_to_snake_case() {
+        assert_eq!(ErrorCode::UpdateOversized.as_str(), "update_oversized");
+        assert_eq!(
+            ErrorCode::UpdateInvalidFormat.as_str(),
+            "update_invalid_format"
+        );
+        assert_eq!(
+            ErrorCode::UpdateIncompatibleHardware.as_str(),
+            "update_incompatible_hardware"
+        );
+        assert_eq!(
+            ErrorCode::UpdateIncompatibleSchema.as_str(),
+            "update_incompatible_schema"
+        );
+        assert_eq!(ErrorCode::UpdateBusy.as_str(), "update_busy");
+        assert_eq!(ErrorCode::UpdateTruncated.as_str(), "update_truncated");
+        assert_eq!(
+            ErrorCode::UpdateCorruptedArtifact.as_str(),
+            "update_corrupted_artifact"
+        );
+
+        let json = serde_json::to_string(&ErrorCode::UpdateCorruptedArtifact).unwrap();
+        assert_eq!(json, "\"update_corrupted_artifact\"");
     }
 }

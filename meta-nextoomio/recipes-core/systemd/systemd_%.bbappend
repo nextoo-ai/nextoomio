@@ -9,7 +9,7 @@ SRC_URI:append = " \
 
 do_install:append() {
     install -d ${D}${systemd_unitdir}/system-preset
-    install -m 0644 ${WORKDIR}/99-timesync.preset ${D}${systemd_unitdir}/system-preset/99-timesync.preset
+    install -m 0644 ${UNPACKDIR}/99-timesync.preset ${D}${systemd_unitdir}/system-preset/99-timesync.preset
 }
 
 FILES:${PN} += " \
