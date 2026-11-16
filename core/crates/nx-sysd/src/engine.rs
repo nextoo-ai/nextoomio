@@ -326,8 +326,20 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
                 );
                 return Err(err);
             }
-            Err(StagingError::Io(msg)) => {
+            Err(StagingError::Stream(msg)) => {
                 let err = UpdateEngineError::Truncated(msg);
+                let _ = self.journal.commit_state(
+                    UpdateTransactionState::Failed,
+                    None,
+                    None,
+                    0,
+                    None,
+                    Some(err.error_code_str().to_string()),
+                );
+                return Err(err);
+            }
+            Err(StagingError::Storage(msg)) => {
+                let err = UpdateEngineError::Storage(msg);
                 let _ = self.journal.commit_state(
                     UpdateTransactionState::Failed,
                     None,

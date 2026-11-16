@@ -6,7 +6,7 @@
 use nx_protocol::UpdateTransactionState;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Computes CRC32 (IEEE 802.3 standard) checksum.
@@ -106,6 +106,9 @@ impl JournalRecord {
 pub trait JournalStorage: Send + Sync {
     fn read_record(&self, slot_idx: usize) -> Result<Option<JournalRecord>, String>;
     fn write_record(&mut self, slot_idx: usize, record: &JournalRecord) -> Result<(), String>;
+    fn preallocate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// In-memory journal storage for unit tests.
@@ -149,6 +152,9 @@ pub struct FileJournalStorage {
 }
 
 impl FileJournalStorage {
+    /// Preallocated file size for each journal record file in bytes (1 disk block / 4096 bytes).
+    pub const JOURNAL_FILE_SIZE: u64 = 4096;
+
     pub fn new(dir: impl AsRef<Path>) -> Self {
         Self {
             journal_dir: dir.as_ref().to_path_buf(),
@@ -161,14 +167,38 @@ impl FileJournalStorage {
 }
 
 impl JournalStorage for FileJournalStorage {
+    fn preallocate(&mut self) -> Result<(), String> {
+        fs::create_dir_all(&self.journal_dir)
+            .map_err(|e| format!("cannot create dir {}: {e}", self.journal_dir.display()))?;
+        for slot in 0..2 {
+            let path = self.path_for(slot);
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+            let meta = file.metadata().map_err(|e| e.to_string())?;
+            if meta.len() < Self::JOURNAL_FILE_SIZE {
+                crate::system::allocate_file_extents(&file, Self::JOURNAL_FILE_SIZE)?;
+            }
+        }
+        Ok(())
+    }
+
     fn read_record(&self, slot_idx: usize) -> Result<Option<JournalRecord>, String> {
         let path = self.path_for(slot_idx);
         if !path.exists() {
             return Ok(None);
         }
-        let data = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        match serde_json::from_str::<JournalRecord>(&data) {
+        let data = fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if data.is_empty() || data.iter().all(|&b| b == 0) {
+            return Ok(None);
+        }
+        let end_pos = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let json_slice = &data[..end_pos];
+        match serde_json::from_slice::<JournalRecord>(json_slice) {
             Ok(rec) => {
                 if rec.is_valid() {
                     Ok(Some(rec))
@@ -190,17 +220,36 @@ impl JournalStorage for FileJournalStorage {
         fs::create_dir_all(&self.journal_dir)
             .map_err(|e| format!("cannot create dir {}: {e}", self.journal_dir.display()))?;
         let path = self.path_for(slot_idx);
-        let json = serde_json::to_string_pretty(record)
+        let json = serde_json::to_string(record)
             .map_err(|e| format!("cannot serialize journal record: {e}"))?;
+        let json_bytes = json.as_bytes();
+        if json_bytes.len() > Self::JOURNAL_FILE_SIZE as usize {
+            return Err(format!(
+                "journal record size ({} bytes) exceeds preallocated size ({} bytes)",
+                json_bytes.len(),
+                Self::JOURNAL_FILE_SIZE
+            ));
+        }
 
         let mut file = OpenOptions::new()
-            .create(true)
+            .read(true)
             .write(true)
-            .truncate(true)
+            .create(true)
+            .truncate(false)
             .open(&path)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
 
-        file.write_all(json.as_bytes())
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if meta.len() < Self::JOURNAL_FILE_SIZE {
+            crate::system::allocate_file_extents(&file, Self::JOURNAL_FILE_SIZE)?;
+        }
+
+        let mut buf = vec![0u8; Self::JOURNAL_FILE_SIZE as usize];
+        buf[..json_bytes.len()].copy_from_slice(json_bytes);
+
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek error {}: {e}", path.display()))?;
+        file.write_all(&buf)
             .map_err(|e| format!("write error {}: {e}", path.display()))?;
         file.sync_all()
             .map_err(|e| format!("sync_all error {}: {e}", path.display()))?;
@@ -227,6 +276,7 @@ impl<S: JournalStorage> JournalController<S> {
         active_slot: &str,
         default_slot: &str,
     ) -> Result<Self, String> {
+        storage.preallocate()?;
         let r0 = storage.read_record(0);
         let r1 = storage.read_record(1);
 

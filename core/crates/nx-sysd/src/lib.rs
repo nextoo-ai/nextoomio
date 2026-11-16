@@ -752,4 +752,153 @@ software = {{
             "allocated extent must remain unchanged after abort"
         );
     }
+
+    #[test]
+    fn test_ac1_constrained_space_fixed_size_in_place_writes_never_grow_or_truncate_files() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-ac1-inplace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let capacity = 5 * 1024 * 1024; // 5 MiB test reservation
+        let backend = MockSlotBackend::new(Slot::A, Slot::A);
+        let storage = FileStagingStorage::new(&temp_dir, capacity);
+        let journal = FileJournalStorage::new(&temp_dir);
+
+        let mut engine = UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some("1.0".to_string()),
+            Some(1),
+            Some(capacity),
+        )
+        .expect("engine initialization failed");
+
+        let staging_file = temp_dir.join("staging.swu");
+        let meta_file = temp_dir.join("staging.meta");
+        let j0_file = temp_dir.join("journal.0");
+        let j1_file = temp_dir.join("journal.1");
+
+        // Verify all 4 files are preallocated with their exact fixed lengths
+        assert_eq!(std::fs::metadata(&staging_file).unwrap().len(), capacity);
+        assert_eq!(std::fs::metadata(&meta_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j0_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j1_file).unwrap().len(), 4096);
+
+        let swu_bytes = make_valid_swu("1.0", 1, b"boot test content", b"root test content");
+
+        // 1. Begin upload -> transitions to Receiving
+        engine.begin_upload(Some(swu_bytes.len() as u64)).unwrap();
+        assert_eq!(std::fs::metadata(&staging_file).unwrap().len(), capacity);
+        assert_eq!(std::fs::metadata(&meta_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j0_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j1_file).unwrap().len(), 4096);
+
+        // Abort upload -> transitions to Idle
+        engine.abort().unwrap();
+        assert_eq!(std::fs::metadata(&staging_file).unwrap().len(), capacity);
+        assert_eq!(std::fs::metadata(&meta_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j0_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j1_file).unwrap().len(), 4096);
+
+        // 2. Stage payload -> transitions to Staged
+        engine
+            .stage_upload(Cursor::new(&swu_bytes), Some(swu_bytes.len() as u64))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&staging_file).unwrap().len(), capacity);
+        assert_eq!(std::fs::metadata(&meta_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j0_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j1_file).unwrap().len(), 4096);
+
+        // 3. Validate -> transitions to Validated
+        let st = engine.validate().unwrap();
+        assert_eq!(st.state, UpdateTransactionState::Validated);
+        assert_eq!(std::fs::metadata(&staging_file).unwrap().len(), capacity);
+        assert_eq!(std::fs::metadata(&meta_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j0_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j1_file).unwrap().len(), 4096);
+
+        // 4. Abort -> resets payload and returns to Idle
+        engine.abort().unwrap();
+        assert_eq!(std::fs::metadata(&staging_file).unwrap().len(), capacity);
+        assert_eq!(std::fs::metadata(&meta_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j0_file).unwrap().len(), 4096);
+        assert_eq!(std::fs::metadata(&j1_file).unwrap().len(), 4096);
+
+        // Verify that no temporary files were created during the lifecycle
+        let entries: Vec<String> = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        for name in &entries {
+            assert!(
+                !name.ends_with(".tmp"),
+                "no temporary files allowed: found {name}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_staging_storage_write_error_reports_data_unavailable_distinct_from_update_truncated() {
+        #[derive(Debug, Clone)]
+        struct FailingWriteStorage;
+        impl StagingStorage for FailingWriteStorage {
+            fn init_staging(&mut self, _capacity: u64) -> Result<(), String> {
+                Ok(())
+            }
+            fn get_allocated_size(&self) -> Result<u64, String> {
+                Ok(1048576)
+            }
+            fn get_payload_size(&self) -> Result<u64, String> {
+                Ok(0)
+            }
+            fn write_payload<R: Read>(
+                &mut self,
+                _reader: R,
+                _declared_len: Option<u64>,
+            ) -> Result<u64, StagingError> {
+                Err(StagingError::Storage(
+                    "simulated disk write failure / ENOSPC".to_string(),
+                ))
+            }
+            fn read_payload(&self) -> Result<Vec<u8>, String> {
+                Ok(vec![])
+            }
+            fn open_payload_reader(&self) -> Result<Box<dyn Read + Send>, String> {
+                Ok(Box::new(Cursor::new(vec![])))
+            }
+            fn cleanup(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let backend = MockSlotBackend::new(Slot::A, Slot::A);
+        let storage = FailingWriteStorage;
+        let journal = MemoryJournalStorage::default();
+        let mut engine = UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some("1.0".to_string()),
+            Some(1),
+            Some(1048576),
+        )
+        .unwrap();
+
+        let swu_bytes = make_valid_swu("1.0", 1, b"boot", b"root");
+        let err = engine
+            .stage_upload(Cursor::new(&swu_bytes), Some(swu_bytes.len() as u64))
+            .expect_err("write storage failure must fail");
+
+        // Storage errors must report data_unavailable, NOT update_truncated
+        assert_eq!(err.error_code_str(), "data_unavailable");
+        assert_eq!(engine.status().state, UpdateTransactionState::Failed);
+        assert_eq!(
+            engine.status().error_code,
+            Some("data_unavailable".to_string())
+        );
+    }
 }

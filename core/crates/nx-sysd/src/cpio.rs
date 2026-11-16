@@ -12,6 +12,9 @@ pub const CPIO_MAGIC_NEW_ASCII_CRC: &[u8; 6] = b"070702";
 /// Trailer filename indicating end of archive.
 pub const CPIO_TRAILER_NAME: &str = "TRAILER!!!";
 
+/// Maximum allowed length for CPIO entry names (4096 bytes, matching standard Linux PATH_MAX).
+pub const MAX_CPIO_NAMESIZE: usize = 4096;
+
 /// Errors occurring during CPIO parsing.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CpioError {
@@ -98,7 +101,7 @@ pub fn read_next_cpio_header<R: Read>(
     let filesize = parse_hex_u32(&header_buf[54..62])? as u64;
     let namesize = parse_hex_u32(&header_buf[94..102])? as usize;
 
-    if namesize == 0 {
+    if namesize == 0 || namesize > MAX_CPIO_NAMESIZE {
         return Err(CpioError::InvalidHeader);
     }
 
@@ -333,5 +336,30 @@ mod tests {
         archive[0..6].copy_from_slice(b"123456");
         let err = read_cpio_entries(archive.as_slice()).expect_err("should fail");
         assert_eq!(err, CpioError::InvalidMagic);
+    }
+
+    #[test]
+    fn test_oversized_namesize_fails_with_invalid_header() {
+        // Construct 110-byte header with valid magic and namesize = 0xFFFFFFFF (or > MAX_CPIO_NAMESIZE)
+        let header = format!(
+            "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+            0,             // ino
+            0o100644,      // mode
+            0,             // uid
+            0,             // gid
+            1,             // nlink
+            0,             // mtime
+            10,            // filesize
+            0,             // devmajor
+            0,             // devminor
+            0,             // rdevmajor
+            0,             // rdevminor
+            0xFFFFFFFFu32, // namesize (crafted huge value)
+            0              // check
+        );
+        let mut cursor = std::io::Cursor::new(header.into_bytes());
+        let err =
+            read_next_cpio_header(&mut cursor).expect_err("oversized namesize must be rejected");
+        assert_eq!(err, CpioError::InvalidHeader);
     }
 }

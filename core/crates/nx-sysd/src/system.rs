@@ -170,7 +170,7 @@ impl SlotBackend for PhysicalSlotBackend {
 }
 
 #[cfg(target_os = "linux")]
-fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
+pub(crate) fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
     extern "C" {
         fn posix_fallocate(fd: std::os::raw::c_int, offset: i64, len: i64) -> std::os::raw::c_int;
@@ -191,7 +191,7 @@ fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
+pub(crate) fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
     #[repr(C)]
     struct Fstore {
@@ -239,7 +239,7 @@ fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
+pub(crate) fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
     file.set_len(capacity)
         .map_err(|e| format!("cannot allocate {capacity} bytes: {e}"))
 }
@@ -248,7 +248,8 @@ fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum StagingError {
     Oversized { attempted: u64, limit: u64 },
-    Io(String),
+    Stream(String),
+    Storage(String),
 }
 
 impl fmt::Display for StagingError {
@@ -260,7 +261,8 @@ impl fmt::Display for StagingError {
                     "payload size {attempted} bytes exceeds reserved staging capacity {limit} bytes"
                 )
             }
-            Self::Io(msg) => write!(f, "storage I/O error: {msg}"),
+            Self::Stream(msg) => write!(f, "client stream read error: {msg}"),
+            Self::Storage(msg) => write!(f, "storage I/O error: {msg}"),
         }
     }
 }
@@ -351,7 +353,7 @@ impl StagingStorage for MockStagingStorage {
         loop {
             let n = reader
                 .read(&mut chunk)
-                .map_err(|e| StagingError::Io(format!("read error: {e}")))?;
+                .map_err(|e| StagingError::Stream(format!("read error: {e}")))?;
             if n == 0 {
                 break;
             }
@@ -387,6 +389,9 @@ impl StagingStorage for MockStagingStorage {
     }
 }
 
+/// Preallocated file size for staging metadata in bytes (1 disk block / 4096 bytes).
+pub const STAGING_META_FILE_SIZE: u64 = 4096;
+
 /// Filesystem-backed staging storage managing `/data/update/staging.swu`.
 #[derive(Debug, Clone)]
 pub struct FileStagingStorage {
@@ -409,34 +414,47 @@ impl FileStagingStorage {
         }
     }
 
-    /// Atomically persists metadata by writing to a temporary file, syncing, and renaming (UPD-05, AR-01).
-    fn write_meta_atomic(&self, payload_size: u64) -> Result<(), String> {
+    /// Persists metadata in place into the preallocated staging.meta file without truncating (AC1, UPD-05, AR-01).
+    fn write_meta_in_place(&self, payload_size: u64) -> Result<(), String> {
         let meta = StagingMeta {
             payload_size,
             reserved_capacity: self.reserved_capacity,
         };
         let meta_json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
-        let tmp_path = self.staging_dir.join("staging.meta.tmp");
+        let json_bytes = meta_json.as_bytes();
+        if json_bytes.len() > STAGING_META_FILE_SIZE as usize {
+            return Err(format!(
+                "staging metadata size ({} bytes) exceeds preallocated size ({} bytes)",
+                json_bytes.len(),
+                STAGING_META_FILE_SIZE
+            ));
+        }
 
-        let mut tmp_file = OpenOptions::new()
-            .create(true)
+        let mut meta_file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .map_err(|e| format!("cannot open {}: {e}", tmp_path.display()))?;
+            .create(true)
+            .truncate(false)
+            .open(&self.meta_file)
+            .map_err(|e| format!("cannot open {}: {e}", self.meta_file.display()))?;
 
-        tmp_file
-            .write_all(meta_json.as_bytes())
-            .map_err(|e| format!("write error {}: {e}", tmp_path.display()))?;
+        let meta_len = meta_file.metadata().map_err(|e| e.to_string())?.len();
+        if meta_len < STAGING_META_FILE_SIZE {
+            allocate_file_extents(&meta_file, STAGING_META_FILE_SIZE)?;
+        }
 
-        tmp_file
+        let mut buf = vec![0u8; STAGING_META_FILE_SIZE as usize];
+        buf[..json_bytes.len()].copy_from_slice(json_bytes);
+
+        meta_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek error {}: {e}", self.meta_file.display()))?;
+        meta_file
+            .write_all(&buf)
+            .map_err(|e| format!("write error {}: {e}", self.meta_file.display()))?;
+        meta_file
             .sync_all()
-            .map_err(|e| format!("sync_all error {}: {e}", tmp_path.display()))?;
-
-        drop(tmp_file);
-
-        fs::rename(&tmp_path, &self.meta_file)
-            .map_err(|e| format!("cannot rename to {}: {e}", self.meta_file.display()))?;
+            .map_err(|e| format!("sync_all error {}: {e}", self.meta_file.display()))?;
 
         if let Ok(dir) = File::open(&self.staging_dir) {
             let _ = dir.sync_all();
@@ -484,27 +502,26 @@ impl StagingStorage for FileStagingStorage {
             allocate_file_extents(&file, capacity)?;
         }
 
-        // 3. Metadata initialization (idempotent: never resets existing payload_size)
-        if self.meta_file.exists() {
-            if let Ok(content) = fs::read_to_string(&self.meta_file) {
-                if let Ok(mut meta) = serde_json::from_str::<StagingMeta>(&content) {
-                    if meta.reserved_capacity != capacity {
-                        meta.reserved_capacity = capacity;
-                        if let Ok(json) = serde_json::to_string(&meta) {
-                            let _ = fs::write(&self.meta_file, json);
-                        }
-                    }
-                }
-            }
-        } else {
-            let meta = StagingMeta {
-                payload_size: 0,
-                reserved_capacity: capacity,
-            };
-            let meta_json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
-            fs::write(&self.meta_file, meta_json)
-                .map_err(|e| format!("cannot write meta file: {e}"))?;
+        // 3. Preallocate staging.meta file without truncating (AC1)
+        let meta_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.meta_file)
+            .map_err(|e| format!("cannot open {}: {e}", self.meta_file.display()))?;
+
+        let meta_stat = meta_file
+            .metadata()
+            .map_err(|e| format!("cannot stat {}: {e}", self.meta_file.display()))?;
+
+        if meta_stat.len() < STAGING_META_FILE_SIZE {
+            allocate_file_extents(&meta_file, STAGING_META_FILE_SIZE)?;
         }
+
+        // 4. Metadata initialization (idempotent: preserves existing payload_size if valid)
+        let current_payload = self.get_payload_size().unwrap_or(0);
+        self.write_meta_in_place(current_payload)?;
 
         Ok(())
     }
@@ -539,10 +556,14 @@ impl StagingStorage for FileStagingStorage {
         if !self.meta_file.exists() {
             return Ok(0);
         }
-        let content = fs::read_to_string(&self.meta_file)
-            .map_err(|e| format!("cannot read meta file: {e}"))?;
-        let meta: StagingMeta =
-            serde_json::from_str(&content).map_err(|e| format!("invalid meta json: {e}"))?;
+        let data = fs::read(&self.meta_file)
+            .map_err(|e| format!("cannot read meta file {}: {e}", self.meta_file.display()))?;
+        if data.is_empty() || data.iter().all(|&b| b == 0) {
+            return Ok(0);
+        }
+        let end_pos = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let meta: StagingMeta = serde_json::from_slice(&data[..end_pos])
+            .map_err(|e| format!("invalid meta json: {e}"))?;
         Ok(meta.payload_size)
     }
 
@@ -565,11 +586,11 @@ impl StagingStorage for FileStagingStorage {
             .write(true)
             .open(&self.staging_file)
             .map_err(|e| {
-                StagingError::Io(format!("cannot open {}: {e}", self.staging_file.display()))
+                StagingError::Storage(format!("cannot open {}: {e}", self.staging_file.display()))
             })?;
 
         file.seek(SeekFrom::Start(0))
-            .map_err(|e| StagingError::Io(format!("seek error: {e}")))?;
+            .map_err(|e| StagingError::Storage(format!("seek error: {e}")))?;
 
         let mut total_written = 0u64;
         let mut buf = [0u8; 65536];
@@ -577,7 +598,7 @@ impl StagingStorage for FileStagingStorage {
         loop {
             let n = reader
                 .read(&mut buf)
-                .map_err(|e| StagingError::Io(format!("read error: {e}")))?;
+                .map_err(|e| StagingError::Stream(format!("read error: {e}")))?;
             if n == 0 {
                 break;
             }
@@ -588,17 +609,17 @@ impl StagingStorage for FileStagingStorage {
                 });
             }
             file.write_all(&buf[..n])
-                .map_err(|e| StagingError::Io(format!("write error: {e}")))?;
+                .map_err(|e| StagingError::Storage(format!("write error: {e}")))?;
             total_written += n as u64;
         }
 
         // Ensure all written payload extents are committed to durable storage (UPD-05, AR-01)
         file.sync_all()
-            .map_err(|e| StagingError::Io(format!("sync_all error on staging file: {e}")))?;
+            .map_err(|e| StagingError::Storage(format!("sync_all error on staging file: {e}")))?;
 
-        // Atomically commit metadata to disk before returning (write to temp file, sync, atomic rename)
-        self.write_meta_atomic(total_written)
-            .map_err(StagingError::Io)?;
+        // Persist metadata in-place into preallocated staging.meta before returning (AC1)
+        self.write_meta_in_place(total_written)
+            .map_err(StagingError::Storage)?;
 
         Ok(total_written)
     }
@@ -627,7 +648,7 @@ impl StagingStorage for FileStagingStorage {
     }
 
     fn cleanup(&mut self) -> Result<(), String> {
-        // Metadata is reset to zero atomically, but staging.swu file is NEVER unlinked or truncated (AC6, AR-08)
-        self.write_meta_atomic(0)
+        // Metadata is reset to zero in-place; staging.swu and staging.meta are NEVER unlinked or truncated (AC1, AC6, AR-08)
+        self.write_meta_in_place(0)
     }
 }
