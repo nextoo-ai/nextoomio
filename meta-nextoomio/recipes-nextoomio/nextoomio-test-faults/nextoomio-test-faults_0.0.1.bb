@@ -8,8 +8,7 @@ SRC_URI = " \
     file://nextoomio-hang-early.sh \
 "
 
-S = "${WORKDIR}/sources"
-UNPACKDIR = "${S}"
+S = "${UNPACKDIR}"
 
 PACKAGES =+ "${PN}-hang"
 

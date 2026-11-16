@@ -10,8 +10,8 @@ SRC_URI:append = " \
 
 do_install:append() {
     install -d ${D}${sysconfdir}/nftables.d
-    install -m 0644 ${WORKDIR}/nftables.conf ${D}${sysconfdir}/nftables.conf
-    install -m 0644 ${WORKDIR}/00-default.nft ${D}${sysconfdir}/nftables.d/00-default.nft
+    install -m 0644 ${UNPACKDIR}/nftables.conf ${D}${sysconfdir}/nftables.conf
+    install -m 0644 ${UNPACKDIR}/00-default.nft ${D}${sysconfdir}/nftables.d/00-default.nft
 }
 
 FILES:${PN} += " \
