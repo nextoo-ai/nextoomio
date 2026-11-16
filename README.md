@@ -2,7 +2,7 @@
 
 **nextoomio** is an open-source, cloud-free audio player and multiroom operating system for **Raspberry Pi 3+** and **HiFiBerry** sound cards, built on **Yocto Linux**.
 
-> **Project status:** Specification (`v1.15`), cumulative delivery roadmap (`v1.10`), and system architecture (`v0.10`) are established. Repository scaffolding, core state-machine contracts, WebUI i18n catalog foundation, Yocto layer structure, and CI/CD pipelines are initialized for **v0.0.1** development. Hardware measurements and full Yocto target builds are not yet verified on physical hardware.
+> **Project status:** Specification (`v1.15`), cumulative delivery roadmap (`v1.10`), and system architecture (`v0.11`) are established. Repository scaffolding, core state-machine contracts, WebUI i18n catalog foundation, Yocto layer structure, and CI/CD pipelines are initialized for **v0.0.1** development. Hardware measurements and full Yocto target builds are not yet verified on physical hardware.
 
 ---
 
