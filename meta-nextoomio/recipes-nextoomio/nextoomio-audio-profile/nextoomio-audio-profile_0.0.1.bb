@@ -16,8 +16,7 @@ SRC_URI = " \
     file://nextoomio-audio-profile-setup.sh \
 "
 
-S = "${WORKDIR}/sources"
-UNPACKDIR = "${S}"
+S = "${UNPACKDIR}"
 
 do_compile() {
     # Derive boot include from selected hardware profile (D-011, ARCHITECTURE.md section 3.8, CQ-R1)

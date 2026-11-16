@@ -20,7 +20,7 @@ PACKAGECONFIG:remove = " systemd-sshd-socket-mode"
 do_install:append() {
     # Replace default sshd_config with nextoomio hardened key-only configuration
     sdir="${UNPACKDIR}"
-    [ -d "$sdir" ] || sdir="${WORKDIR}"
+    [ -d "$sdir" ] || sdir="${UNPACKDIR}"
 
     install -d ${D}${sysconfdir}/ssh
     install -m 0600 $sdir/sshd_config.nextoomio ${D}${sysconfdir}/ssh/sshd_config

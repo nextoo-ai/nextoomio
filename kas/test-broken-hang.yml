@@ -1,0 +1,8 @@
+# kas configuration for deliberately broken image: kernel/init hang before systemd (P0-F4.7 AC1, AC6)
+# Reference hardware: Raspberry Pi 4 (64-bit)
+header:
+  version: 14
+  includes:
+    - rpi4-64.yml
+
+target: nextoomio-image-broken-hang

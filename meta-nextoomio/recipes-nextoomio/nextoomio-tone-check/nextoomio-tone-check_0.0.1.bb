@@ -11,8 +11,11 @@ SRC_URI = " \
     file://nextoomio-tone-check.sh \
 "
 
-S = "${WORKDIR}/sources"
-UNPACKDIR = "${S}"
+S = "${UNPACKDIR}"
+
+DEPENDS = " \
+    python3-native \
+"
 
 do_compile() {
     # Generate 2.0s 48kHz stereo test tone strictly bounded to <= 30% volume (AC2, D-012)
