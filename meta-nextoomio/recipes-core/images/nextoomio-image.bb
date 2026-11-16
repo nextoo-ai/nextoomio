@@ -17,7 +17,7 @@ do_image_wic[depends] += "rpi-autoboot:do_deploy nextoomio-audio-profile:do_depl
 
 # Size budget guard (ARCHITECTURE.md section 3.6, AR-08: root slot is 3 GiB = 3,145,728 KiB, AC2)
 # BitBake image.bbclass terminates the build naming the limit if rootfs exceeds this budget
-IMAGE_ROOTFS_MAXSIZE ?= "3145728"
+IMAGE_ROOTFS_MAXSIZE = "3145728"
 
 IMAGE_INSTALL:append = " \
     packagegroup-core-boot \
