@@ -113,7 +113,7 @@ jobs:
             ghcr.io/siemens/kas/kas:4.5 \
             kas build /work/kas/ci-hosted.yml
 
-      - name: Upload Yocto image, SPDX SBOM, and license manifest
+      - name: Upload Yocto image, package manifest, SPDX SBOM, and license manifest
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')
         uses: actions/upload-artifact@v4
         with:
@@ -121,6 +121,8 @@ jobs:
           path: |
             build/**/deploy/images/raspberrypi4-64/*.wic.bz2
             build/**/deploy/images/raspberrypi4-64/*.wic.bmap
+            build/**/deploy/images/raspberrypi4-64/*.rootfs.manifest
+            build/**/deploy/images/raspberrypi4-64/*.manifest
             build/**/deploy/images/raspberrypi4-64/*.spdx.tar.zst
             build/**/deploy/licenses/**/license.manifest
           retention-days: 14
