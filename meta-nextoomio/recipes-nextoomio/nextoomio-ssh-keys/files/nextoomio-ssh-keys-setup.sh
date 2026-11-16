@@ -40,6 +40,13 @@ open_firewall_port() {
     return 0
 }
 
+# Helper to stop sshd asynchronously if currently active (CQ-R1, AC1)
+stop_sshd_if_active() {
+    if systemctl is-active --quiet sshd.service 2>/dev/null; then
+        systemctl stop --no-block sshd.service 2>/dev/null || true
+    fi
+}
+
 # Locate public key file on selector partition (authorized_keys or authorized_keys.txt)
 KEY_FILE=""
 if [ -f "${SELECT_DIR}/authorized_keys" ]; then
@@ -59,7 +66,7 @@ if [ -z "$KEY_FILE" ]; then
 }
 EOF
     rm -f "$AUTH_KEYS_FILE"
-    systemctl stop sshd.service 2>/dev/null || true
+    stop_sshd_if_active
     close_firewall_port
     echo "nextoomio-ssh-keys: No key file on selector partition; SSH server disabled."
     exit 0
@@ -77,7 +84,7 @@ if ! command -v ssh-keygen >/dev/null 2>&1; then
 }
 EOF
     rm -f "$AUTH_KEYS_FILE"
-    systemctl stop sshd.service 2>/dev/null || true
+    stop_sshd_if_active
     close_firewall_port
     echo "nextoomio-ssh-keys: Required utility 'ssh-keygen' is missing; SSH disabled." >&2
     exit 0
@@ -96,7 +103,7 @@ if [ "$FILE_SIZE" -gt 16384 ]; then
 }
 EOF
     rm -f "$AUTH_KEYS_FILE"
-    systemctl stop sshd.service 2>/dev/null || true
+    stop_sshd_if_active
     close_firewall_port
     echo "nextoomio-ssh-keys: Key file ${KEY_FILE} exceeds 16 KiB (${FILE_SIZE} bytes); SSH disabled." >&2
     exit 0
@@ -131,7 +138,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa)
             ;;
         *)
-            INVALID_REASON="Line $LINE_NUM: contains key options or unsupported key type ('$KEY_TYPE')"
+            INVALID_REASON="Line $LINE_NUM: contains key options or unsupported key type"
             break
             ;;
     esac
@@ -198,7 +205,7 @@ if [ -n "$INVALID_REASON" ]; then
 }
 EOF
     rm -f "$AUTH_KEYS_FILE" "$TMP_KEYS"
-    systemctl stop sshd.service 2>/dev/null || true
+    stop_sshd_if_active
     close_firewall_port
     echo "nextoomio-ssh-keys: Invalid key file on selector partition: ${INVALID_REASON}; SSH disabled." >&2
     exit 0
@@ -216,7 +223,7 @@ if [ "$KEY_COUNT" -gt 16 ]; then
 }
 EOF
     rm -f "$AUTH_KEYS_FILE" "$TMP_KEYS"
-    systemctl stop sshd.service 2>/dev/null || true
+    stop_sshd_if_active
     close_firewall_port
     echo "nextoomio-ssh-keys: Key file contains ${KEY_COUNT} keys (max 16); SSH disabled." >&2
     exit 0
@@ -233,7 +240,7 @@ if [ "$KEY_COUNT" -eq 0 ]; then
 }
 EOF
     rm -f "$AUTH_KEYS_FILE" "$TMP_KEYS"
-    systemctl stop sshd.service 2>/dev/null || true
+    stop_sshd_if_active
     close_firewall_port
     echo "nextoomio-ssh-keys: Key file contains no public keys; SSH disabled." >&2
     exit 0
@@ -264,7 +271,7 @@ if [ ! -s "${DATA_SSH_DIR}/ssh_host_ed25519_key" ] || [ ! -s "${DATA_SSH_DIR}/ss
 }
 EOF
     rm -f "$AUTH_KEYS_FILE" "$TMP_KEYS"
-    systemctl stop sshd.service 2>/dev/null || true
+    stop_sshd_if_active
     close_firewall_port
     echo "nextoomio-ssh-keys: Missing persistent host keys in ${DATA_SSH_DIR}; SSH disabled." >&2
     exit 0
@@ -287,7 +294,7 @@ if ! open_firewall_port; then
 }
 EOF
     rm -f "$AUTH_KEYS_FILE"
-    systemctl stop sshd.service 2>/dev/null || true
+    stop_sshd_if_active
     close_firewall_port
     echo "nextoomio-ssh-keys: Failed to open firewall port 22; SSH disabled." >&2
     exit 0
@@ -314,7 +321,7 @@ cat << EOF > "$DIAG_FILE"
 EOF
 
 # AC1: Start SSH server (fail closed if start fails)
-if ! systemctl start sshd.service; then
+if ! systemctl start --no-block sshd.service; then
     cat << 'EOF' > "$DIAG_FILE"
 {
   "enabled": false,

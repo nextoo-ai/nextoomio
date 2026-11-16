@@ -344,6 +344,18 @@ def main() -> int:
         if "ConditionPathExists=/run/ssh/authorized_keys" not in dropin_text:
             errors.append("10-authorized-keys.conf drop-in must specify 'ConditionPathExists=/run/ssh/authorized_keys' (AC5)")
 
+    openssh_bbappend = ROOT / "meta-nextoomio/recipes-connectivity/openssh/openssh_%.bbappend"
+    if openssh_bbappend.is_file():
+        openssh_text = openssh_bbappend.read_text(encoding="utf-8")
+        if "systemd-sshd-service-mode" not in openssh_text:
+            errors.append("openssh_%.bbappend must enable systemd-sshd-service-mode in PACKAGECONFIG to install sshd.service (AC1, AD-23)")
+
+    ssh_recipe = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/nextoomio-ssh-keys_0.0.1.bb"
+    if ssh_recipe.is_file():
+        recipe_text = ssh_recipe.read_text(encoding="utf-8")
+        if re.search(r'^\s*S\s*=\s*["\']\$\{WORKDIR\}["\']', recipe_text, re.MULTILINE):
+            errors.append("nextoomio-ssh-keys_0.0.1.bb: 'S = \"${WORKDIR}\"' is forbidden in Yocto Scarthgap/Wrynose; use UNPACKDIR (CQ-R1)")
+
     # P0-F3.1: Validator systemd service ordering and dependencies (AC1, CQ-R1)
     ssh_service = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service"
     if ssh_service.is_file():
@@ -388,6 +400,8 @@ def main() -> int:
             errors.append("nextoomio-ssh-keys-setup.sh must initialize host keys on /data/ssh (AC5)")
         if "/run/nextoomio/diagnostics/ssh.json" not in script_text:
             errors.append("nextoomio-ssh-keys-setup.sh must record diagnostics to /run/nextoomio/diagnostics/ssh.json (AC4)")
+        if "systemctl start --no-block sshd.service" not in script_text:
+            errors.append("nextoomio-ssh-keys-setup.sh must start sshd with --no-block to prevent systemd ordering deadlock (CQ-R1, AC1)")
 
     # P0-F3.1: Stop script cleanup check (AC3, CQ-R1, CQ-R2)
     stop_script = ROOT / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh"

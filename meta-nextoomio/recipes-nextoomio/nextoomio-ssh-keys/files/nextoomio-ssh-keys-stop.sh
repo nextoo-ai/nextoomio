@@ -4,7 +4,7 @@
 
 set -u
 
-systemctl stop sshd.service 2>/dev/null || true
+systemctl stop --no-block sshd.service 2>/dev/null || true
 rm -f /run/ssh/authorized_keys
 
 if command -v nft >/dev/null 2>&1; then

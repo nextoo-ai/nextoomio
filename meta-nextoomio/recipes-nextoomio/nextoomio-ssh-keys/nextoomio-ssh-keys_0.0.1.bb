@@ -11,15 +11,16 @@ SRC_URI = " \
     file://nextoomio-ssh-keys-stop.sh \
 "
 
-S = "${WORKDIR}"
+S = "${WORKDIR}/sources"
+UNPACKDIR = "${S}"
 
 do_install() {
     install -d ${D}${sbindir}
-    install -m 0755 ${WORKDIR}/nextoomio-ssh-keys-setup.sh ${D}${sbindir}/nextoomio-ssh-keys-setup
-    install -m 0755 ${WORKDIR}/nextoomio-ssh-keys-stop.sh ${D}${sbindir}/nextoomio-ssh-keys-stop
+    install -m 0755 ${S}/nextoomio-ssh-keys-setup.sh ${D}${sbindir}/nextoomio-ssh-keys-setup
+    install -m 0755 ${S}/nextoomio-ssh-keys-stop.sh ${D}${sbindir}/nextoomio-ssh-keys-stop
 
     install -d ${D}${systemd_system_unitdir}
-    install -m 0644 ${WORKDIR}/nextoomio-ssh-keys.service ${D}${systemd_system_unitdir}/nextoomio-ssh-keys.service
+    install -m 0644 ${S}/nextoomio-ssh-keys.service ${D}${systemd_system_unitdir}/nextoomio-ssh-keys.service
 }
 
 SYSTEMD_SERVICE:${PN} = "nextoomio-ssh-keys.service"
