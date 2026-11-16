@@ -121,6 +121,7 @@ jobs:
           path: |
             build/**/deploy/images/raspberrypi4-64/*.wic.bz2
             build/**/deploy/images/raspberrypi4-64/*.wic.bmap
+            build/**/deploy/images/raspberrypi4-64/*.swu
             build/**/deploy/images/raspberrypi4-64/*.rootfs.manifest
             build/**/deploy/images/raspberrypi4-64/*.manifest
             build/**/deploy/images/raspberrypi4-64/*.spdx.tar.zst

@@ -10,7 +10,7 @@ IMAGE_FEATURES += "read-only-rootfs"
 IMAGE_FEATURES:remove = "debug-tweaks ssh-server-dropbear package-management"
 
 WKS_FILE = "nextoomio-ab.wks.in"
-IMAGE_FSTYPES = "wic.bz2 wic.bmap ext4.gz"
+IMAGE_FSTYPES = "wic.bz2 wic.bmap ext4.gz swu"
 
 # Depend on rpi-autoboot and nextoomio-audio-profile deploy tasks for boot partitions (D-005, D-011)
 do_image_wic[depends] += "rpi-autoboot:do_deploy nextoomio-audio-profile:do_deploy"
@@ -33,6 +33,10 @@ IMAGE_INSTALL:append = " \
     avahi-daemon \
     nftables \
     nx-sysd \
+    nextoomio-data \
+    e2fsprogs-e2fsck \
+    e2fsprogs-resize2fs \
+    parted \
     openssh-sshd \
     openssh-keygen \
     nextoomio-ssh-keys \
