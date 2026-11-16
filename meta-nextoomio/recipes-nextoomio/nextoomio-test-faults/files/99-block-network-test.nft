@@ -1,0 +1,6 @@
+# Deliberately block external SSH network access for P0-F4.7 AC3 and ARCHITECTURE.md section 3.6
+table inet filter {
+    chain input {
+        tcp dport 22 drop
+    }
+}
