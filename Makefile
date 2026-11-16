@@ -21,6 +21,7 @@ check-bench:
 	python3 scripts/bench/test_broken_images.py --test
 	python3 scripts/bench/deploy.py --test
 	python3 scripts/bench/soak.py --test
+	python3 scripts/bench/power_loss.py --test
 
 check-core:
 	cargo check --locked --manifest-path core/Cargo.toml --all-targets
