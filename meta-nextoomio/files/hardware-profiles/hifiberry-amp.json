@@ -4,6 +4,7 @@
   "hardware_family": "HiFiBerry Amp+",
   "dtoverlay": "hifiberry-amp",
   "dtoverlay_params": [],
+  "alsa_card_id": "sndrpihifiberry",
   "alsa_mixer_control": "Master",
   "fixed_hardware_mixer_percent": 30,
   "default_logical_volume_percent": 30,

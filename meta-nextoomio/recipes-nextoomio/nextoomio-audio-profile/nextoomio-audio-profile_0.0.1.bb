@@ -24,9 +24,13 @@ do_compile() {
     if [ -n "${NEXTOOMIO_AUDIO_PROFILE}" ] && [ -f "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" ]; then
         OVERLAY=$(grep -o '"dtoverlay"[^,]*' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | sed -e 's/"dtoverlay"[[:space:]]*:[[:space:]]*"//' -e 's/"//' | tr -d '[:space:]')
         PARAMS=$(grep -A 5 '"dtoverlay_params"' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | grep '"' | sed -e 's/.*"\(.*\)".*/\1/' | tr '\n' ',' | sed 's/,$//')
+        ALSA_CARD_ID=$(grep -o '"alsa_card_id"[^,]*' "${S}/${NEXTOOMIO_AUDIO_PROFILE}.json" | sed -e 's/"alsa_card_id"[[:space:]]*:[[:space:]]*"//' -e 's/"//' | tr -cd 'a-zA-Z0-9_-')
 
         echo "# nextoomio sound card hardware overlay include (ARCHITECTURE.md section 3.8, D-011)" > "${B}/nextoomio-hardware.txt"
         echo "# Derived from hardware profile: ${NEXTOOMIO_AUDIO_PROFILE}" >> "${B}/nextoomio-hardware.txt"
+        if [ -n "$ALSA_CARD_ID" ]; then
+            echo "# Expected ALSA card ID: ${ALSA_CARD_ID}" >> "${B}/nextoomio-hardware.txt"
+        fi
         if [ -n "$OVERLAY" ]; then
             if [ -n "$PARAMS" ]; then
                 echo "dtoverlay=${OVERLAY},${PARAMS}" >> "${B}/nextoomio-hardware.txt"

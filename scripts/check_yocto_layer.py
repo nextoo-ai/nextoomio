@@ -111,6 +111,8 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("Reference alsa_mixer_control must be 'Master' per ARCHITECTURE.md section 9.2")
         if profile.get("dtoverlay") != "hifiberry-amp":
             errors.append("Reference dtoverlay must be 'hifiberry-amp' per ARCHITECTURE.md section 9.2")
+        if profile.get("alsa_card_id") != "sndrpihifiberry":
+            errors.append("Reference alsa_card_id must be 'sndrpihifiberry' to identify sound card in ALSA (AC1, AC5)")
 
     if (root / "meta-nextoomio/wic").exists():
         errors.append(
@@ -551,6 +553,10 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("nextoomio-audio-profile-setup.sh must check /etc/nextoomio/hardware-profile.json (D-011)")
         if "amixer" not in sh_text:
             errors.append("nextoomio-audio-profile-setup.sh must use amixer to configure mixer level (AC2, D-012)")
+        if "amixer -c" not in sh_text:
+            errors.append("nextoomio-audio-profile-setup.sh must address sound card explicitly via 'amixer -c' (AC1, AC2)")
+        if "alsa_card_id" not in sh_text:
+            errors.append("nextoomio-audio-profile-setup.sh must read alsa_card_id from hardware profile (AC1, AC5)")
         if "/run/nextoomio/diagnostics/audio.json" not in sh_text:
             errors.append("nextoomio-audio-profile-setup.sh must record diagnostics to /run/nextoomio/diagnostics/audio.json")
         if "/run/nextoomio/diagnostics/audio.txt" not in sh_text:
@@ -749,6 +755,24 @@ def run_self_tests() -> int:
         assert any("IMAGE_INSTALL must include 'nextoomio-audio-profile'" in e for e in errs), f"Expected audio profile in IMAGE_INSTALL failure: {errs}"
         img_bb_path.write_text(orig_img_bb, encoding="utf-8")
         print("  test_check_fails_when_image_missing_audio_profile: OK")
+
+        # 15. AC1 / AC5: Fail when hifiberry-amp.json is missing alsa_card_id
+        prof_file = tmp_root / "meta-nextoomio/files/hardware-profiles/hifiberry-amp.json"
+        orig_prof = prof_file.read_text(encoding="utf-8")
+        prof_file.write_text(orig_prof.replace('"alsa_card_id": "sndrpihifiberry",\n', ''), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("Reference alsa_card_id must be 'sndrpihifiberry'" in e for e in errs), f"Expected alsa_card_id failure: {errs}"
+        prof_file.write_text(orig_prof, encoding="utf-8")
+        print("  test_check_fails_when_profile_missing_alsa_card_id: OK")
+
+        # 16. AC1 / AC2: Fail when nextoomio-audio-profile-setup.sh does not use amixer -c
+        ap_sh_path = tmp_root / "meta-nextoomio/recipes-nextoomio/nextoomio-audio-profile/files/nextoomio-audio-profile-setup.sh"
+        orig_ap_sh = ap_sh_path.read_text(encoding="utf-8")
+        ap_sh_path.write_text(orig_ap_sh.replace("amixer -c", "amixer"), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must address sound card explicitly via 'amixer -c'" in e for e in errs), f"Expected amixer -c failure: {errs}"
+        ap_sh_path.write_text(orig_ap_sh, encoding="utf-8")
+        print("  test_check_fails_when_audio_setup_omits_card_flag: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0
