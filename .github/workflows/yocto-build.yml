@@ -121,7 +121,7 @@ jobs:
         run: |
           shopt -s nullglob globstar
           image_dir=build/tmp/deploy/images/raspberrypi4-64
-          for pattern in 'nextoomio-image-raspberrypi4-64.rootfs.wic.bz2' 'nextoomio-image-raspberrypi4-64.rootfs.wic.bmap' 'nextoomio-image-raspberrypi4-64.rootfs.manifest' 'nextoomio-image-raspberrypi4-64.rootfs.swu'; do
+          for pattern in 'nextoomio-image-raspberrypi4-64.rootfs.wic.bz2' 'nextoomio-image-raspberrypi4-64.rootfs.wic.bmap' 'nextoomio-image-raspberrypi4-64.rootfs.manifest' 'nextoomio-image-raspberrypi4-64.rootfs.swu' 'nextoomio-image-raspberrypi4-64.rootfs.spdx.json'; do
             files=("$image_dir"/$pattern)
             if (( ${#files[@]} == 0 )); then
               echo "Missing required artifact: $pattern" >&2
@@ -147,6 +147,7 @@ jobs:
             build/**/deploy/images/raspberrypi4-64/*.swu
             build/**/deploy/images/raspberrypi4-64/*.rootfs.manifest
             build/**/deploy/images/raspberrypi4-64/*.manifest
+            build/**/deploy/images/raspberrypi4-64/*.rootfs.spdx.json
             build/**/deploy/images/raspberrypi4-64/*.spdx.tar.zst
             build/**/deploy/licenses/**/license.manifest
             !build/**/deploy/images/raspberrypi4-64/*-20[0-9]*

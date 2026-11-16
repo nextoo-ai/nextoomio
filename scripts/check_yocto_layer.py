@@ -278,10 +278,16 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "selector partition must hold only the boot-selection file (D-005)"
             )
 
-        m_incompat = re.search(r'^\s*INCOMPATIBLE_LICENSE\s*=\s*["\']([^"\']*)["\']', conf_text, re.MULTILINE)
+        if re.search(r'^\s*INCOMPATIBLE_LICENSE(?:[:_][\w${}+-]+)*\s*(?:[?+: .]*=)', conf_text, re.MULTILINE):
+            errors.append("meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must not be set in the distro configuration (D-069)")
+
+    image_license_bb = root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+    if image_license_bb.is_file():
+        img_license_text = image_license_bb.read_text(encoding="utf-8")
+        m_incompat = re.search(r'^\s*INCOMPATIBLE_LICENSE\s*=\s*["\']([^"\']*)["\']', img_license_text, re.MULTILINE)
         if not m_incompat:
             errors.append(
-                "meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must be configured "
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: INCOMPATIBLE_LICENSE must be configured "
                 "with hard assignment '=' to reject unaccepted licenses (AC4)"
             )
         else:
@@ -290,7 +296,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             missing_licenses = required_licenses - set(incompat_val)
             if missing_licenses:
                 errors.append(
-                    f"meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must include "
+                    f"meta-nextoomio/recipes-core/images/nextoomio-image.bb: INCOMPATIBLE_LICENSE must include "
                     f"AGPL licenses {sorted(required_licenses)} (missing: {sorted(missing_licenses)}) (AC4)"
                 )
 
@@ -1626,18 +1632,21 @@ def run_self_tests() -> int:
         image_bb.write_text(orig_image_bb, encoding="utf-8")
         print("  test_check_fails_when_image_rootfs_maxsize_invalid: OK")
 
-        # 50. AC4: Fail when INCOMPATIBLE_LICENSE is missing, weakly assigned, or omits AGPL
+        # D-069: the gate belongs to the image, and must reject all listed AGPL variants.
+        image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_image_bb = image_bb.read_text(encoding="utf-8")
+        image_bb.write_text(re.sub(r"^\s*INCOMPATIBLE_LICENSE\b[^\n]*\n", "", orig_image_bb, flags=re.MULTILINE), encoding="utf-8")
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in validate_layer(tmp_root))
+        image_bb.write_text(re.sub(r"INCOMPATIBLE_LICENSE\s*=", "INCOMPATIBLE_LICENSE ?=", orig_image_bb), encoding="utf-8")
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in validate_layer(tmp_root))
+        image_bb.write_text(re.sub(r'INCOMPATIBLE_LICENSE\s*=\s*"[^"]*"', 'INCOMPATIBLE_LICENSE = "GPL-3.0"', orig_image_bb), encoding="utf-8")
+        assert any("INCOMPATIBLE_LICENSE must include AGPL licenses" in e for e in validate_layer(tmp_root))
+        image_bb.write_text(orig_image_bb, encoding="utf-8")
         distro_conf = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
         orig_distro_conf = distro_conf.read_text(encoding="utf-8")
-        distro_conf.write_text(re.sub(r"^\s*INCOMPATIBLE_LICENSE\b[^\n]*\n", "", orig_distro_conf, flags=re.MULTILINE), encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected license gate error: {errs}"
-        distro_conf.write_text(re.sub(r"INCOMPATIBLE_LICENSE\s*=", "INCOMPATIBLE_LICENSE ?=", orig_distro_conf), encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected weak assignment failure: {errs}"
-        distro_conf.write_text(re.sub(r'INCOMPATIBLE_LICENSE\s*=\s*"[^"]*"', 'INCOMPATIBLE_LICENSE = "GPL-3.0"', orig_distro_conf), encoding="utf-8")
-        errs = validate_layer(tmp_root)
-        assert any("INCOMPATIBLE_LICENSE must include AGPL licenses" in e for e in errs), f"Expected missing AGPL license failure: {errs}"
+        for assignment in ('INCOMPATIBLE_LICENSE = "AGPL-3.0-only"', 'INCOMPATIBLE_LICENSE:append = " AGPL-3.0-only"'):
+            distro_conf.write_text(orig_distro_conf + "\n" + assignment + "\n", encoding="utf-8")
+            assert any("INCOMPATIBLE_LICENSE must not be set" in e for e in validate_layer(tmp_root))
         distro_conf.write_text(orig_distro_conf, encoding="utf-8")
         print("  test_check_fails_when_incompatible_license_invalid: OK")
 
