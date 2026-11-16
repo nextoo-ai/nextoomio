@@ -91,6 +91,12 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
+        root / "meta-nextoomio/classes/image_types_nextoomio.bbclass",
+        root / "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend",
+        root / "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb",
+        root / "meta-nextoomio/recipes-support/swupdate/files/sw-description",
+        root / "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg",
+        root / "meta-nextoomio/recipes-support/swupdate/files/hwrevision",
     ]
 
     for path in required_files:
@@ -622,6 +628,116 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if "/run/nextoomio/diagnostics/audio.txt" not in sh_text:
             errors.append("nextoomio-audio-profile-setup.sh must record diagnostics text to /run/nextoomio/diagnostics/audio.txt")
 
+    # P0-F4.2 / UPD-03 / UPD-04 / AD-13: Update file and SWUpdate configuration checks
+    if distro_conf.is_file():
+        conf_text = distro_conf.read_text(encoding="utf-8")
+        if "image_types_nextoomio" not in conf_text:
+            errors.append(
+                "meta-nextoomio/conf/distro/nextoomio.conf: IMAGE_CLASSES must append "
+                "'image_types_nextoomio' to enable .swu update file generation (P0-F4.2, D-008)"
+            )
+        if "SWUPDATE_IMAGES" not in conf_text:
+            errors.append(
+                "meta-nextoomio/conf/distro/nextoomio.conf: SWUPDATE_IMAGES must be defined"
+            )
+
+    if image_bb.is_file():
+        img_text = image_bb.read_text(encoding="utf-8")
+        m_fstypes = re.search(r'IMAGE_FSTYPES\s*=\s*["\']([^"\']+)["\']', img_text)
+        if not m_fstypes or "swu" not in m_fstypes.group(1).split():
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_FSTYPES must contain 'swu' "
+                "to produce update package alongside flashable image (P0-F4.2, AC1, D-008)"
+            )
+
+    types_class = root / "meta-nextoomio/classes/image_types_nextoomio.bbclass"
+    if types_class.is_file():
+        class_text = types_class.read_text(encoding="utf-8")
+        if "inherit image_types" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must inherit image_types")
+        if 'IMAGE_TYPES += "swu"' not in class_text:
+            errors.append("image_types_nextoomio.bbclass must declare 'IMAGE_TYPES += \"swu\"'")
+        if 'IMAGE_TYPEDEP:swu = "ext4.gz"' not in class_text:
+            errors.append("image_types_nextoomio.bbclass must declare 'IMAGE_TYPEDEP:swu = \"ext4.gz\"'")
+        if "NEXTOOMIO_BOOT_SLOT_MAXSIZE" not in class_text or "268435456" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must enforce NEXTOOMIO_BOOT_SLOT_MAXSIZE = 268435456 (256 MiB, AC3)"
+            )
+        if "NEXTOOMIO_ROOT_SLOT_MAXSIZE" not in class_text or "3221225472" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must enforce NEXTOOMIO_ROOT_SLOT_MAXSIZE = 3221225472 (3072 MiB, AC3)"
+            )
+        if "NEXTOOMIO_STAGING_RESERVATION_MAXSIZE" not in class_text or "1073741824" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must enforce NEXTOOMIO_STAGING_RESERVATION_MAXSIZE = 1073741824 (1 GiB, AC3)"
+            )
+        if "SWUPDATE_SIGNING" not in class_text or re.search(r'SWUPDATE_SIGNING\s*=\s*["\'](?!["\'])', class_text):
+            errors.append(
+                "image_types_nextoomio.bbclass must set SWUPDATE_SIGNING = \"\" (signing disabled per UPD-03, AC2)"
+            )
+        for limit_check in ("BOOT_EXPANDED_SIZE", "ROOT_EXPANDED_SIZE", "SWU_SIZE"):
+            if limit_check not in class_text:
+                errors.append(f"image_types_nextoomio.bbclass must check {limit_check} against slot/staging limit (AC3)")
+
+    sw_desc = root / "meta-nextoomio/recipes-support/swupdate/files/sw-description"
+    if sw_desc.is_file():
+        desc_text = sw_desc.read_text(encoding="utf-8")
+        if not re.search(r'version\s*=\s*["\']0\.0\.1-dev["\']', desc_text):
+            errors.append("sw-description must declare version matching DISTRO_VERSION ('0.0.1-dev') (AC1, AC4)")
+        if "hardware-compatibility" not in desc_text or "raspberrypi4-64" not in desc_text:
+            errors.append("sw-description must declare hardware-compatibility containing 'raspberrypi4-64' (AC1)")
+        if "config-schema-range" not in desc_text:
+            errors.append("sw-description must declare readable config-schema-range (AC1)")
+        if "sha256" not in desc_text:
+            errors.append("sw-description must declare sha256 checksums for artifacts (AC1)")
+        if "copy1" not in desc_text or "copy2" not in desc_text:
+            errors.append("sw-description must configure dual-slot selections copy1 and copy2 (AC1)")
+        if "/dev/mmcblk0p2" not in desc_text or "/dev/mmcblk0p5" not in desc_text:
+            errors.append("sw-description copy1 must target slot A partitions (/dev/mmcblk0p2, /dev/mmcblk0p5)")
+        if "/dev/mmcblk0p3" not in desc_text or "/dev/mmcblk0p6" not in desc_text:
+            errors.append("sw-description copy2 must target slot B partitions (/dev/mmcblk0p3, /dev/mmcblk0p6)")
+        if re.search(r'signature\s*=\s*true', desc_text, re.IGNORECASE):
+            errors.append("sw-description must NOT require signature verification (UPD-03, AC2)")
+
+    sw_bbappend = root / "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend"
+    if sw_bbappend.is_file():
+        app_text = sw_bbappend.read_text(encoding="utf-8")
+        if 'SWUPDATE_SIGNING = ""' not in app_text:
+            errors.append("swupdate_%.bbappend must set SWUPDATE_SIGNING = \"\" (UPD-03, AC2)")
+        if "swupdate.cfg" not in app_text or "hwrevision" not in app_text:
+            errors.append("swupdate_%.bbappend must install swupdate.cfg and hwrevision")
+
+    hwrev_file = root / "meta-nextoomio/recipes-support/swupdate/files/hwrevision"
+    if hwrev_file.is_file():
+        hwrev_text = hwrev_file.read_text(encoding="utf-8")
+        if not re.search(r"^raspberrypi4-64\s+1\.0", hwrev_text.strip()):
+            errors.append("hwrevision must specify 'raspberrypi4-64 1.0' matching hardware-compatibility declaration")
+
+    update_img_bb = root / "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb"
+    if update_img_bb.is_file():
+        up_text = update_img_bb.read_text(encoding="utf-8")
+        if "inherit swupdate" not in up_text:
+            errors.append("nextoomio-update-image.bb must inherit swupdate")
+        if "IMAGE_DEPENDS" not in up_text or "nextoomio-image" not in up_text:
+            errors.append("nextoomio-update-image.bb must declare IMAGE_DEPENDS = 'nextoomio-image'")
+        if "SWUPDATE_IMAGES" not in up_text or "nextoomio-image" not in up_text:
+            errors.append("nextoomio-update-image.bb must declare SWUPDATE_IMAGES containing 'nextoomio-image'")
+        if 'SWUPDATE_SIGNING = ""' not in up_text:
+            errors.append("nextoomio-update-image.bb must set SWUPDATE_SIGNING = \"\" (UPD-03, AC2)")
+
+    kas_base = root / "kas/base.yml"
+    if kas_base.is_file():
+        kas_text = kas_base.read_text(encoding="utf-8")
+        if "nextoomio-update-image" not in kas_text:
+            errors.append("kas/base.yml: target must include nextoomio-update-image")
+
+    if yocto_wf.is_file():
+        wf_text = yocto_wf.read_text(encoding="utf-8")
+        if "*.swu" not in wf_text:
+            errors.append(".github/workflows/yocto-build.yml: artifact upload must publish *.swu update file (AC5)")
+        if "bitbake -p nextoomio-image nextoomio-update-image" not in wf_text:
+            errors.append(".github/workflows/yocto-build.yml: parse-only check must parse nextoomio-image and nextoomio-update-image")
+
     # Component register check in ARCHITECTURE.md section 10
     arch_doc = root / "ARCHITECTURE.md"
     if arch_doc.is_file():
@@ -686,6 +802,12 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys.service",
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-setup.sh",
         "meta-nextoomio/recipes-nextoomio/nextoomio-ssh-keys/files/nextoomio-ssh-keys-stop.sh",
+        "meta-nextoomio/classes/image_types_nextoomio.bbclass",
+        "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend",
+        "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb",
+        "meta-nextoomio/recipes-support/swupdate/files/sw-description",
+        "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg",
+        "meta-nextoomio/recipes-support/swupdate/files/hwrevision",
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
     ]
@@ -856,6 +978,72 @@ def run_self_tests() -> int:
         ap_bb_path.write_text(orig_ap_bb, encoding="utf-8")
         print("  test_check_fails_when_do_compile_derives_invalid_overlay: OK")
 
+        # 18. AC1 / D-008: Fail when IMAGE_FSTYPES in nextoomio-image.bb is missing 'swu'
+        img_bb_p = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_img_bb_p = img_bb_p.read_text(encoding="utf-8")
+        img_bb_p.write_text(orig_img_bb_p.replace('swu', ''), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_FSTYPES must contain 'swu'" in e for e in errs), f"Expected swu in IMAGE_FSTYPES failure: {errs}"
+        img_bb_p.write_text(orig_img_bb_p, encoding="utf-8")
+        print("  test_check_fails_when_image_fstypes_missing_swu: OK")
+
+        # 19. AC1: Fail when sw-description is missing hardware-compatibility
+        sw_desc_p = tmp_root / "meta-nextoomio/recipes-support/swupdate/files/sw-description"
+        orig_sw_desc = sw_desc_p.read_text(encoding="utf-8")
+        sw_desc_p.write_text(orig_sw_desc.replace('hardware-compatibility', 'ignored_hw'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("hardware-compatibility" in e for e in errs), f"Expected hardware-compatibility failure: {errs}"
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_missing_hardware_compatibility: OK")
+
+        # 20. AC1: Fail when sw-description is missing config-schema-range
+        sw_desc_p.write_text(orig_sw_desc.replace('config-schema-range', 'ignored_schema'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("config-schema-range" in e for e in errs), f"Expected config-schema-range failure: {errs}"
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_missing_config_schema_range: OK")
+
+        # 21. AC1: Fail when sw-description is missing sha256 checksums
+        sw_desc_p.write_text(orig_sw_desc.replace('sha256', 'md5'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("sha256 checksums" in e for e in errs), f"Expected sha256 failure: {errs}"
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_missing_sha256: OK")
+
+        # 22. AC3: Fail when slot limits in image_types_nextoomio.bbclass are altered
+        class_p = tmp_root / "meta-nextoomio/classes/image_types_nextoomio.bbclass"
+        orig_class = class_p.read_text(encoding="utf-8")
+        class_p.write_text(orig_class.replace('268435456', '999999'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("NEXTOOMIO_BOOT_SLOT_MAXSIZE" in e for e in errs), f"Expected size limit failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_size_limits_missing_or_altered: OK")
+
+        # 23. AC2: Fail when SWUPDATE_SIGNING is enabled
+        class_p.write_text(orig_class.replace('SWUPDATE_SIGNING = ""', 'SWUPDATE_SIGNING = "RSA"'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("SWUPDATE_SIGNING" in e for e in errs), f"Expected SWUPDATE_SIGNING failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_swupdate_signing_enabled: OK")
+
+        # 24. AC5: Fail when *.swu artifact upload is missing from yocto-build.yml
+        wf_p = tmp_root / ".github/workflows/yocto-build.yml"
+        orig_wf_p = wf_p.read_text(encoding="utf-8")
+        wf_p.write_text(orig_wf_p.replace('*.swu', '*.ignored'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("publish *.swu" in e for e in errs), f"Expected *.swu upload failure: {errs}"
+        wf_p.write_text(orig_wf_p, encoding="utf-8")
+        print("  test_check_fails_when_swu_artifact_upload_missing: OK")
+
+        # 25. AC1 / D-008: Fail when distro conf is missing image_types_nextoomio
+        dist_p = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
+        orig_dist_p = dist_p.read_text(encoding="utf-8")
+        dist_p.write_text(orig_dist_p.replace('image_types_nextoomio', 'ignored_class'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("image_types_nextoomio" in e for e in errs), f"Expected image_types_nextoomio failure: {errs}"
+        dist_p.write_text(orig_dist_p, encoding="utf-8")
+        print("  test_check_fails_when_distro_conf_missing_swupdate_class: OK")
+
     print("OK: all AC5 automated self-tests passed.")
     return 0
 
@@ -870,7 +1058,7 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2/P0-F6.1 rules validated.")
+    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, SWUpdate .swu configuration, and D-004/D-005/P0-F3.2/P0-F4.2/P0-F6.1 rules validated.")
     return 0
 
 

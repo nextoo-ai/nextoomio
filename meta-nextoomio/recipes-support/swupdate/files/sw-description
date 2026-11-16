@@ -1,0 +1,71 @@
+software =
+{
+    version = "0.0.1-dev";
+    description = "nextoomio system update image";
+    hardware-compatibility: [ "raspberrypi4-64" ];
+    config-schema-range = "1..1";
+    config-schema-min = "1";
+    config-schema-max = "1";
+
+    images: (
+        {
+            filename = "nextoomio-boot.vfat.gz";
+            device = "/dev/mmcblk0p2";
+            type = "raw";
+            compressed = "zlib";
+            sha256 = "@nextoomio-boot.vfat.gz@";
+            installed-directly = true;
+        },
+        {
+            filename = "nextoomio-image-raspberrypi4-64.rootfs.ext4.gz";
+            device = "/dev/mmcblk0p5";
+            type = "raw";
+            compressed = "zlib";
+            sha256 = "@nextoomio-image-raspberrypi4-64.rootfs.ext4.gz@";
+            installed-directly = true;
+        }
+    );
+
+    stable = {
+        copy1 = {
+            images: (
+                {
+                    filename = "nextoomio-boot.vfat.gz";
+                    device = "/dev/mmcblk0p2";
+                    type = "raw";
+                    compressed = "zlib";
+                    sha256 = "@nextoomio-boot.vfat.gz@";
+                    installed-directly = true;
+                },
+                {
+                    filename = "nextoomio-image-raspberrypi4-64.rootfs.ext4.gz";
+                    device = "/dev/mmcblk0p5";
+                    type = "raw";
+                    compressed = "zlib";
+                    sha256 = "@nextoomio-image-raspberrypi4-64.rootfs.ext4.gz@";
+                    installed-directly = true;
+                }
+            );
+        };
+        copy2 = {
+            images: (
+                {
+                    filename = "nextoomio-boot.vfat.gz";
+                    device = "/dev/mmcblk0p3";
+                    type = "raw";
+                    compressed = "zlib";
+                    sha256 = "@nextoomio-boot.vfat.gz@";
+                    installed-directly = true;
+                },
+                {
+                    filename = "nextoomio-image-raspberrypi4-64.rootfs.ext4.gz";
+                    device = "/dev/mmcblk0p6";
+                    type = "raw";
+                    compressed = "zlib";
+                    sha256 = "@nextoomio-image-raspberrypi4-64.rootfs.ext4.gz@";
+                    installed-directly = true;
+                }
+            );
+        };
+    };
+}

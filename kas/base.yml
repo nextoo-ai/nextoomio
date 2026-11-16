@@ -4,7 +4,9 @@ header:
   version: 14
 
 distro: nextoomio
-target: nextoomio-image
+target:
+  - nextoomio-image
+  - nextoomio-update-image
 
 repos:
   nextoomio:
