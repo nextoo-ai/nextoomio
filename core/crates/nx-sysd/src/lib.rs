@@ -1218,7 +1218,8 @@ software = {{
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let capacity = 10 * 1024 * 1024;
-        let backend = MockSlotBackend::new(Slot::A, Slot::A);
+        let mut backend = MockSlotBackend::new(Slot::A, Slot::A);
+        backend.abort_during_write = true;
         let storage = FileStagingStorage::new(&temp_dir, capacity);
         let journal = FileJournalStorage::new(&temp_dir);
 
@@ -1238,18 +1239,28 @@ software = {{
             .unwrap();
         engine.validate().unwrap();
 
-        // Simulate install beginning (persisting 'installing' state)
-        engine
-            .journal
-            .commit_state(
-                UpdateTransactionState::Installing,
-                Some("tx-test-ac5".to_string()),
-                Some("root_b".to_string()),
-                swu_bytes.len() as u64,
-                Some(Sha256::hex(&swu_bytes)),
-                None,
-            )
-            .unwrap();
+        // Simulate sudden power loss or reboot during real install() execution mid write_partition
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.install();
+        }));
+        assert!(
+            panic_result.is_err(),
+            "install must be interrupted mid write_partition"
+        );
+
+        // Assert that the journal on disk holds 'Installing' at the point of interruption
+        let interrupted_journal = FileJournalStorage::new(&temp_dir);
+        let controller = crate::journal::JournalController::load_or_init(
+            interrupted_journal,
+            "root_a",
+            "root_a",
+        )
+        .expect("journal must be loadable after interrupted install");
+        assert_eq!(
+            controller.current().state,
+            UpdateTransactionState::Installing,
+            "journal must hold 'installing' state at the point of interruption"
+        );
 
         // Simulate sudden reboot or power loss: a fresh process starts and runs boot reconciliation
         let reboot_backend = MockSlotBackend::new(Slot::A, Slot::A);
@@ -1277,12 +1288,9 @@ software = {{
             "interrupted install must not result in installed state"
         );
         assert_eq!(status.state, UpdateTransactionState::Failed);
+        assert_eq!(status.error_code, Some("update_truncated".to_string()));
 
         // AC5: Device runs the previous slot
-        assert_eq!(status.active_slot, "root_a");
-        assert_eq!(status.default_slot, "root_a");
-
-        // AC5: State is not installed; active and default slot remain unchanged (previous slot)
         assert_eq!(status.active_slot, "root_a");
         assert_eq!(status.default_slot, "root_a");
 
@@ -1395,8 +1403,100 @@ software =
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_p0_f4_4_install_fails_when_target_partition_absent() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-target-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let slot_a_boot_file = temp_dir.join("slot_a_boot.img");
+        let slot_a_root_file = temp_dir.join("slot_a_root.img");
+        std::fs::write(&slot_a_boot_file, b"slot-a-boot").unwrap();
+        std::fs::write(&slot_a_root_file, b"slot-a-root").unwrap();
+
+        let active_boot_dir = temp_dir.join("boot_active");
+        std::fs::create_dir_all(&active_boot_dir).unwrap();
+        std::fs::write(
+            active_boot_dir.join("nextoomio-hardware.txt"),
+            "dtoverlay=hifiberry-amp\n",
+        )
+        .unwrap();
+
+        std::env::set_var("NEXTOOMIO_SLOT", "root_a");
+        std::env::set_var("NEXTOOMIO_SLOT_A_BOOT", &slot_a_boot_file);
+        std::env::set_var("NEXTOOMIO_SLOT_A_ROOT", &slot_a_root_file);
+        std::env::set_var("NEXTOOMIO_ACTIVE_BOOT_DIR", &active_boot_dir);
+        // Explicitly remove target Slot B overrides so it targets physical /dev/mmcblk0p3 / p6
+        std::env::remove_var("NEXTOOMIO_SLOT_B_BOOT");
+        std::env::remove_var("NEXTOOMIO_SLOT_B_ROOT");
+        std::env::remove_var("NEXTOOMIO_INACTIVE_BOOT_DIR");
+
+        let capacity = 10 * 1024 * 1024;
+        let update_dir = temp_dir.join("update");
+
+        let backend = PhysicalSlotBackend;
+        let storage = FileStagingStorage::new(&update_dir, capacity);
+        let journal = FileJournalStorage::new(&update_dir);
+        let mut engine = UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some("1.0".to_string()),
+            Some(1),
+            Some(capacity),
+        )
+        .unwrap();
+
+        let swu_bytes = make_valid_swu("1.0", 1, b"boot", b"root");
+        engine
+            .stage_upload(Cursor::new(&swu_bytes), Some(swu_bytes.len() as u64))
+            .unwrap();
+        engine.validate().unwrap();
+
+        // Target partition device /dev/mmcblk0p3 is absent on test workstation/CI.
+        // write_partition must verify existence and block-device type before writing and must NOT create it.
+        let install_err = engine
+            .install()
+            .expect_err("install must fail when target partition device is absent");
+        match install_err {
+            UpdateEngineError::Storage(msg) => {
+                assert!(
+                    msg.contains("does not exist") || msg.contains("not a block device"),
+                    "error message should indicate absent or invalid target partition: {msg}"
+                );
+            }
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+
+        // State must transition to Failed (not Installed)
+        assert_eq!(
+            engine.status().state,
+            UpdateTransactionState::Failed,
+            "engine state must be Failed when install fails due to absent target partition"
+        );
+
+        // Ensure no regular file was created under /dev
+        assert!(
+            !std::path::Path::new("/dev/mmcblk0p3").exists(),
+            "/dev/mmcblk0p3 must not be created as a regular file"
+        );
+
+        // Clean up environment variables
+        std::env::remove_var("NEXTOOMIO_SLOT");
+        std::env::remove_var("NEXTOOMIO_SLOT_A_BOOT");
+        std::env::remove_var("NEXTOOMIO_SLOT_A_ROOT");
+        std::env::remove_var("NEXTOOMIO_ACTIVE_BOOT_DIR");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[test]
     fn test_p0_f4_4_cli_end_to_end_file_storage_and_physical_backend() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!("nx-test-cli-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();

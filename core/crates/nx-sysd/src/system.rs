@@ -144,6 +144,7 @@ pub struct MockSlotBackend {
     pub written_partitions: Vec<(Slot, PartitionType)>,
     pub corrupt_readback: bool,
     pub write_active_slot_glitch: bool,
+    pub abort_during_write: bool,
 }
 
 impl MockSlotBackend {
@@ -166,6 +167,7 @@ impl MockSlotBackend {
             written_partitions: Vec::new(),
             corrupt_readback: false,
             write_active_slot_glitch: false,
+            abort_during_write: false,
         }
     }
 }
@@ -195,6 +197,9 @@ impl SlotBackend for MockSlotBackend {
         mut reader: R,
         size: u64,
     ) -> Result<(), String> {
+        if self.abort_during_write {
+            panic!("simulated power cut or reboot during write_partition");
+        }
         self.written_partitions.push((slot, partition));
         let mut buf = vec![0u8; size as usize];
         reader.read_exact(&mut buf).map_err(|e| {
@@ -290,22 +295,11 @@ fn mount_vfat(dev: &Path, target: &Path) -> Result<(), String> {
     };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        // Fall back to external mount utility if direct syscall failed (e.g. loop setup or user namespace)
-        let output = std::process::Command::new("mount")
-            .arg("-t")
-            .arg("vfat")
-            .arg(dev)
-            .arg(target)
-            .output()
-            .map_err(|e| format!("mount syscall failed ({err}) and exec mount failed: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "failed to mount {} at {} (vfat): syscall {err}; util: {stderr}",
-                dev.display(),
-                target.display()
-            ));
-        }
+        return Err(format!(
+            "failed to mount {} at {} (vfat): {err}",
+            dev.display(),
+            target.display()
+        ));
     }
     Ok(())
 }
@@ -349,17 +343,7 @@ fn unmount_target(target: &Path) -> Result<(), String> {
     let ret = unsafe { umount2(c_target.as_ptr(), 0) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        let output = std::process::Command::new("umount")
-            .arg(target)
-            .output()
-            .map_err(|e| format!("umount syscall failed ({err}) and exec umount failed: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "failed to unmount {}: syscall {err}; util: {stderr}",
-                target.display()
-            ));
-        }
+        return Err(format!("failed to unmount {}: {err}", target.display()));
     }
     Ok(())
 }
@@ -428,6 +412,16 @@ impl Drop for ScopedBootMount {
 pub struct PhysicalSlotBackend;
 
 impl PhysicalSlotBackend {
+    fn is_device_path_overridden(&self, slot: Slot, partition: PartitionType) -> bool {
+        let env_var = match (slot, partition) {
+            (Slot::A, PartitionType::Boot) => "NEXTOOMIO_SLOT_A_BOOT",
+            (Slot::A, PartitionType::Root) => "NEXTOOMIO_SLOT_A_ROOT",
+            (Slot::B, PartitionType::Boot) => "NEXTOOMIO_SLOT_B_BOOT",
+            (Slot::B, PartitionType::Root) => "NEXTOOMIO_SLOT_B_ROOT",
+        };
+        std::env::var(env_var).is_ok()
+    }
+
     fn get_device_path(&self, slot: Slot, partition: PartitionType) -> PathBuf {
         let env_var = match (slot, partition) {
             (Slot::A, PartitionType::Boot) => "NEXTOOMIO_SLOT_A_BOOT",
@@ -537,10 +531,34 @@ impl SlotBackend for PhysicalSlotBackend {
         size: u64,
     ) -> Result<(), String> {
         let path = self.get_device_path(slot, partition);
+        let is_override = self.is_device_path_overridden(slot, partition);
+
+        if !path.exists() {
+            return Err(format!(
+                "target partition device {} does not exist",
+                path.display()
+            ));
+        }
+
+        if !is_override {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                let meta = fs::metadata(&path)
+                    .map_err(|e| format!("cannot stat target partition {}: {e}", path.display()))?;
+                if !meta.file_type().is_block_device() {
+                    return Err(format!(
+                        "target partition {} is not a block device",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(is_override)
             .truncate(false)
             .open(&path)
             .map_err(|e| format!("cannot open partition {}: {e}", path.display()))?;
