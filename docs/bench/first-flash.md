@@ -72,7 +72,7 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
      # Change into the extracted artifact directory
      cd nextoomio-rpi4-64
      ```
-     `gh run download` extracts the artifact contents directly. Using `--dir <directory>` with `-p "nextoomio-rpi4-64-*"` ensures that files are placed into a predictable folder regardless of whether single or multiple artifacts are selected. No separate `unzip` command is needed when using `gh`.
+     `gh run download` extracts the artifact contents directly. Only one artifact matches the pattern `nextoomio-rpi4-64-*` for a given run; using `--dir nextoomio-rpi4-64` ensures its files are placed into that dedicated directory rather than the current working directory. No separate `unzip` command is needed when using `gh`.
 
    - **Using the GitHub Web UI:**
      1. Navigate to the repository's **Actions** tab.

@@ -258,11 +258,21 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "selector partition must hold only the boot-selection file (D-005)"
             )
 
-        if not re.search(r"^\s*INCOMPATIBLE_LICENSE\s*=", conf_text, re.MULTILINE):
+        m_incompat = re.search(r'^\s*INCOMPATIBLE_LICENSE\s*=\s*["\']([^"\']*)["\']', conf_text, re.MULTILINE)
+        if not m_incompat:
             errors.append(
                 "meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must be configured "
                 "with hard assignment '=' to reject unaccepted licenses (AC4)"
             )
+        else:
+            incompat_val = m_incompat.group(1).split()
+            required_licenses = {"AGPL-3.0-only", "AGPL-3.0-or-later", "AGPL-1.0-only", "AGPL-1.0-or-later"}
+            missing_licenses = required_licenses - set(incompat_val)
+            if missing_licenses:
+                errors.append(
+                    f"meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must include "
+                    f"AGPL licenses {sorted(required_licenses)} (missing: {sorted(missing_licenses)}) (AC4)"
+                )
 
     autoboot_bb = root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb"
     if autoboot_bb.is_file():
@@ -290,11 +300,19 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
                 "must include 'nextoomio-audio-profile' (D-011, D-012, P0-F6.1)"
             )
-        if not re.search(r"^\s*IMAGE_ROOTFS_MAXSIZE\s*=", image_text, re.MULTILINE):
+        m_maxsize = re.search(r'^\s*IMAGE_ROOTFS_MAXSIZE\s*=\s*["\']?(\d+)["\']?', image_text, re.MULTILINE)
+        if not m_maxsize:
             errors.append(
                 "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_ROOTFS_MAXSIZE "
                 "must be configured with hard assignment '=' to enforce the root slot size budget (AC2)"
             )
+        else:
+            maxsize_val = int(m_maxsize.group(1))
+            if maxsize_val <= 0 or maxsize_val > 3145728:
+                errors.append(
+                    f"meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_ROOTFS_MAXSIZE ({maxsize_val}) "
+                    "must be positive and not exceed the 3 GiB root slot budget (3145728 KiB) per ARCHITECTURE.md section 3.6 (AC2)"
+                )
 
     # Wic layout verification (ARCHITECTURE.md section 3.6, AC2, AC4, AC5)
     wks_path = root / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
@@ -1039,7 +1057,7 @@ def run_self_tests() -> int:
         avahi_bbappend.write_text(orig_avahi_bbappend, encoding="utf-8")
         print("  test_check_fails_when_recipe_uses_workdir_for_file_source: OK")
 
-        # 24. AC2: Fail when IMAGE_ROOTFS_MAXSIZE is missing or weakly assigned in nextoomio-image.bb
+        # 24. AC2: Fail when IMAGE_ROOTFS_MAXSIZE is missing, weakly assigned, or exceeds budget
         image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
         orig_image_bb = image_bb.read_text(encoding="utf-8")
         image_bb.write_text(re.sub(r"^\s*IMAGE_ROOTFS_MAXSIZE\b[^\n]*\n", "", orig_image_bb, flags=re.MULTILINE), encoding="utf-8")
@@ -1048,10 +1066,13 @@ def run_self_tests() -> int:
         image_bb.write_text(re.sub(r"IMAGE_ROOTFS_MAXSIZE\s*=", "IMAGE_ROOTFS_MAXSIZE ?=", orig_image_bb), encoding="utf-8")
         errs = validate_layer(tmp_root)
         assert any("IMAGE_ROOTFS_MAXSIZE must be configured" in e for e in errs), f"Expected weak assignment failure: {errs}"
+        image_bb.write_text(re.sub(r'IMAGE_ROOTFS_MAXSIZE\s*=\s*"[^"]*"', 'IMAGE_ROOTFS_MAXSIZE = "9999999"', orig_image_bb), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must be positive and not exceed the 3 GiB root slot budget" in e for e in errs), f"Expected budget exceeded failure: {errs}"
         image_bb.write_text(orig_image_bb, encoding="utf-8")
-        print("  test_check_fails_when_image_rootfs_maxsize_missing: OK")
+        print("  test_check_fails_when_image_rootfs_maxsize_invalid: OK")
 
-        # 25. AC4: Fail when INCOMPATIBLE_LICENSE is missing or weakly assigned in nextoomio.conf
+        # 25. AC4: Fail when INCOMPATIBLE_LICENSE is missing, weakly assigned, or omits AGPL
         distro_conf = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
         orig_distro_conf = distro_conf.read_text(encoding="utf-8")
         distro_conf.write_text(re.sub(r"^\s*INCOMPATIBLE_LICENSE\b[^\n]*\n", "", orig_distro_conf, flags=re.MULTILINE), encoding="utf-8")
@@ -1060,8 +1081,11 @@ def run_self_tests() -> int:
         distro_conf.write_text(re.sub(r"INCOMPATIBLE_LICENSE\s*=", "INCOMPATIBLE_LICENSE ?=", orig_distro_conf), encoding="utf-8")
         errs = validate_layer(tmp_root)
         assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected weak assignment failure: {errs}"
+        distro_conf.write_text(re.sub(r'INCOMPATIBLE_LICENSE\s*=\s*"[^"]*"', 'INCOMPATIBLE_LICENSE = "GPL-3.0"', orig_distro_conf), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("INCOMPATIBLE_LICENSE must include AGPL licenses" in e for e in errs), f"Expected missing AGPL license failure: {errs}"
         distro_conf.write_text(orig_distro_conf, encoding="utf-8")
-        print("  test_check_fails_when_incompatible_license_missing: OK")
+        print("  test_check_fails_when_incompatible_license_invalid: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0
