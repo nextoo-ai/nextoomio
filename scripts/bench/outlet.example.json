@@ -1,0 +1,88 @@
+{
+  "_comment": "Example switched outlet configuration for nextoomio test bench (P0-F7.1). Copy to scripts/bench/outlet.json or ~/.config/nextoomio/outlet.json and adjust for your local outlet hardware. Never commit real credentials or private network addresses (AC3, CQ-R6).",
+  "driver": "http",
+  "host": "http://outlet.local",
+  "timeout_seconds": 10.0,
+  "cycle_delay_seconds": 5.0,
+  "auth": {
+    "type": "none"
+  },
+  "actions": {
+    "on": {
+      "method": "POST",
+      "path": "/relay/0?turn=on"
+    },
+    "off": {
+      "method": "POST",
+      "path": "/relay/0?turn=off"
+    },
+    "status": {
+      "method": "GET",
+      "path": "/relay/0",
+      "on_pattern": "\"ison\":\\s*true",
+      "off_pattern": "\"ison\":\\s*false"
+    }
+  },
+  "_examples": {
+    "shelly_gen1": {
+      "driver": "shelly",
+      "generation": 1,
+      "channel": 0,
+      "host": "http://shellyplug-sample.local",
+      "auth": {
+        "type": "basic",
+        "username": "admin",
+        "password": "sample-password"
+      }
+    },
+    "shelly_gen2": {
+      "driver": "shelly",
+      "generation": 2,
+      "channel": 0,
+      "host": "http://shellyplus-sample.local",
+      "auth": {
+        "type": "none"
+      }
+    },
+    "tasmota": {
+      "driver": "tasmota",
+      "host": "http://tasmota-sample.local",
+      "relay": 1
+    },
+    "home_assistant_rest": {
+      "driver": "http",
+      "host": "http://homeassistant.local:8123",
+      "auth": {
+        "type": "bearer",
+        "token": "sample-long-lived-access-token"
+      },
+      "actions": {
+        "on": {
+          "method": "POST",
+          "path": "/api/services/switch/turn_on",
+          "body": {
+            "entity_id": "switch.bench_outlet"
+          }
+        },
+        "off": {
+          "method": "POST",
+          "path": "/api/services/switch/turn_off",
+          "body": {
+            "entity_id": "switch.bench_outlet"
+          }
+        },
+        "status": {
+          "method": "GET",
+          "path": "/api/states/switch.bench_outlet",
+          "on_pattern": "\"state\":\\s*\"on\"",
+          "off_pattern": "\"state\":\\s*\"off\""
+        }
+      }
+    },
+    "mock_for_dry_run": {
+      "driver": "mock",
+      "host": "mock://bench-outlet",
+      "mock_initial_state": "on"
+    }
+  }
+}
