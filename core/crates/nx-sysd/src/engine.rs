@@ -141,22 +141,40 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// Initializes or loads an update engine instance.
     pub fn new(
         backend: B,
-        mut storage: S,
+        storage: S,
         journal_storage: J,
         hardware_model: Option<String>,
         schema_version: Option<u32>,
         capacity: Option<u64>,
     ) -> Result<Self, UpdateEngineError> {
+        Self::new_with_compatibility_reader(
+            backend,
+            storage,
+            journal_storage,
+            hardware_model,
+            schema_version,
+            capacity,
+            crate::identity::read_hardware_compatibility,
+        )
+    }
+
+    pub(crate) fn new_with_compatibility_reader(
+        backend: B,
+        mut storage: S,
+        journal_storage: J,
+        hardware_model: Option<String>,
+        schema_version: Option<u32>,
+        capacity: Option<u64>,
+        read_compatibility: impl FnOnce() -> Result<String, String>,
+    ) -> Result<Self, UpdateEngineError> {
         let cap = capacity.unwrap_or(DEFAULT_STAGING_RESERVATION);
         let hw = match hardware_model {
             Some(h) => h,
-            None => crate::identity::query_device_identity()
-                .map(|id| id.hardware_compatibility)
-                .map_err(|e| {
-                    UpdateEngineError::Storage(format!(
-                        "failed to determine hardware compatibility from device identity: {e}"
-                    ))
-                })?,
+            None => read_compatibility().map_err(|e| {
+                UpdateEngineError::Storage(format!(
+                    "failed to determine hardware compatibility from device identity: {e}"
+                ))
+            })?,
         };
         let schema = schema_version.unwrap_or(DEFAULT_SCHEMA_VERSION);
 

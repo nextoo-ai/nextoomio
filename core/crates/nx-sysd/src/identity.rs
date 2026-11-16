@@ -167,6 +167,26 @@ pub fn parse_release_file(content: &str) -> Result<ReleaseInfo, IdentityError> {
     })
 }
 
+/// Read only the update compatibility value from the image release file.
+pub fn read_hardware_compatibility_with_path(path: &Path) -> Result<String, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    for line in content.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "HARDWARE_COMPATIBILITY" {
+                let value = value.trim().trim_matches(&['\"', '\''][..]);
+                if !value.is_empty() {
+                    return Ok(value.to_string());
+                }
+            }
+        }
+    }
+    Err(IdentityError::HardwareCompatibilityNotFound.to_string())
+}
+
+pub fn read_hardware_compatibility() -> Result<String, String> {
+    read_hardware_compatibility_with_path(Path::new("/etc/nextoomio-release"))
+}
+
 /// Detects running slot from /proc/cmdline (D-004).
 /// The running slot is derived from root=PARTUUID=4e58544d-05 (A) or -06 (B) only,
 /// anything else is reported as unknown (CQ-R2, CQ-R14).
@@ -182,15 +202,15 @@ pub fn detect_running_slot_with_path(cmdline_path: &Path) -> String {
 pub fn parse_slot_from_cmdline(cmdline: &str) -> String {
     // Partition 5 (PARTUUID=4e58544d-05) is slot A (root_a)
     // Partition 6 (PARTUUID=4e58544d-06) is slot B (root_b)
-    if cmdline.contains("root=PARTUUID=4e58544d-05") || cmdline.contains("PARTUUID=4e58544d-05") {
-        "a".to_string()
-    } else if cmdline.contains("root=PARTUUID=4e58544d-06")
-        || cmdline.contains("PARTUUID=4e58544d-06")
+    match cmdline
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("root="))
     {
-        "b".to_string()
-    } else {
-        "unknown".to_string()
+        Some("PARTUUID=4e58544d-05") => "a",
+        Some("PARTUUID=4e58544d-06") => "b",
+        _ => "unknown",
     }
+    .to_string()
 }
 
 /// Detects board model from device tree (AC2).
@@ -347,7 +367,8 @@ pub fn query_device_identity_with_paths(
         build_id: release.build_id,
         running_slot: slot,
         board_model: board,
-        hardware_compatibility: release.hardware_compatibility,
+        hardware_compatibility: read_hardware_compatibility_with_path(paths.release_file)
+            .map_err(|_| IdentityError::HardwareCompatibilityNotFound)?,
         device_id: dev_id,
     })
 }
@@ -418,6 +439,10 @@ SOURCE_COMMIT="80903cb41d775175a82c3470a402ef9a4b2de01f"
         );
         assert_eq!(parse_slot_from_cmdline("console=serial0,115200"), "unknown");
         assert_eq!(parse_slot_from_cmdline("root=/dev/mmcblk0p5 ro"), "unknown");
+        assert_eq!(
+            parse_slot_from_cmdline("resume=PARTUUID=4e58544d-05 root=/dev/foo"),
+            "unknown"
+        );
     }
 
     #[test]
@@ -520,8 +545,6 @@ SOURCE_COMMIT="80903cb41d775175a82c3470a402ef9a4b2de01f"
         )
         .unwrap();
         fs::write(&cmdline_file, "root=PARTUUID=4e58544d-05 ro\n").unwrap();
-        fs::write(&dt_model_file, "Raspberry Pi 4 Model B Rev 1.4\0").unwrap();
-
         let paths = IdentityPaths {
             release_file: &release_file,
             cmdline_file: &cmdline_file,
@@ -529,6 +552,7 @@ SOURCE_COMMIT="80903cb41d775175a82c3470a402ef9a4b2de01f"
             device_id_file: &device_id_file,
         };
 
+        fs::write(&dt_model_file, "Raspberry Pi 4 Model B Rev 1.4\0").unwrap();
         let identity = query_device_identity_with_paths(&paths).expect("identity query must pass");
         assert_eq!(identity.image_version, "0.0.1-dev");
         assert_eq!(
@@ -617,7 +641,6 @@ SOURCE_COMMIT="80903cb41d775175a82c3470a402ef9a4b2de01f"
         )
         .unwrap();
         fs::write(&cmdline_file, "root=PARTUUID=4e58544d-05 ro\n").unwrap();
-        fs::write(&dt_model_file, "Raspberry Pi 4 Model B Rev 1.4\0").unwrap();
 
         let paths = IdentityPaths {
             release_file: &release_file,
@@ -626,6 +649,25 @@ SOURCE_COMMIT="80903cb41d775175a82c3470a402ef9a4b2de01f"
             device_id_file: &device_id_file,
         };
 
+        // The default update path needs neither a device tree nor a device ID.
+        let backend =
+            crate::system::MockSlotBackend::new(crate::system::Slot::A, crate::system::Slot::A);
+        let storage = crate::system::MockStagingStorage::new(10 * 1024 * 1024);
+        let journal = crate::journal::MemoryJournalStorage::default();
+        let engine = crate::engine::UpdateEngine::new_with_compatibility_reader(
+            backend,
+            storage,
+            journal,
+            None,
+            Some(1),
+            Some(10 * 1024 * 1024),
+            || read_hardware_compatibility_with_path(&release_file),
+        )
+        .expect("engine initialization must not require device identity");
+        assert!(!device_id_file.exists());
+        assert!(!dt_model_file.exists());
+
+        fs::write(&dt_model_file, "Raspberry Pi 4 Model B Rev 1.4\0").unwrap();
         let identity = query_device_identity_with_paths(&paths).expect("identity query must pass");
         let hardware_report = HardwareIdentity {
             board_model: identity.board_model.clone(),
@@ -664,20 +706,6 @@ SOURCE_COMMIT="80903cb41d775175a82c3470a402ef9a4b2de01f"
         );
 
         // Verify engine initialized with this hardware compatibility string matches
-        let backend =
-            crate::system::MockSlotBackend::new(crate::system::Slot::A, crate::system::Slot::A);
-        let storage = crate::system::MockStagingStorage::new(10 * 1024 * 1024);
-        let journal = crate::journal::MemoryJournalStorage::default();
-        let engine = crate::engine::UpdateEngine::new(
-            backend,
-            storage,
-            journal,
-            Some(hardware_report.hardware_compatibility.clone()),
-            Some(1),
-            Some(10 * 1024 * 1024),
-        )
-        .expect("engine initialization must succeed");
-
         assert_eq!(
             engine.hardware_model,
             hardware_report.hardware_compatibility

@@ -28,7 +28,6 @@ fn print_usage() {
         nx-sysd identity                                 Print complete device identity as JSON\n  \
         nx-sysd version [--json]                         Print image version, commit, build ID, and slot\n  \
         nx-sysd hardware                                 Print board model and hardware compatibility JSON\n  \
-        nx-sysd device-id [--json]                       Print random persistent device ID\n  \
         nx-sysd init-device-id                           Initialize persistent device ID on /data\n\n\
         Update commands:\n  \
         nx-sysd update init-staging [--dir <path>] [--capacity <bytes>]\n  \
@@ -118,24 +117,6 @@ fn handle_hardware() -> ExitCode {
         }
         Err(e) => {
             eprintln!("Error querying hardware identity: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn handle_device_id(args: &[String]) -> ExitCode {
-    let want_json = args.iter().any(|a| a == "--json");
-    match get_or_create_device_id_with_path(Path::new(DEFAULT_DEVICE_ID_PATH)) {
-        Ok(dev_id) => {
-            if want_json {
-                println!("{{\"device_id\": \"{dev_id}\"}}");
-            } else {
-                println!("{dev_id}");
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("Error obtaining device ID: {e}");
             ExitCode::from(1)
         }
     }
@@ -454,23 +435,15 @@ fn handle_update(args: &[String]) -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    let prog_name = args.first().map(|s| s.as_str()).unwrap_or("nx-sysd");
-
-    // Check if invoked via nx-identity symlink
-    if prog_name.ends_with("nx-identity") {
-        return print_identity_json();
-    }
-
     if args.len() < 2 {
         print_usage();
         return ExitCode::SUCCESS;
     }
 
     match args[1].as_str() {
-        "identity" | "--identity" => print_identity_json(),
-        "version" | "--version" | "-V" => handle_version(&args[2..]),
-        "hardware" | "--hardware" => handle_hardware(),
-        "device-id" | "--device-id" => handle_device_id(&args[2..]),
+        "identity" => print_identity_json(),
+        "version" => handle_version(&args[2..]),
+        "hardware" => handle_hardware(),
         "init-device-id" => handle_init_device_id(),
         "update" => handle_update(&args[2..]),
         "help" | "--help" | "-h" => {
