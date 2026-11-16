@@ -172,13 +172,17 @@ fn handle_update(args: &[String]) -> ExitCode {
 
     match subcmd {
         "init-staging" => {
-            let engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
+            let mut engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
                 Ok(e) => e,
                 Err(err) => {
                     eprintln!("Error: {err}");
                     return ExitCode::from(1);
                 }
             };
+            if let Err(err) = engine.reconcile_boot() {
+                eprintln!("Reconciliation error: {err}");
+                return ExitCode::from(1);
+            }
             let status = engine.status();
             match serde_json::to_string_pretty(&status) {
                 Ok(j) => println!("{j}"),

@@ -175,7 +175,14 @@ fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
     extern "C" {
         fn posix_fallocate(fd: std::os::raw::c_int, offset: i64, len: i64) -> std::os::raw::c_int;
     }
+    if capacity > i64::MAX as u64 {
+        return Err("capacity exceeds i64::MAX".to_string());
+    }
     let fd = file.as_raw_fd();
+    // SAFETY:
+    // 1. `file.as_raw_fd()` borrows a valid open file descriptor that remains open for the lifetime of `file`.
+    // 2. `capacity as i64` is sound and non-negative because `capacity <= i64::MAX as u64` was validated above.
+    // 3. `posix_fallocate` allocates disk extents without modifying file offset and does not truncate.
     let ret = unsafe { posix_fallocate(fd, 0, capacity as i64) };
     if ret != 0 {
         return Err(format!("posix_fallocate failed with errno {ret}"));
@@ -201,6 +208,10 @@ fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
     const F_ALLOCATEALL: u32 = 0x00000004;
     const F_PEOFPOSMODE: i32 = 3;
 
+    if capacity > i64::MAX as u64 {
+        return Err("capacity exceeds i64::MAX".to_string());
+    }
+
     let mut store = Fstore {
         fst_flags: F_ALLOCATEALL,
         fst_posmode: F_PEOFPOSMODE,
@@ -209,14 +220,21 @@ fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
         fst_bytesalloc: 0,
     };
     let fd = file.as_raw_fd();
+    // SAFETY:
+    // 1. `file.as_raw_fd()` borrows a valid open file descriptor that remains open for the lifetime of `file`.
+    // 2. `store` is uniquely borrowed (`&mut store`), stack-allocated, initialized, and matches the macOS kernel `fstore_t` ABI layout.
+    // 3. `capacity as i64` is sound and non-negative because `capacity <= i64::MAX as u64` was validated above.
     let ret = unsafe { fcntl(fd, F_PREALLOCATE, &mut store) };
     if ret != 0 {
-        file.set_len(capacity)
-            .map_err(|e| format!("cannot allocate {capacity} bytes: {e}"))?;
-    } else {
-        file.set_len(capacity)
-            .map_err(|e| format!("cannot allocate {capacity} bytes: {e}"))?;
+        return Err(format!(
+            "fcntl(F_PREALLOCATE) failed with error: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+    // F_PREALLOCATE allocates continuous physical disk blocks without updating logical file size (stat.st_size).
+    // Synchronize logical file size with the preallocated extents.
+    file.set_len(capacity)
+        .map_err(|e| format!("cannot set logical file size after preallocation: {e}"))?;
     Ok(())
 }
 
@@ -225,6 +243,29 @@ fn allocate_file_extents(file: &File, capacity: u64) -> Result<(), String> {
     file.set_len(capacity)
         .map_err(|e| format!("cannot allocate {capacity} bytes: {e}"))
 }
+
+/// Typed errors occurring during staging storage write and preallocation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StagingError {
+    Oversized { attempted: u64, limit: u64 },
+    Io(String),
+}
+
+impl fmt::Display for StagingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Oversized { attempted, limit } => {
+                write!(
+                    f,
+                    "payload size {attempted} bytes exceeds reserved staging capacity {limit} bytes"
+                )
+            }
+            Self::Io(msg) => write!(f, "storage I/O error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for StagingError {}
 
 /// Abstract storage backend for the preallocated update staging reservation.
 pub trait StagingStorage: Send + Sync {
@@ -242,7 +283,7 @@ pub trait StagingStorage: Send + Sync {
         &mut self,
         reader: R,
         declared_len: Option<u64>,
-    ) -> Result<u64, String>;
+    ) -> Result<u64, StagingError>;
 
     /// Reads the payload bytes (up to payload_size).
     fn read_payload(&self) -> Result<Vec<u8>, String>;
@@ -294,10 +335,13 @@ impl StagingStorage for MockStagingStorage {
         &mut self,
         mut reader: R,
         declared_len: Option<u64>,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, StagingError> {
         if let Some(decl) = declared_len {
             if decl > self.reserved_capacity {
-                return Err("declared length exceeds reserved staging capacity".to_string());
+                return Err(StagingError::Oversized {
+                    attempted: decl,
+                    limit: self.reserved_capacity,
+                });
             }
         }
 
@@ -307,13 +351,16 @@ impl StagingStorage for MockStagingStorage {
         loop {
             let n = reader
                 .read(&mut chunk)
-                .map_err(|e| format!("read error: {e}"))?;
+                .map_err(|e| StagingError::Io(format!("read error: {e}")))?;
             if n == 0 {
                 break;
             }
 
             if (read_bytes + n) as u64 > self.reserved_capacity {
-                return Err("streamed payload exceeds reserved staging capacity".to_string());
+                return Err(StagingError::Oversized {
+                    attempted: (read_bytes + n) as u64,
+                    limit: self.reserved_capacity,
+                });
             }
 
             self.buffer[read_bytes..read_bytes + n].copy_from_slice(&chunk[..n]);
@@ -360,6 +407,42 @@ impl FileStagingStorage {
             meta_file,
             reserved_capacity: capacity,
         }
+    }
+
+    /// Atomically persists metadata by writing to a temporary file, syncing, and renaming (UPD-05, AR-01).
+    fn write_meta_atomic(&self, payload_size: u64) -> Result<(), String> {
+        let meta = StagingMeta {
+            payload_size,
+            reserved_capacity: self.reserved_capacity,
+        };
+        let meta_json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
+        let tmp_path = self.staging_dir.join("staging.meta.tmp");
+
+        let mut tmp_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("cannot open {}: {e}", tmp_path.display()))?;
+
+        tmp_file
+            .write_all(meta_json.as_bytes())
+            .map_err(|e| format!("write error {}: {e}", tmp_path.display()))?;
+
+        tmp_file
+            .sync_all()
+            .map_err(|e| format!("sync_all error {}: {e}", tmp_path.display()))?;
+
+        drop(tmp_file);
+
+        fs::rename(&tmp_path, &self.meta_file)
+            .map_err(|e| format!("cannot rename to {}: {e}", self.meta_file.display()))?;
+
+        if let Ok(dir) = File::open(&self.staging_dir) {
+            let _ = dir.sync_all();
+        }
+
+        Ok(())
     }
 }
 
@@ -467,10 +550,13 @@ impl StagingStorage for FileStagingStorage {
         &mut self,
         mut reader: R,
         declared_len: Option<u64>,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, StagingError> {
         if let Some(decl) = declared_len {
             if decl > self.reserved_capacity {
-                return Err("declared length exceeds reserved staging capacity".to_string());
+                return Err(StagingError::Oversized {
+                    attempted: decl,
+                    limit: self.reserved_capacity,
+                });
             }
         }
 
@@ -478,10 +564,12 @@ impl StagingStorage for FileStagingStorage {
             .read(true)
             .write(true)
             .open(&self.staging_file)
-            .map_err(|e| format!("cannot open {}: {e}", self.staging_file.display()))?;
+            .map_err(|e| {
+                StagingError::Io(format!("cannot open {}: {e}", self.staging_file.display()))
+            })?;
 
         file.seek(SeekFrom::Start(0))
-            .map_err(|e| format!("seek error: {e}"))?;
+            .map_err(|e| StagingError::Io(format!("seek error: {e}")))?;
 
         let mut total_written = 0u64;
         let mut buf = [0u8; 65536];
@@ -489,27 +577,28 @@ impl StagingStorage for FileStagingStorage {
         loop {
             let n = reader
                 .read(&mut buf)
-                .map_err(|e| format!("read error: {e}"))?;
+                .map_err(|e| StagingError::Io(format!("read error: {e}")))?;
             if n == 0 {
                 break;
             }
             if total_written + (n as u64) > self.reserved_capacity {
-                return Err("streamed payload exceeds reserved staging capacity".to_string());
+                return Err(StagingError::Oversized {
+                    attempted: total_written + (n as u64),
+                    limit: self.reserved_capacity,
+                });
             }
             file.write_all(&buf[..n])
-                .map_err(|e| format!("write error: {e}"))?;
+                .map_err(|e| StagingError::Io(format!("write error: {e}")))?;
             total_written += n as u64;
         }
 
-        file.flush().map_err(|e| format!("flush error: {e}"))?;
+        // Ensure all written payload extents are committed to durable storage (UPD-05, AR-01)
+        file.sync_all()
+            .map_err(|e| StagingError::Io(format!("sync_all error on staging file: {e}")))?;
 
-        let meta = StagingMeta {
-            payload_size: total_written,
-            reserved_capacity: self.reserved_capacity,
-        };
-        let meta_json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
-        fs::write(&self.meta_file, meta_json)
-            .map_err(|e| format!("cannot write meta file: {e}"))?;
+        // Atomically commit metadata to disk before returning (write to temp file, sync, atomic rename)
+        self.write_meta_atomic(total_written)
+            .map_err(StagingError::Io)?;
 
         Ok(total_written)
     }
@@ -538,14 +627,7 @@ impl StagingStorage for FileStagingStorage {
     }
 
     fn cleanup(&mut self) -> Result<(), String> {
-        // Metadata is reset to zero, but staging.swu file is NEVER unlinked or truncated (AC6)
-        let meta = StagingMeta {
-            payload_size: 0,
-            reserved_capacity: self.reserved_capacity,
-        };
-        let meta_json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
-        fs::write(&self.meta_file, meta_json)
-            .map_err(|e| format!("cannot write meta file: {e}"))?;
-        Ok(())
+        // Metadata is reset to zero atomically, but staging.swu file is NEVER unlinked or truncated (AC6, AR-08)
+        self.write_meta_atomic(0)
     }
 }

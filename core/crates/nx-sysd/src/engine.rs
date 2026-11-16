@@ -8,7 +8,7 @@ use crate::cpio::{
 use crate::journal::{JournalController, JournalStorage};
 use crate::sha256::Sha256;
 use crate::sw_description::parse_sw_description;
-use crate::system::{SlotBackend, StagingStorage};
+use crate::system::{SlotBackend, StagingError, StagingStorage};
 use nx_protocol::{ErrorCode, UpdateTransactionState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -161,19 +161,14 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             .get_default_slot()
             .map_err(UpdateEngineError::Storage)?;
 
-        // Ensure staging storage is preallocated (AC1, AC6)
-        storage
+        let storage_init = storage
             .init_staging(cap)
-            .map_err(UpdateEngineError::Storage)?;
+            .map_err(UpdateEngineError::Storage);
+        storage_init?;
 
-        let mut journal =
+        let journal =
             JournalController::load_or_init(journal_storage, active.name(), default.name())
                 .map_err(UpdateEngineError::Storage)?;
-
-        // Reconcile interrupted boot (AC4)
-        journal
-            .reconcile_boot()
-            .map_err(UpdateEngineError::Storage)?;
 
         Ok(Self {
             backend,
@@ -185,13 +180,33 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         })
     }
 
+    /// Reconciles unfinalized boot/recovery state (e.g. interrupted upload while Receiving).
+    /// Called explicitly on real boot (by `nx-sysd update init-staging` / `nextoomio-update-init.service`).
+    pub fn reconcile_boot(&mut self) -> Result<(), UpdateEngineError> {
+        self.journal
+            .reconcile_boot()
+            .map_err(UpdateEngineError::Storage)
+    }
+
     /// Queries the current update transaction status.
+    /// Reports the live slot configuration directly from the backend (AC2).
     pub fn status(&self) -> UpdateStatus {
         let rec = self.journal.current();
+        let active_slot = self
+            .backend
+            .get_active_slot()
+            .map(|s| s.name().to_string())
+            .unwrap_or_else(|_| rec.active_slot.clone());
+        let default_slot = self
+            .backend
+            .get_default_slot()
+            .map(|s| s.name().to_string())
+            .unwrap_or_else(|_| rec.default_slot.clone());
+
         UpdateStatus {
             state: rec.state,
-            active_slot: rec.active_slot.clone(),
-            default_slot: rec.default_slot.clone(),
+            active_slot,
+            default_slot,
             target_slot: rec.target_slot.clone(),
             tx_id: rec.tx_id.clone(),
             payload_length: rec.payload_len,
@@ -209,6 +224,15 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         // AC5: Given an upload in progress, when a second upload or an install is requested, then it is refused as busy.
         if curr == UpdateTransactionState::Receiving || curr == UpdateTransactionState::Installing {
             return Err(UpdateEngineError::Busy);
+        }
+
+        // Strict state transitions: an upload can start from Idle, or from Failed (AC4 retry).
+        // Transition from Staged or Validated without abort is rejected.
+        if curr != UpdateTransactionState::Idle && curr != UpdateTransactionState::Failed {
+            return Err(UpdateEngineError::InvalidStateTransition {
+                from: curr,
+                to: UpdateTransactionState::Receiving,
+            });
         }
 
         // AC3: Check declared reservation limit upfront if provided
@@ -287,15 +311,23 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             .write_payload(&mut hashing_reader, declared_len)
         {
             Ok(bytes) => bytes,
-            Err(e) => {
-                let err = if e.contains("exceeds reserved") {
-                    UpdateEngineError::Oversized {
-                        size: self.reserved_capacity + 1,
-                        limit: self.reserved_capacity,
-                    }
-                } else {
-                    UpdateEngineError::Truncated(e)
+            Err(StagingError::Oversized { attempted, limit }) => {
+                let err = UpdateEngineError::Oversized {
+                    size: attempted,
+                    limit,
                 };
+                let _ = self.journal.commit_state(
+                    UpdateTransactionState::Failed,
+                    None,
+                    None,
+                    attempted,
+                    None,
+                    Some(err.error_code_str().to_string()),
+                );
+                return Err(err);
+            }
+            Err(StagingError::Io(msg)) => {
+                let err = UpdateEngineError::Truncated(msg);
                 let _ = self.journal.commit_state(
                     UpdateTransactionState::Failed,
                     None,
@@ -307,6 +339,24 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
                 return Err(err);
             }
         };
+
+        // If declared length was provided, verify actual received bytes match exactly
+        if let Some(decl) = declared_len {
+            if total_written != decl {
+                let err = UpdateEngineError::Truncated(format!(
+                    "upload stream ended after {total_written} bytes, expected {decl} bytes"
+                ));
+                let _ = self.journal.commit_state(
+                    UpdateTransactionState::Failed,
+                    None,
+                    None,
+                    total_written,
+                    None,
+                    Some(err.error_code_str().to_string()),
+                );
+                return Err(err);
+            }
+        }
 
         let sha256_hex = hashing_reader.hasher.hex_digest();
 

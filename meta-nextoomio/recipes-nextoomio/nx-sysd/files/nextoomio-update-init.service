@@ -1,8 +1,9 @@
 [Unit]
 Description=Initialize nextoomio update staging area (UPD-05, AR-08)
+DefaultDependencies=no
+RequiresMountsFor=/data
 After=data.mount
 Before=basic.target
-ConditionPathExists=/data
 
 [Service]
 Type=oneshot

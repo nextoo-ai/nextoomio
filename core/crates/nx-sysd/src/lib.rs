@@ -19,7 +19,7 @@ pub use journal::{
 };
 pub use system::{
     FileStagingStorage, MockSlotBackend, MockStagingStorage, PhysicalSlotBackend, Slot,
-    SlotBackend, StagingStorage,
+    SlotBackend, StagingError, StagingStorage,
 };
 
 #[cfg(test)]
@@ -496,6 +496,11 @@ software = {{
             )
             .expect("boot recovery init must succeed");
 
+            // On real boot, init-staging calls reconcile_boot()
+            engine
+                .reconcile_boot()
+                .expect("reconcile_boot must succeed");
+
             // AC4: when queried, no transaction is installable
             let st = engine.status();
             assert_eq!(st.state, UpdateTransactionState::Failed);
@@ -545,6 +550,104 @@ software = {{
             .expect_err("install must be refused as busy while upload is in progress");
         assert_eq!(err_install, UpdateEngineError::Busy);
         assert_eq!(err_install.error_code_str(), "update_busy");
+    }
+
+    #[test]
+    fn test_ac5_separate_engine_processes_over_same_journal_sees_receiving_and_refuses_busy() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("nx-test-ac5-proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let capacity = 10 * 1024 * 1024;
+
+        // Process 1: Starts an upload over the shared update directory (state -> Receiving)
+        {
+            let backend1 = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage1 = FileStagingStorage::new(&temp_dir, capacity);
+            let journal1 = FileJournalStorage::new(&temp_dir);
+            let mut engine1 = UpdateEngine::new(
+                backend1,
+                storage1,
+                journal1,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .expect("engine 1 init failed");
+
+            engine1
+                .begin_upload(Some(5000))
+                .expect("begin_upload must succeed");
+            assert_eq!(engine1.status().state, UpdateTransactionState::Receiving);
+        }
+
+        // Process 2: Invoked concurrently over the same journal directory (e.g. nx-sysd update status or stage)
+        {
+            let backend2 = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage2 = FileStagingStorage::new(&temp_dir, capacity);
+            let journal2 = FileJournalStorage::new(&temp_dir);
+            let mut engine2 = UpdateEngine::new(
+                backend2,
+                storage2,
+                journal2,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .expect("engine 2 init failed");
+
+            // Process 2 status sees Receiving (not clobbered by construction!)
+            assert_eq!(engine2.status().state, UpdateTransactionState::Receiving);
+
+            // Process 2 attempts second upload while Process 1 is receiving -> refused as busy (AC5)
+            let err_upload = engine2
+                .begin_upload(Some(5000))
+                .expect_err("concurrent upload must be refused as busy");
+            assert_eq!(err_upload, UpdateEngineError::Busy);
+            assert_eq!(err_upload.error_code_str(), "update_busy");
+
+            // Process 2 attempts install while Process 1 is receiving -> refused as busy (AC5)
+            let err_install = engine2
+                .begin_install()
+                .expect_err("concurrent install must be refused as busy");
+            assert_eq!(err_install, UpdateEngineError::Busy);
+            assert_eq!(err_install.error_code_str(), "update_busy");
+        }
+
+        // Process 3: Simulates device reboot where init-staging runs reconcile_boot()
+        {
+            let backend3 = MockSlotBackend::new(Slot::A, Slot::A);
+            let storage3 = FileStagingStorage::new(&temp_dir, capacity);
+            let journal3 = FileJournalStorage::new(&temp_dir);
+            let mut engine3 = UpdateEngine::new(
+                backend3,
+                storage3,
+                journal3,
+                Some("1.0".to_string()),
+                Some(1),
+                Some(capacity),
+            )
+            .expect("engine 3 init failed");
+
+            engine3
+                .reconcile_boot()
+                .expect("reconcile_boot on boot must succeed");
+            assert_eq!(engine3.status().state, UpdateTransactionState::Failed);
+            assert_eq!(
+                engine3.status().error_code,
+                Some("update_truncated".to_string())
+            );
+
+            // After reboot reconciliation, a new upload can start and succeed (AC4)
+            let swu_bytes = make_valid_swu("1.0", 1, b"boot payload", b"rootfs payload");
+            let status = engine3
+                .stage_upload(Cursor::new(&swu_bytes), Some(swu_bytes.len() as u64))
+                .expect("upload after boot reconciliation must succeed");
+            assert_eq!(status.state, UpdateTransactionState::Staged);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
