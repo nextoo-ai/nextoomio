@@ -159,14 +159,6 @@ class PowerController(abc.ABC):
     def power_on(self) -> None:
         """Restore power to the bench device."""
 
-    @abc.abstractmethod
-    def power_cycle(self, delay: float = DEFAULT_POWER_CYCLE_DELAY) -> None:
-        """Cut power, wait delay, and restore power."""
-
-    @abc.abstractmethod
-    def get_status(self) -> str:
-        """Query outlet status ('on' or 'off')."""
-
     def notify_cut_scheduled(self, delay: float, phase: str) -> None:
         """Hook called when a power cut is scheduled."""
         pass
@@ -178,12 +170,10 @@ class CommandPowerController(PowerController):
     def __init__(
         self,
         command_template: str,
-        cycle_delay: float = DEFAULT_POWER_CYCLE_DELAY,
         timeout: float = 15.0,
         verbose: bool = False,
     ):
         self.command_template = command_template
-        self.cycle_delay = cycle_delay
         self.timeout = timeout
         self.verbose = verbose
 
@@ -227,26 +217,6 @@ class CommandPowerController(PowerController):
     def power_on(self) -> None:
         self._execute("on")
 
-    def power_cycle(self, delay: float = DEFAULT_POWER_CYCLE_DELAY) -> None:
-        try:
-            self._execute("cycle", ["--delay", str(delay)])
-        except PowerCutError:
-            # Fallback to discrete off -> sleep -> on if cycle subcommand is unsupported
-            self.power_off()
-            time.sleep(delay)
-            self.power_on()
-
-    def get_status(self) -> str:
-        try:
-            out = self._execute("status")
-            if "on" in out.lower():
-                return "on"
-            if "off" in out.lower():
-                return "off"
-            return out
-        except Exception:
-            return "unknown"
-
 
 class MockPowerController(PowerController):
     """In-memory simulated power controller for offline testing and CI verification."""
@@ -280,14 +250,6 @@ class MockPowerController(PowerController):
             sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] [MockPower] OUTLET RESTORED (ON)\n")
         if self.on_restore_callback:
             self.on_restore_callback()
-
-    def power_cycle(self, delay: float = DEFAULT_POWER_CYCLE_DELAY) -> None:
-        self.power_off()
-        time.sleep(min(0.05, delay))
-        self.power_on()
-
-    def get_status(self) -> str:
-        return "on" if self.is_on else "off"
 
 
 # ==============================================================================
@@ -703,7 +665,9 @@ class PowerLossRunner:
         Checks:
         1. systemd PID 1 is responsive.
         2. Rootfs entry in 'mount' output is active, mounted read-only ('ro' in options),
-           and points to the partition matching the active running slot (SYS-04).
+           and points to the partition matching the active running slot (SYS-04). If the mount
+           source is '/dev/root', it is resolved against the kernel command line ('root=')
+           in /proc/cmdline (CQ-R4, CQ-R2).
         """
         if running_slot not in ("root_a", "root_b"):
             self._log(f"AC1 check failed: running slot '{running_slot}' invalid")
@@ -760,8 +724,24 @@ class PowerLossRunner:
             or source.endswith(expected_part_num)
             or expected_name in source
             or expected_uuid_part in source
-            or source == "/dev/root"
         )
+
+        if not source_matches and source == "/dev/root":
+            # Resolve /dev/root against kernel command line (root=)
+            res_cmd = self.runner.run("cat /proc/cmdline", timeout=5.0)
+            if res_cmd.ok and res_cmd.stdout.strip():
+                for token in res_cmd.stdout.strip().split():
+                    if token.startswith("root="):
+                        root_param = token[len("root=") :]
+                        if (
+                            expected_part in root_param
+                            or root_param.endswith(expected_part_num)
+                            or expected_name in root_param
+                            or expected_uuid_part in root_param
+                        ):
+                            source_matches = True
+                            break
+
         if not source_matches:
             self._log(
                 f"AC1 check failed: root device '{source}' does not match expected slot '{running_slot}'"
@@ -1019,6 +999,60 @@ class PowerLossRunner:
         ts = scheduler.cut_timestamp or datetime.datetime.now().isoformat()
         return ts, moment
 
+    def _wait_for_trial_boot(self, target_slot: str, pre_boot_id: Optional[str] = None) -> None:
+        """Wait for device to reboot into target trial slot and enter trial state.
+
+        Ensures the reboot has completed (boot ID or slot changed) and asserts running slot
+        is target_slot and updater state is 'trial' before commit can begin (CQ-R4, CQ-R1).
+        """
+        start = time.monotonic()
+        reboot_confirmed = False
+        self._log(f"Waiting for device to reboot into trial slot '{target_slot}'...")
+
+        while (time.monotonic() - start) < self.timeout_secs:
+            if not self.runner.check_reachability(timeout=min(3.0, self.poll_interval_secs + 1.0)):
+                reboot_confirmed = True
+                time.sleep(self.poll_interval_secs)
+                continue
+
+            # Device answers SSH. Check if this is still the pre-reboot system during shutdown.
+            if pre_boot_id:
+                res_boot = self.runner.run(
+                    "cat /proc/sys/kernel/random/boot_id",
+                    timeout=min(3.0, self.poll_interval_secs + 1.0),
+                )
+                if res_boot.ok and res_boot.stdout.strip() == pre_boot_id:
+                    self._log("Device still reachable with pre-reboot boot ID (shutdown in progress)...")
+                    time.sleep(self.poll_interval_secs)
+                    continue
+                elif res_boot.ok and res_boot.stdout.strip():
+                    reboot_confirmed = True
+
+            cur_slot, _, cur_status = self.query_device_state()
+            cur_state = (cur_status.get("state") or "").lower()
+
+            if cur_slot != target_slot:
+                if not reboot_confirmed:
+                    self._log(f"Device still on pre-reboot slot '{cur_slot}' (shutdown in progress)...")
+                    time.sleep(self.poll_interval_secs)
+                    continue
+                raise PowerLossError(
+                    f"Device rebooted into unexpected slot '{cur_slot}' (expected trial slot '{target_slot}')"
+                )
+
+            if cur_state != "trial":
+                raise PowerLossError(
+                    f"Device booted into target slot '{cur_slot}' but state is '{cur_state}' (expected 'trial')"
+                )
+
+            elapsed = time.monotonic() - start
+            self._log(f"Device successfully entered trial slot '{target_slot}' (state 'trial') in {elapsed:.1f}s.")
+            return
+
+        raise DeviceRecoveryError(
+            f"Device failed to reboot into trial slot '{target_slot}' with state 'trial' within {self.timeout_secs}s"
+        )
+
     def _run_commit_cut(self, delay: float, target_slot: str) -> Tuple[str, str]:
         """Case 4: Install update, boot trial slot, and cut power right at the moment of commit."""
         self._log(f"Installing and trial booting into {target_slot} for commit cut test...")
@@ -1037,6 +1071,10 @@ class PowerLossRunner:
         if not res_inst.ok:
             raise PowerLossError(f"Pre-commit install failed: {res_inst.stderr}")
 
+        # Record pre-reboot boot ID to verify reboot completion (CQ-R4, CQ-R1)
+        res_boot = self.runner.run("cat /proc/sys/kernel/random/boot_id", timeout=5.0)
+        pre_boot_id = res_boot.stdout.strip() if res_boot.ok and res_boot.stdout.strip() else None
+
         res_trial = self.runner.run(
             "nx-sysd update trial --remote-confirm && (nohup systemctl reboot >/dev/null 2>&1 &)",
             timeout=15.0,
@@ -1044,8 +1082,17 @@ class PowerLossRunner:
         if not res_trial.ok:
             raise PowerLossError(f"Pre-commit trial arm failed: {res_trial.stderr}")
 
-        # Wait for trial slot to boot
-        self._wait_for_device_recovery()
+        # Wait for device to complete reboot into trial slot and enter trial state (CQ-R4, CQ-R1)
+        self._wait_for_trial_boot(target_slot, pre_boot_id)
+
+        # Assert running slot is target_slot and state is trial before commit begins
+        cur_slot, _, cur_status = self.query_device_state()
+        cur_state = (cur_status.get("state") or "").lower()
+        if cur_slot != target_slot or cur_state != "trial":
+            raise PowerLossError(
+                f"Pre-commit assertion failed: expected slot '{target_slot}' with state 'trial', "
+                f"got slot '{cur_slot}' with state '{cur_state}'"
+            )
 
         self._log(f"Executing commit; power cut scheduled in {delay}s at commit boundary...")
         scheduler = PowerCutScheduler(delay, self.power_ctrl, "commit")
@@ -1141,6 +1188,19 @@ class PowerLossRunner:
                     return False, f"Commit switched to '{target_slot}' but state is '{device_state}' (expected 'committed')"
                 return True, "Interrupted commit: completed atomically and durable selector committed"
             elif resulting_slot == initial_slot:
+                if device_state in (
+                    "committing",
+                    "trial",
+                    "installed",
+                    "installing",
+                    "validated",
+                    "staged",
+                    "receiving",
+                ):
+                    return False, (
+                        f"Commit returned to previous slot '{initial_slot}' with unresolved state '{device_state}' "
+                        "(expected resolved state such as 'idle' or 'failed', not 'committing', 'trial', or 'installed')"
+                    )
                 return True, f"Interrupted commit: returned cleanly to previous slot '{initial_slot}' (state '{device_state}')"
             else:
                 return False, f"Interrupted commit resulted in unknown slot '{resulting_slot}'"
@@ -1368,7 +1428,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         power_ctrl = CommandPowerController(
             command_template=args.power_cmd,
-            cycle_delay=args.power_cycle_delay,
             verbose=not args.quiet,
         )
 

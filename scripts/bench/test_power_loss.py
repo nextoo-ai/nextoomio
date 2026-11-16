@@ -67,6 +67,7 @@ class PowerLossMockDevice(SshRunner):
         target_version: str = "0.0.1-powerloss-target",
         fail_recovery: bool = False,
         power_ctrl: Optional[MockPowerController] = None,
+        reboot_delay_polls: int = 0,
     ):
         self.host = "192.0.2.1"
         self.active_slot = initial_slot
@@ -76,11 +77,16 @@ class PowerLossMockDevice(SshRunner):
         self.target_version = target_version
         self.fail_recovery = fail_recovery
         self.power_ctrl = power_ctrl
+        self.reboot_delay_polls = reboot_delay_polls
+        self.remaining_reboot_delay = 0
+        self.trial_armed = False
 
         # Power state
         self.is_powered = True
         self.boot_count = 1
         self.boot_id = f"mock-boot-id-{self.boot_count}"
+        self.pre_reboot_boot_id = self.boot_id
+        self.pre_reboot_slot = self.active_slot
 
         # Update state machine
         self.update_state = "Idle"
@@ -91,6 +97,15 @@ class PowerLossMockDevice(SshRunner):
         self.commands_executed: List[str] = []
         self.mount_options = "ro,relatime"
         self.mount_device_override: Optional[str] = None
+        self.cmdline_override: Optional[str] = None
+
+    def _trigger_trial_reboot(self) -> None:
+        self.active_slot = opposite_slot(self.active_slot)
+        self.current_version = self.target_version
+        self.update_state = "Trial"
+        self.boot_count += 1
+        self.boot_id = f"mock-boot-id-{self.boot_count}"
+        self.trial_armed = False
 
     def handle_power_cut(self) -> None:
         """Called when power outlet is switched OFF."""
@@ -179,20 +194,56 @@ class PowerLossMockDevice(SshRunner):
             return SshCommandResult(0, f"{dev} on / type ext4 ({self.mount_options})\n", "")
 
         if "cat /proc/sys/kernel/random/boot_id" in cmd:
+            if self.trial_armed and self.remaining_reboot_delay > 0:
+                self.remaining_reboot_delay -= 1
+                old_id = self.pre_reboot_boot_id
+                if self.remaining_reboot_delay == 0:
+                    self._trigger_trial_reboot()
+                return SshCommandResult(0, old_id, "")
             return SshCommandResult(0, self.boot_id, "")
 
+        if "cat /proc/cmdline" in cmd:
+            if self.cmdline_override:
+                return SshCommandResult(0, self.cmdline_override, "")
+            slot = (
+                self.pre_reboot_slot
+                if (self.trial_armed and self.remaining_reboot_delay > 0)
+                else self.active_slot
+            )
+            partuuid = "4e58544d-05" if slot == "root_a" else "4e58544d-06"
+            return SshCommandResult(
+                0,
+                f"console=serial0,115200 root=PARTUUID={partuuid} rootfstype=ext4 fsck.repair=yes rootwait\n",
+                "",
+            )
+
         if "nx-sysd version --json" in cmd:
+            slot = (
+                self.pre_reboot_slot
+                if (self.trial_armed and self.remaining_reboot_delay > 0)
+                else self.active_slot
+            )
             data = {
                 "version": self.current_version,
                 "commit": "mock123",
-                "slot": self.active_slot,
+                "slot": slot,
             }
             return SshCommandResult(0, json.dumps(data), "")
 
         if "nx-sysd update status --json" in cmd:
+            slot = (
+                self.pre_reboot_slot
+                if (self.trial_armed and self.remaining_reboot_delay > 0)
+                else self.active_slot
+            )
+            state = (
+                "Installed"
+                if (self.trial_armed and self.remaining_reboot_delay > 0)
+                else self.update_state
+            )
             data = {
-                "state": self.update_state,
-                "active_slot": self.active_slot,
+                "state": state,
+                "active_slot": slot,
                 "default_slot": self.default_slot,
             }
             if self.trial_attempts is not None:
@@ -216,13 +267,14 @@ class PowerLossMockDevice(SshRunner):
 
         if "nx-sysd update trial" in cmd:
             self.current_phase = "trial"
-            self.update_state = "Trial"
             self.trial_attempts = (self.trial_attempts or 0) + 1
-            # Trial armed: reboot toggles active slot and activates target version
-            self.active_slot = opposite_slot(self.active_slot)
-            self.current_version = self.target_version
-            self.boot_count += 1
-            self.boot_id = f"mock-boot-id-{self.boot_count}"
+            self.trial_armed = True
+            self.pre_reboot_boot_id = self.boot_id
+            self.pre_reboot_slot = self.active_slot
+            if self.reboot_delay_polls > 0:
+                self.remaining_reboot_delay = self.reboot_delay_polls
+            else:
+                self._trigger_trial_reboot()
             return SshCommandResult(0, "Trial armed, rebooting", "")
 
         if "nx-sysd update confirm" in cmd or "nx-sysd update commit" in cmd:
@@ -257,9 +309,14 @@ class TestPowerLossTool(unittest.TestCase):
         cases: List[str],
         trials_per_case: int = 1,
         fail_recovery: bool = False,
+        reboot_delay_polls: int = 0,
     ) -> Tuple[PowerLossRunner, PowerLossMockDevice, MockPowerController]:
         mock_power = MockPowerController(verbose=False)
-        mock_dev = PowerLossMockDevice(fail_recovery=fail_recovery, power_ctrl=mock_power)
+        mock_dev = PowerLossMockDevice(
+            fail_recovery=fail_recovery,
+            power_ctrl=mock_power,
+            reboot_delay_polls=reboot_delay_polls,
+        )
         mock_power.on_cut_callback = mock_dev.handle_power_cut
         mock_power.on_restore_callback = mock_dev.handle_power_restore
 
@@ -342,6 +399,41 @@ class TestPowerLossTool(unittest.TestCase):
         self.assertIn(trial.device_state, ("committed", "failed", "rolled_back"))
         self.assertNotIn(trial.device_state, ("undefined", "unknown", "corrupt"))
 
+    def test_commit_cut_waits_for_reboot_when_device_stays_reachable_on_old_slot(self) -> None:
+        """CQ-R4, CQ-R1: Commit case waits for reboot into target slot when device stays reachable during shutdown."""
+        runner, dev, _ = self._create_runner_and_mock(
+            cases=["commit"], trials_per_case=1, reboot_delay_polls=3
+        )
+        report = runner.run()
+
+        self.assertEqual(len(report.trials), 1)
+        trial = report.trials[0]
+        self.assertTrue(trial.success, f"Trial failed: {trial.error_message}")
+        self.assertTrue(trial.ac1_complete_image)
+        self.assertTrue(trial.ac2_state_consistent)
+        self.assertTrue(trial.ac4_subsequent_deploy)
+        self.assertEqual(trial.resulting_slot, "root_b")
+        self.assertEqual(trial.device_state, "committed")
+
+    def test_commit_cut_interrupted_reverting_to_previous_slot_with_unresolved_state_fails(self) -> None:
+        """CQ-R4: Interrupted commit ending on initial slot with unresolved state fails consistency check."""
+        runner, dev, _ = self._create_runner_and_mock(cases=["commit"], trials_per_case=1)
+
+        # Unresolved states must fail AC2
+        for bad_state in ("committing", "trial", "installed", "installing"):
+            ok, details = runner._verify_ac2_state_consistency(
+                "commit", "root_a", "root_b", "root_a", bad_state, {"state": bad_state}
+            )
+            self.assertFalse(ok, f"State '{bad_state}' should not pass for previous slot")
+            self.assertIn("unresolved", details)
+
+        # Resolved state (e.g. failed or idle) must pass
+        ok, details = runner._verify_ac2_state_consistency(
+            "commit", "root_a", "root_b", "root_a", "failed", {"state": "failed"}
+        )
+        self.assertTrue(ok)
+        self.assertIn("returned cleanly", details)
+
     def test_ac1_fails_when_rootfs_mounted_read_write(self) -> None:
         """AC1: _verify_complete_image rejects rootfs mounted read-write or with mismatched partition."""
         runner, dev, _ = self._create_runner_and_mock(cases=["upload"], trials_per_case=1)
@@ -357,6 +449,22 @@ class TestPowerLossTool(unittest.TestCase):
         dev.mount_options = "ro,relatime"
         dev.mount_device_override = "/dev/mmcblk0p9"
         self.assertFalse(runner._verify_complete_image("root_a"))
+
+    def test_ac1_resolves_dev_root_against_cmdline(self) -> None:
+        """CQ-R4, CQ-R2: _verify_complete_image resolves /dev/root against /proc/cmdline."""
+        runner, dev, _ = self._create_runner_and_mock(cases=["upload"], trials_per_case=1)
+        dev.mount_device_override = "/dev/root"
+
+        # Matching cmdline for root_a (PARTUUID 4e58544d-05) -> passes
+        dev.cmdline_override = "console=serial0,115200 root=PARTUUID=4e58544d-05 rootfstype=ext4 ro rootwait\n"
+        self.assertTrue(runner._verify_complete_image("root_a"))
+
+        # Mismatched cmdline for root_a (PARTUUID 4e58544d-06 belongs to root_b) -> fails
+        dev.cmdline_override = "console=serial0,115200 root=PARTUUID=4e58544d-06 rootfstype=ext4 ro rootwait\n"
+        self.assertFalse(runner._verify_complete_image("root_a"))
+
+        # Matching cmdline for root_b -> passes
+        self.assertTrue(runner._verify_complete_image("root_b"))
 
     def test_ac2_trial_missing_or_zero_attempts_fails(self) -> None:
         """AC2: Interrupted trial with missing or zero trial_attempts fails consistency check."""
