@@ -1,8 +1,8 @@
-.PHONY: all check check-docs check-doc-versions check-evidence check-i18n check-core test-core build-webui yocto-validate
+.PHONY: all check check-docs check-doc-versions check-evidence check-i18n check-core test-core build-webui yocto-validate check-bench
 
 all: check
 
-check: check-docs check-doc-versions check-evidence check-i18n yocto-validate
+check: check-docs check-doc-versions check-evidence check-i18n yocto-validate check-bench
 
 check-docs:
 	python3 scripts/check_traceability.py
@@ -30,3 +30,7 @@ build-webui:
 yocto-validate:
 	python3 scripts/check_yocto_layer.py --test
 	python3 scripts/check_yocto_layer.py
+
+check-bench:
+	python3 scripts/bench/deploy.py --test
+
