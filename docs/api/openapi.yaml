@@ -109,6 +109,19 @@ paths:
                 $ref: '#/components/schemas/UpdateStatus'
         '400':
           $ref: '#/components/responses/ApiErrorResponse'
+  /update/install:
+    post:
+      summary: Install validated update into the inactive system slot (SYS-05, UPD-05)
+      operationId: installUpdate
+      responses:
+        '200':
+          description: Update installed into inactive slot and verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateStatus'
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
 components:
   schemas:
     UpdateStatus:
