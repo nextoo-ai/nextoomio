@@ -3,6 +3,10 @@
 
 inherit image_types
 
+# Share the slot A root reference with the deployed rpi-cmdline recipe.
+require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/rpi-cmdline.bbappend
+NEXTOOMIO_ROOT_B = "PARTUUID=4e58544d-06"
+
 IMAGE_TYPES += "swu"
 IMAGE_TYPEDEP:swu = "ext4.gz"
 
@@ -71,16 +75,43 @@ IMAGE_CMD:swu () {
     mmd -i "${BOOT_ARTIFACT}" ::/overlays
     mcopy -i "${BOOT_ARTIFACT}" -s "${DEPLOY_DIR_IMAGE}/overlays/"* ::/overlays/
 
-    gzip -9 -c "${BOOT_ARTIFACT}" > "${SWU_BUILD_DIR}/nextoomio-boot.vfat.gz"
-    BOOT_PKG_FILE="nextoomio-boot.vfat.gz"
-    BOOT_PKG_PATH="${SWU_BUILD_DIR}/${BOOT_PKG_FILE}"
-
-    # 3. Size enforcement checks (AC3, ARCHITECTURE.md section 3.6 step 2)
-    BOOT_EXPANDED_SIZE=$(stat -c %s "${BOOT_ARTIFACT}")
-    if [ "${BOOT_EXPANDED_SIZE}" -gt "${NEXTOOMIO_BOOT_SLOT_MAXSIZE}" ]; then
-        bbfatal "Boot slot artifact expanded size ${BOOT_EXPANDED_SIZE} exceeds slot limit ${NEXTOOMIO_BOOT_SLOT_MAXSIZE} bytes (AC3)"
+    # Reject a changed slot A reference before deriving the slot-specific payloads.
+    if [ "${CMDLINE_ROOT_PARTITION}" != "${@d.getVar('NEXTOOMIO_ROOT_B').replace('-06', '-05')}" ]; then
+        bbfatal "Slot A root reference does not match the A/B partition layout"
     fi
 
+    # Create independent slot images and verify the command line inside each FAT.
+    BOOT_PKG_A="nextoomio-boot-a.vfat.gz"
+    BOOT_PKG_B="nextoomio-boot-b.vfat.gz"
+    for slot in a b; do
+        SLOT_ARTIFACT="${SWU_BUILD_DIR}/boot-$slot.vfat"
+        cp "${BOOT_ARTIFACT}" "${SLOT_ARTIFACT}"
+        if [ "$slot" = a ]; then
+            EXPECTED_ROOT="${CMDLINE_ROOT_PARTITION}"
+            OTHER_ROOT="${NEXTOOMIO_ROOT_B}"
+        else
+            EXPECTED_ROOT="${NEXTOOMIO_ROOT_B}"
+            OTHER_ROOT="${CMDLINE_ROOT_PARTITION}"
+            sed "s|root=${CMDLINE_ROOT_PARTITION}|root=${NEXTOOMIO_ROOT_B}|g" \
+                "${DEPLOY_DIR_IMAGE}/cmdline.txt" > "${SWU_BUILD_DIR}/cmdline-b.txt"
+            mdel -i "${SLOT_ARTIFACT}" ::/cmdline.txt
+            mcopy -i "${SLOT_ARTIFACT}" "${SWU_BUILD_DIR}/cmdline-b.txt" ::/cmdline.txt
+        fi
+        if ! mcopy -i "${SLOT_ARTIFACT}" ::/cmdline.txt "${SWU_BUILD_DIR}/readback-$slot.txt"; then
+            bbfatal "Cannot read cmdline.txt from boot slot $slot"
+        fi
+        if ! grep -Eq "(^|[[:space:]])root=$EXPECTED_ROOT([[:space:]]|$)" "${SWU_BUILD_DIR}/readback-$slot.txt" || \
+           grep -Fq "$OTHER_ROOT" "${SWU_BUILD_DIR}/readback-$slot.txt"; then
+            bbfatal "Invalid root reference in boot slot $slot cmdline.txt"
+        fi
+        BOOT_EXPANDED_SIZE=$(stat -c %s "${SLOT_ARTIFACT}")
+        if [ "${BOOT_EXPANDED_SIZE}" -gt "${NEXTOOMIO_BOOT_SLOT_MAXSIZE}" ]; then
+            bbfatal "Boot slot $slot artifact exceeds slot limit ${NEXTOOMIO_BOOT_SLOT_MAXSIZE} bytes"
+        fi
+        gzip -9 -c "${SLOT_ARTIFACT}" > "${SWU_BUILD_DIR}/nextoomio-boot-$slot.vfat.gz"
+    done
+
+    # 3. Enforce the root slot size limit.
     if [ -f "${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.rootfs.ext4" ]; then
         ROOT_EXPANDED_SIZE=$(stat -c %s "${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.rootfs.ext4")
     elif [ -f "${IMGDEPLOYDIR}/${IMAGE_NAME}.rootfs.ext4" ]; then
@@ -94,7 +125,10 @@ IMAGE_CMD:swu () {
     fi
 
     # 4. Checksums & metadata preparation (AC1)
-    BOOT_SHA256=$(sha256sum "${BOOT_PKG_PATH}" | awk '{print $1}')
+    BOOT_A_SHA256=$(sha256sum "${SWU_BUILD_DIR}/${BOOT_PKG_A}" | awk '{print $1}')
+    BOOT_B_SHA256=$(sha256sum "${SWU_BUILD_DIR}/${BOOT_PKG_B}" | awk '{print $1}')
+    BOOT_A_SIZE=$(stat -c %s "${SWU_BUILD_DIR}/${BOOT_PKG_A}")
+    BOOT_B_SIZE=$(stat -c %s "${SWU_BUILD_DIR}/${BOOT_PKG_B}")
     ROOT_SHA256=$(sha256sum "${ROOTFS_ARTIFACT}" | awk '{print $1}')
     ROOT_PKG_FILE=$(basename "${ROOTFS_ARTIFACT}")
 
@@ -109,15 +143,19 @@ IMAGE_CMD:swu () {
     sed -e "s/@DISTRO_VERSION@/${DISTRO_VERSION}/g" \
         -e "s/@HW_COMPATIBILITY@/${NEXTOOMIO_HW_COMPATIBILITY}/g" \
         -e "s/@CONFIG_SCHEMA_RANGE@/${NEXTOOMIO_CONFIG_SCHEMA_RANGE}/g" \
-        -e "s/@BOOT_PKG_FILE@/${BOOT_PKG_FILE}/g" \
-        -e "s/@BOOT_SHA256@/${BOOT_SHA256}/g" \
+        -e "s/@BOOT_PKG_A@/${BOOT_PKG_A}/g" \
+        -e "s/@BOOT_PKG_B@/${BOOT_PKG_B}/g" \
+        -e "s/@BOOT_A_SHA256@/${BOOT_A_SHA256}/g" \
+        -e "s/@BOOT_B_SHA256@/${BOOT_B_SHA256}/g" \
+        -e "s/@BOOT_A_SIZE@/${BOOT_A_SIZE}/g" \
+        -e "s/@BOOT_B_SIZE@/${BOOT_B_SIZE}/g" \
         -e "s/@ROOT_PKG_FILE@/${ROOT_PKG_FILE}/g" \
         -e "s/@ROOT_SHA256@/${ROOT_SHA256}/g" \
         "${SWUPDATE_DESCRIPTION_TEMPLATE}" > "${SWU_BUILD_DIR}/sw-description"
 
     # 6. Package into .swu container via cpio (AC1, AC2)
     # Order is mandatory: sw-description must be the first file in the archive
-    (cd "${SWU_BUILD_DIR}" && for f in sw-description "${BOOT_PKG_FILE}" "${ROOT_PKG_FILE}"; do
+    (cd "${SWU_BUILD_DIR}" && for f in sw-description "${BOOT_PKG_A}" "${BOOT_PKG_B}" "${ROOT_PKG_FILE}"; do
         echo "$f"
     done | cpio -ov -H crc > "${IMGDEPLOYDIR}/${IMAGE_NAME}.swu")
 

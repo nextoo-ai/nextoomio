@@ -807,6 +807,27 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if "SWUPDATE_DESCRIPTION_TEMPLATE" not in class_text or "sed" not in class_text:
             errors.append("image_types_nextoomio.bbclass must use SWUPDATE_DESCRIPTION_TEMPLATE and sed to populate sw-description")
 
+        # D-067: both slot payloads and the fatal FAT read-back must remain wired in.
+        required_slot_fragments = (
+            'require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/rpi-cmdline.bbappend',
+            'NEXTOOMIO_ROOT_B = "PARTUUID=4e58544d-06"',
+            'BOOT_PKG_A="nextoomio-boot-a.vfat.gz"',
+            'BOOT_PKG_B="nextoomio-boot-b.vfat.gz"',
+            'for slot in a b; do',
+            'EXPECTED_ROOT="${CMDLINE_ROOT_PARTITION}"',
+            'OTHER_ROOT="${NEXTOOMIO_ROOT_B}"',
+            'EXPECTED_ROOT="${NEXTOOMIO_ROOT_B}"',
+            'OTHER_ROOT="${CMDLINE_ROOT_PARTITION}"',
+            'mcopy -i "${SLOT_ARTIFACT}" ::/cmdline.txt "${SWU_BUILD_DIR}/readback-$slot.txt"',
+            'grep -Eq "(^|[[:space:]])root=$EXPECTED_ROOT([[:space:]]|$)"',
+            'grep -Fq "$OTHER_ROOT"',
+            'bbfatal "Invalid root reference in boot slot $slot cmdline.txt"',
+            'for f in sw-description "${BOOT_PKG_A}" "${BOOT_PKG_B}" "${ROOT_PKG_FILE}"',
+        )
+        for fragment in required_slot_fragments:
+            if fragment not in class_text:
+                errors.append(f"D-067 slot payload/read-back check missing: {fragment}")
+
     distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
     if distro_conf.is_file():
         d_text = distro_conf.read_text(encoding="utf-8")
@@ -837,6 +858,18 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("sw-description.in copy1 must target slot A partitions (/dev/mmcblk0p2, /dev/mmcblk0p5)")
         if "/dev/mmcblk0p3" not in desc_text or "/dev/mmcblk0p6" not in desc_text:
             errors.append("sw-description.in copy2 must target slot B partitions (/dev/mmcblk0p3, /dev/mmcblk0p6)")
+        for selection, slot, boot_device, root_device in (
+            ("copy1", "A", "p2", "p5"), ("copy2", "B", "p3", "p6")
+        ):
+            match = re.search(rf"{selection}\s*=\s*\{{(.*?)\);", desc_text, re.DOTALL)
+            section = match.group(1) if match else ""
+            for fragment in (f'filename = "@BOOT_PKG_{slot}@"',
+                             f'sha256 = "@BOOT_{slot}_SHA256@"',
+                             f'size = @BOOT_{slot}_SIZE@',
+                             f'device = "/dev/mmcblk0{boot_device}"',
+                             f'device = "/dev/mmcblk0{root_device}"'):
+                if fragment not in section:
+                    errors.append(f"D-067 {selection} missing {fragment}")
         if re.search(r'signature\s*=\s*true', desc_text, re.IGNORECASE):
             errors.append("sw-description.in must NOT require signature verification (UPD-03, AC2)")
 
@@ -1099,6 +1132,12 @@ def run_self_tests() -> int:
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
     ]
+
+    baseline_errors = validate_layer(ROOT)
+    if baseline_errors:
+        for error in baseline_errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
 
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp_root = pathlib.Path(tmp_str)
@@ -1554,6 +1593,15 @@ def run_self_tests() -> int:
         assert any("overlays directory is missing or empty" in e for e in errs), f"Expected overlays fatal check failure: {errs}"
         class_p.write_text(orig_class, encoding="utf-8")
         print("  test_check_fails_when_overlays_check_not_fatal: OK")
+
+        # D-067: reject a shared boot payload and a removed FAT read-back.
+        sw_desc_p.write_text(orig_sw_desc.replace("@BOOT_PKG_B@", "@BOOT_PKG_A@"), encoding="utf-8")
+        assert any("D-067 copy2" in e for e in validate_layer(tmp_root))
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        class_p.write_text(orig_class.replace('mcopy -i "${SLOT_ARTIFACT}" ::/cmdline.txt "${SWU_BUILD_DIR}/readback-$slot.txt"', 'true'), encoding="utf-8")
+        assert any("D-067 slot payload/read-back" in e for e in validate_layer(tmp_root))
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_d067_shared_payload_and_missing_readback: OK")
 
     print("OK: all AC5 automated self-tests passed.")
     return 0
