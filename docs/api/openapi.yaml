@@ -122,6 +122,43 @@ paths:
                 $ref: '#/components/schemas/UpdateStatus'
         '400':
           $ref: '#/components/responses/ApiErrorResponse'
+  /update/trial:
+    post:
+      summary: Request trial boot of the installed system slot (UPD-06, AR-01)
+      operationId: requestTrialUpdate
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                auto_reboot:
+                  type: boolean
+                  default: true
+                  description: Whether to trigger immediate trial reboot after arming trial boot.
+      responses:
+        '200':
+          description: Trial armed and attempt recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateStatus'
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
+  /update/health-check:
+    get:
+      summary: Check system health prerequisites for update trial acceptance (UPD-06, AR-01)
+      operationId: checkUpdateHealth
+      responses:
+        '200':
+          description: Local health check evaluation report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthReport'
+        '400':
+          $ref: '#/components/responses/ApiErrorResponse'
 components:
   schemas:
     UpdateStatus:
@@ -132,6 +169,7 @@ components:
         - default_slot
         - payload_length
         - reserved_capacity
+        - consumed_attempts
       properties:
         state:
           type: string
@@ -148,9 +186,37 @@ components:
           type: integer
         reserved_capacity:
           type: integer
+        consumed_attempts:
+          type: integer
+          minimum: 0
         error_code:
           type: [string, 'null']
+          description: Machine-readable error code if transaction failed (I18N-04)
         message:
+          type: [string, 'null']
+    HealthReport:
+      type: object
+      required:
+        - healthy
+        - system_target_reached
+        - data_mounted
+        - sound_card_openable
+        - ssh_listening
+        - ssh_key_file_present
+      properties:
+        healthy:
+          type: boolean
+        system_target_reached:
+          type: boolean
+        data_mounted:
+          type: boolean
+        sound_card_openable:
+          type: boolean
+        ssh_listening:
+          type: boolean
+        ssh_key_file_present:
+          type: boolean
+        details:
           type: [string, 'null']
     CommandScope:
       type: string
@@ -188,6 +254,35 @@ components:
         code:
           type: string
           description: Stable machine-readable error code mapped to catalog keys in the WebUI (I18N-04)
+          enum:
+            - setup_required
+            - setup_already_completed
+            - unauthenticated
+            - csrf_invalid
+            - command_unsupported
+            - waiting_for_client
+            - source_unreachable
+            - format_unsupported
+            - playlist_invalid
+            - nas_unreachable
+            - clock_not_set
+            - data_unavailable
+            - self_master_rejected
+            - topology_cycle_rejected
+            - group_level_disabled
+            - update_oversized
+            - update_invalid_format
+            - update_incompatible_hardware
+            - update_incompatible_schema
+            - update_busy
+            - update_truncated
+            - update_corrupted_artifact
+            - update_trial_failed
+            - update_trial_exhausted
+            - update_trial_deadline_exceeded
+            - update_health_check_failed
+            - update_record_contradictory
+            - update_journal_corrupted
         details:
           type: object
           additionalProperties: true

@@ -1,0 +1,16 @@
+[Unit]
+Description=nextoomio trial boot deadline watchdog (UPD-06, AR-01)
+DefaultDependencies=no
+Wants=data.mount
+After=data.mount
+Before=basic.target
+OnFailure=reboot.target
+FailureAction=reboot
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nx-sysd update trial-watchdog --deadline 120 --poll-interval 1000
+Restart=no
+
+[Install]
+WantedBy=basic.target

@@ -270,13 +270,43 @@ pub struct JournalController<S: JournalStorage> {
     latest_record: JournalRecord,
 }
 
+/// Outcome of boot reconciliation across durable boundaries (AR-01, AC4..AC6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    Unchanged,
+    TruncatedFailed,
+    TrialInProgress,
+    SecondTrialRequested,
+    TrialExhausted,
+    ContradictoryFailed,
+    JournalCorruptedFailed,
+}
+
+/// Typed journal errors distinguishing corruption from storage/I/O issues (CQ-R9, AC6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalError {
+    Corrupted(String),
+    Storage(String),
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupted(msg) => write!(f, "journal corrupted or invalid: {msg}"),
+            Self::Storage(msg) => write!(f, "journal storage error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for JournalError {}
+
 impl<S: JournalStorage> JournalController<S> {
     pub fn load_or_init(
         mut storage: S,
         active_slot: &str,
         default_slot: &str,
-    ) -> Result<Self, String> {
-        storage.preallocate()?;
+    ) -> Result<Self, JournalError> {
+        storage.preallocate().map_err(JournalError::Storage)?;
         let r0 = storage.read_record(0);
         let r1 = storage.read_record(1);
 
@@ -292,13 +322,15 @@ impl<S: JournalStorage> JournalController<S> {
             (Ok(None), Ok(Some(b))) | (Err(_), Ok(Some(b))) => (1, b),
             (Ok(None), Ok(None)) => {
                 let init = JournalRecord::new_initial(active_slot, default_slot);
-                storage.write_record(0, &init)?;
+                storage
+                    .write_record(0, &init)
+                    .map_err(JournalError::Storage)?;
                 (0, init)
             }
             (r0_err, r1_err) => {
-                return Err(format!(
+                return Err(JournalError::Corrupted(format!(
                     "both journal records are invalid or corrupted (slot 0: {r0_err:?}, slot 1: {r1_err:?}); refusing to discard state"
-                ));
+                )));
             }
         };
 
@@ -309,11 +341,50 @@ impl<S: JournalStorage> JournalController<S> {
         })
     }
 
+    /// Reloads the newest valid journal record from storage.
+    pub fn reload(&mut self) -> Result<(), JournalError> {
+        let r0 = self.storage.read_record(0);
+        let r1 = self.storage.read_record(1);
+
+        match (r0, r1) {
+            (Ok(Some(a)), Ok(Some(b))) => {
+                if a.generation >= b.generation {
+                    self.active_slot_idx = 0;
+                    self.latest_record = a;
+                } else {
+                    self.active_slot_idx = 1;
+                    self.latest_record = b;
+                }
+                Ok(())
+            }
+            (Ok(Some(a)), Ok(None)) | (Ok(Some(a)), Err(_)) => {
+                self.active_slot_idx = 0;
+                self.latest_record = a;
+                Ok(())
+            }
+            (Ok(None), Ok(Some(b))) | (Err(_), Ok(Some(b))) => {
+                self.active_slot_idx = 1;
+                self.latest_record = b;
+                Ok(())
+            }
+            (Err(e0), Err(e1)) => Err(JournalError::Corrupted(format!(
+                "both journal records unreadable: {e0}; {e1}"
+            ))),
+            (Ok(None), Err(e)) | (Err(e), Ok(None)) => Err(JournalError::Corrupted(format!(
+                "one journal record missing and one invalid: {e}"
+            ))),
+            (Ok(None), Ok(None)) => Err(JournalError::Storage(
+                "no journal records found on reload".to_string(),
+            )),
+        }
+    }
+
     pub fn current(&self) -> &JournalRecord {
         &self.latest_record
     }
 
-    pub fn commit_state(
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_state_with_attempts(
         &mut self,
         next_state: UpdateTransactionState,
         tx_id: Option<String>,
@@ -321,6 +392,7 @@ impl<S: JournalStorage> JournalController<S> {
         payload_len: u64,
         payload_sha256: Option<String>,
         error_code: Option<String>,
+        consumed_attempts: u32,
     ) -> Result<JournalRecord, String> {
         let next_slot_idx = 1 - self.active_slot_idx;
         let next_gen = self.latest_record.generation + 1;
@@ -336,7 +408,7 @@ impl<S: JournalStorage> JournalController<S> {
             payload_len,
             payload_sha256,
             error_code,
-            consumed_attempts: self.latest_record.consumed_attempts,
+            consumed_attempts,
             checksum: 0,
         };
         rec.checksum = rec.compute_checksum();
@@ -348,9 +420,89 @@ impl<S: JournalStorage> JournalController<S> {
         Ok(rec)
     }
 
-    /// Reconciles state after reboot: if upload was interrupted while receiving (AC4)
-    /// or install was interrupted while installing (AC5), marks transaction failed.
-    pub fn reconcile_boot(&mut self) -> Result<(), String> {
+    pub fn commit_state(
+        &mut self,
+        next_state: UpdateTransactionState,
+        tx_id: Option<String>,
+        target_slot: Option<String>,
+        payload_len: u64,
+        payload_sha256: Option<String>,
+        error_code: Option<String>,
+    ) -> Result<JournalRecord, String> {
+        self.commit_state_with_attempts(
+            next_state,
+            tx_id,
+            target_slot,
+            payload_len,
+            payload_sha256,
+            error_code,
+            self.latest_record.consumed_attempts,
+        )
+    }
+
+    /// Reconciles state after reboot: handles interrupted uploads/installs (AC5 of P0-F4.4),
+    /// interrupted commits (D-026), trial attempt progression / two-attempt limits (AC4, AC5),
+    /// and contradictory or unreadable records (AC6).
+    pub fn reconcile_boot(&mut self, running_slot: &str) -> Result<ReconcileOutcome, String> {
+        // 0. Corrupted/unreadable journal check (AC6)
+        if self.latest_record.error_code.as_deref() == Some("update_journal_corrupted") {
+            return Ok(ReconcileOutcome::JournalCorruptedFailed);
+        }
+
+        // 1. Contradiction check: slot format validity (AC6)
+        let default_slot_valid =
+            crate::system::Slot::parse(&self.latest_record.default_slot).is_some();
+        let target_slot_valid = self
+            .latest_record
+            .target_slot
+            .as_deref()
+            .map(|t| crate::system::Slot::parse(t).is_some())
+            .unwrap_or(true);
+
+        if !default_slot_valid || !target_slot_valid {
+            self.commit_state(
+                UpdateTransactionState::Failed,
+                self.latest_record.tx_id.clone(),
+                None,
+                self.latest_record.payload_len,
+                None,
+                Some("update_record_contradictory".to_string()),
+            )?;
+            return Ok(ReconcileOutcome::ContradictoryFailed);
+        }
+
+        // 1b. Contradiction check: target slot matches default slot (AC6)
+        if let Some(target) = &self.latest_record.target_slot {
+            if (self.latest_record.state == UpdateTransactionState::Trial
+                || self.latest_record.state == UpdateTransactionState::Installing
+                || self.latest_record.state == UpdateTransactionState::Installed)
+                && target == &self.latest_record.default_slot
+            {
+                self.commit_state(
+                    UpdateTransactionState::Failed,
+                    self.latest_record.tx_id.clone(),
+                    None,
+                    self.latest_record.payload_len,
+                    None,
+                    Some("update_record_contradictory".to_string()),
+                )?;
+                return Ok(ReconcileOutcome::ContradictoryFailed);
+            }
+        }
+
+        if self.latest_record.consumed_attempts > 2 {
+            self.commit_state(
+                UpdateTransactionState::Failed,
+                self.latest_record.tx_id.clone(),
+                None,
+                self.latest_record.payload_len,
+                None,
+                Some("update_record_contradictory".to_string()),
+            )?;
+            return Ok(ReconcileOutcome::ContradictoryFailed);
+        }
+
+        // 2. Interrupted receiving or installing (AC5 of P0-F4.4)
         if self.latest_record.state == UpdateTransactionState::Receiving
             || self.latest_record.state == UpdateTransactionState::Installing
         {
@@ -362,7 +514,125 @@ impl<S: JournalStorage> JournalController<S> {
                 None,
                 Some("update_truncated".to_string()),
             )?;
+            return Ok(ReconcileOutcome::TruncatedFailed);
         }
-        Ok(())
+
+        // 3. Interrupted commit (D-026)
+        if self.latest_record.state == UpdateTransactionState::Committing {
+            if let Some(target) = &self.latest_record.target_slot {
+                if running_slot == target {
+                    self.commit_state(
+                        UpdateTransactionState::Committed,
+                        self.latest_record.tx_id.clone(),
+                        self.latest_record.target_slot.clone(),
+                        self.latest_record.payload_len,
+                        self.latest_record.payload_sha256.clone(),
+                        None,
+                    )?;
+                    return Ok(ReconcileOutcome::Unchanged);
+                }
+            }
+            self.commit_state(
+                UpdateTransactionState::Failed,
+                None,
+                None,
+                0,
+                None,
+                Some("update_truncated".to_string()),
+            )?;
+            return Ok(ReconcileOutcome::TruncatedFailed);
+        }
+
+        // 4. Trial boot reconciliation (AC1, AC4, AC5)
+        if self.latest_record.state == UpdateTransactionState::Trial {
+            if let Some(target) = &self.latest_record.target_slot {
+                if running_slot == target {
+                    // Running on trial target slot: trial is in progress
+                    let target_str = target.clone();
+                    let tx_id = self.latest_record.tx_id.clone();
+                    let payload_len = self.latest_record.payload_len;
+                    let payload_sha = self.latest_record.payload_sha256.clone();
+                    let attempts = self.latest_record.consumed_attempts;
+
+                    let next_slot_idx = 1 - self.active_slot_idx;
+                    let next_gen = self.latest_record.generation + 1;
+                    let mut rec = JournalRecord {
+                        format_version: 1,
+                        generation: next_gen,
+                        tx_id,
+                        state: UpdateTransactionState::Trial,
+                        active_slot: running_slot.to_string(),
+                        default_slot: self.latest_record.default_slot.clone(),
+                        target_slot: Some(target_str),
+                        payload_len,
+                        payload_sha256: payload_sha,
+                        error_code: None,
+                        consumed_attempts: attempts,
+                        checksum: 0,
+                    };
+                    rec.checksum = rec.compute_checksum();
+                    self.storage.write_record(next_slot_idx, &rec)?;
+                    self.active_slot_idx = next_slot_idx;
+                    self.latest_record = rec;
+
+                    return Ok(ReconcileOutcome::TrialInProgress);
+                } else if running_slot == self.latest_record.default_slot {
+                    // Booted previous slot: trial failed
+                    if self.latest_record.consumed_attempts < 2 {
+                        // First attempt failed: request exactly one more trial (attempt 2)
+                        let target_str = target.clone();
+                        let tx_id = self.latest_record.tx_id.clone();
+                        let payload_len = self.latest_record.payload_len;
+                        let payload_sha = self.latest_record.payload_sha256.clone();
+
+                        self.commit_state_with_attempts(
+                            UpdateTransactionState::Trial,
+                            tx_id,
+                            Some(target_str),
+                            payload_len,
+                            payload_sha,
+                            None,
+                            2, // durably record attempt 2 before reboot (AC1, AC5)
+                        )?;
+                        return Ok(ReconcileOutcome::SecondTrialRequested);
+                    } else {
+                        // Second attempt failed: state is failed, previous slot stays selected (AC4)
+                        self.commit_state_with_attempts(
+                            UpdateTransactionState::Failed,
+                            self.latest_record.tx_id.clone(),
+                            None,
+                            self.latest_record.payload_len,
+                            None,
+                            Some("update_trial_exhausted".to_string()),
+                            self.latest_record.consumed_attempts,
+                        )?;
+                        return Ok(ReconcileOutcome::TrialExhausted);
+                    }
+                } else {
+                    // Running neither target slot nor default slot while in state Trial is contradictory (AC6)
+                    self.commit_state(
+                        UpdateTransactionState::Failed,
+                        self.latest_record.tx_id.clone(),
+                        None,
+                        self.latest_record.payload_len,
+                        None,
+                        Some("update_record_contradictory".to_string()),
+                    )?;
+                    return Ok(ReconcileOutcome::ContradictoryFailed);
+                }
+            } else {
+                self.commit_state(
+                    UpdateTransactionState::Failed,
+                    self.latest_record.tx_id.clone(),
+                    None,
+                    self.latest_record.payload_len,
+                    None,
+                    Some("update_record_contradictory".to_string()),
+                )?;
+                return Ok(ReconcileOutcome::ContradictoryFailed);
+            }
+        }
+
+        Ok(ReconcileOutcome::Unchanged)
     }
 }
