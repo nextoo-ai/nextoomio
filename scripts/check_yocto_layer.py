@@ -294,14 +294,18 @@ def main() -> int:
     distro_conf = ROOT / "meta-nextoomio/conf/distro/nextoomio.conf"
     if distro_conf.is_file():
         dist_text = distro_conf.read_text(encoding="utf-8")
-        if "nextoomio_derive_source_commit" not in dist_text or "NEXTOOMIO_SOURCE_COMMIT" not in dist_text:
-            errors.append("nextoomio.conf must derive NEXTOOMIO_SOURCE_COMMIT dynamically at build time (AC1, AC4, P0-F2.3)")
+        if "NEXTOOMIO_SOURCE_COMMIT" not in dist_text:
+            errors.append("nextoomio.conf must define NEXTOOMIO_SOURCE_COMMIT baseline (AC1, AC4, P0-F2.3)")
+        if re.search(r"^\s*def\s+", dist_text, re.MULTILINE):
+            errors.append("nextoomio.conf must not define Python functions (BitBake .conf parse error; CQ-R1)")
 
     image_version_class = ROOT / "meta-nextoomio/classes/nextoomio-image-version.bbclass"
     if image_version_class.is_file():
         iv_text = image_version_class.read_text(encoding="utf-8")
         if "IMAGE_PREPROCESS_COMMAND" not in iv_text or "nextoomio-release" not in iv_text:
             errors.append("nextoomio-image-version.bbclass must write /etc/nextoomio-release via IMAGE_PREPROCESS_COMMAND")
+        if "nextoomio_derive_source_commit" not in iv_text or "NEXTOOMIO_SOURCE_COMMIT" not in iv_text:
+            errors.append("nextoomio-image-version.bbclass must derive NEXTOOMIO_SOURCE_COMMIT at build time (AC1, AC4, P0-F2.3)")
 
     image_bb = ROOT / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
     if image_bb.is_file():
