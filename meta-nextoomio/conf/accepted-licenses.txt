@@ -1,0 +1,61 @@
+# License expressions observed in CI run 43832700635, one per line.
+(BSD-3-Clause | GPL-2.0-only) & (BSD-3-Clause | LGPL-2.0-or-later)
+(GPL-2.0-or-later | LGPL-3.0-only) & Unicode-DFS-2016
+(MPL-2.0 & MIT) | (MPL-2.0 & GPL-2.0-or-later & MIT) | (MPL-2.0 & LGPL-2.1-or-later & MIT)
+0BSD
+AFL-2.1 | GPL-2.0-or-later
+Apache-2.0
+BSD-2-Clause
+BSD-2-Clause & BSD-3-Clause
+BSD-2-Clause & BSD-3-Clause & ISC & MIT
+BSD-2-Clause & GPL-2.0-only & GPL-2.0-or-later
+BSD-2-Clause & hdparm
+BSD-3-Clause
+BSD-3-Clause & BSD-2-Clause & MIT
+BSD-3-Clause & MIT
+BSD-3-Clause | GPL-2.0-only
+Firmware-cypress-rpidistro
+GFDL-1.3 & GPL-2.0-or-later & LGPL-2.1-or-later & BSD-3-Clause
+GPL-1.0-or-later & GPL-2.0-only & GPL-2.0-or-later & LGPL-2.1-or-later & BSD-2-Clause & BSD-3-Clause & BSD-4-Clause-UC & MIT & EUPL-1.2
+GPL-2.0-only
+GPL-2.0-only & GPL-2.0-or-later & LGPL-2.1-or-later
+GPL-2.0-only & GPL-2.0-or-later & LGPL-2.1-or-later & LGPL-2.1-only & MIT & ISC & BSD-1-Clause & BSD-3-Clause & OFL-1.1
+GPL-2.0-only & LGPL-2.0-only & BSD-3-Clause & MIT
+GPL-2.0-only & LGPL-2.1-or-later
+GPL-2.0-only & binary-redist-Cypress-rpidistro & Synaptics-rpidistro
+GPL-2.0-only & bzip2-1.0.6
+GPL-2.0-only | GPL-3.0-only
+GPL-2.0-only | MPL-2.0 | LGPL-2.1-only
+GPL-2.0-or-later
+GPL-2.0-or-later & LGPL-2.0-or-later
+GPL-2.0-or-later & LGPL-2.1-or-later
+GPL-2.0-or-later & LGPL-2.1-or-later & BSD-2-Clause & BSD-3-Clause & MIT
+GPL-2.0-or-later & MPL-2.0
+GPL-2.0-or-later | BSD-3-Clause
+GPL-2.0-or-later | LGPL-3.0-or-later
+GPL-2.0-with-Linux-syscall-note
+GPL-3.0-only
+GPL-3.0-or-later
+GPL-3.0-with-GCC-exception
+ICU & MIT
+ISC
+LGPL-2.0-or-later
+LGPL-2.1-only
+LGPL-2.1-only & 0BSD & BSD-3-Clause
+LGPL-2.1-only & GPL-2.0-or-later
+LGPL-2.1-only | MPL-2.0
+LGPL-2.1-or-later
+LGPL-2.1-or-later & BSD-2-Clause & BSD-3-Clause & MIT
+LGPL-2.1-or-later & BSD-3-Clause & GCR-docs
+LGPL-2.1-or-later & MIT & BSD-3-Clause
+LGPL-3.0-or-later | GPL-2.0-or-later
+MIT
+MIT & GPL-2.0-or-later
+MIT & LGPL-2.1-or-later & GPL-2.0-only
+PD
+Synaptics-rpidistro
+Zlib
+binary-redist-Cypress-rpidistro
+blessing
+bzip2-1.0.6
+curl

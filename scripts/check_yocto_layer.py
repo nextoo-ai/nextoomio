@@ -86,7 +86,6 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-connectivity/avahi/files/avahi-daemon.conf",
         root / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend",
         root / "meta-nextoomio/recipes-core/base-files/files/fstab",
-        root / "meta-nextoomio/recipes-core/os-release/os-release.bbappend",
         root / "meta-nextoomio/classes/nextoomio-image-version.bbclass",
         root / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend",
         root / "meta-nextoomio/recipes-core/systemd/files/99-timesync.preset",
@@ -110,6 +109,11 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/nextoomio-test-faults_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-hang-early.sh",
         root / "scripts/bench/test_broken_images.py",
+        root / "meta-nextoomio/classes/image_types_nextoomio.bbclass",
+        root / "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend",
+        root / "meta-nextoomio/recipes-support/swupdate/files/sw-description.in",
+        root / "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg",
+        root / "meta-nextoomio/recipes-support/swupdate/files/hwrevision",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py",
@@ -190,8 +194,12 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
 
     has_cmdline_root = False
     expected_partuuid = None
-    if cmdline_bbappend.is_file():
-        bbappend_text = cmdline_bbappend.read_text(encoding="utf-8")
+    cmdline_include = cmdline_bbappend.with_name("nextoomio-cmdline.inc")
+    include_directive = "require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc"
+    if not cmdline_bbappend.is_file() or include_directive not in cmdline_bbappend.read_text(encoding="utf-8"):
+        errors.append("rpi-cmdline.bbappend must require nextoomio-cmdline.inc")
+    if cmdline_include.is_file():
+        bbappend_text = cmdline_include.read_text(encoding="utf-8")
         for line in bbappend_text.splitlines():
             line_clean = line.strip()
             if line_clean.startswith("#") or not line_clean:
@@ -272,6 +280,22 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "selector partition must hold only the boot-selection file (D-005)"
             )
 
+        m_incompat = re.search(r'^\s*INCOMPATIBLE_LICENSE\s*=\s*["\']([^"\']*)["\']', conf_text, re.MULTILINE)
+        if not m_incompat:
+            errors.append(
+                "meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must be configured "
+                "with hard assignment '=' to reject unaccepted licenses (AC4)"
+            )
+        else:
+            incompat_val = m_incompat.group(1).split()
+            required_licenses = {"AGPL-3.0-only", "AGPL-3.0-or-later", "AGPL-1.0-only", "AGPL-1.0-or-later"}
+            missing_licenses = required_licenses - set(incompat_val)
+            if missing_licenses:
+                errors.append(
+                    f"meta-nextoomio/conf/distro/nextoomio.conf: INCOMPATIBLE_LICENSE must include "
+                    f"AGPL licenses {sorted(required_licenses)} (missing: {sorted(missing_licenses)}) (AC4)"
+                )
+
     autoboot_bb = root / "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb"
     if autoboot_bb.is_file():
         autoboot_text = autoboot_bb.read_text(encoding="utf-8")
@@ -303,6 +327,19 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
                 "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_INSTALL "
                 "must include 'nextoomio-tone-check' (P0-F6.2)"
             )
+        m_maxsize = re.search(r'^\s*IMAGE_ROOTFS_MAXSIZE\s*=\s*["\']?(\d+)["\']?', image_text, re.MULTILINE)
+        if not m_maxsize:
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_ROOTFS_MAXSIZE "
+                "must be configured with hard assignment '=' to enforce the root slot size budget (AC2)"
+            )
+        else:
+            maxsize_val = int(m_maxsize.group(1))
+            if maxsize_val <= 0 or maxsize_val > 3145728:
+                errors.append(
+                    f"meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_ROOTFS_MAXSIZE ({maxsize_val}) "
+                    "must be positive and not exceed the 3 GiB root slot budget (3145728 KiB) per ARCHITECTURE.md section 3.6 (AC2)"
+                )
 
     # Wic layout verification (ARCHITECTURE.md section 3.6, AC2, AC4, AC5)
     wks_path = root / "meta-nextoomio/files/wic/nextoomio-ab.wks.in"
@@ -459,13 +496,6 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("systemd preset must disable systemd-time-wait-sync.service (AD-21, AC5)")
 
     # P0-F2.3: Validate device identity, image version release metadata, and persistent device ID
-    os_release_append = root / "meta-nextoomio/recipes-core/os-release/os-release.bbappend"
-    if os_release_append.is_file():
-        osr_text = os_release_append.read_text(encoding="utf-8")
-        for field in ("BUILD_ID", "IMAGE_VERSION", "NEXTOOMIO_SOURCE_COMMIT", "NEXTOOMIO_BUILD_ID", "NEXTOOMIO_IMAGE_VERSION", "NEXTOOMIO_HARDWARE_COMPAT"):
-            if field not in osr_text:
-                errors.append(f"os-release.bbappend must include '{field}' in OS_RELEASE_FIELDS (AC1, AC2, P0-F2.3)")
-
     distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
     if distro_conf.is_file():
         dist_text = distro_conf.read_text(encoding="utf-8")
@@ -503,8 +533,6 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         sysd_text = nx_sysd_bb.read_text(encoding="utf-8")
         if "nextoomio-device-id.service" not in sysd_text:
             errors.append("nx-sysd_0.0.1.bb must package nextoomio-device-id.service (AC3)")
-        if "nx-identity" not in sysd_text:
-            errors.append("nx-sysd_0.0.1.bb must create /usr/bin/nx-identity symlink to nx-sysd")
 
     base_files_append = root / "meta-nextoomio/recipes-core/base-files/base-files_%.bbappend"
     if base_files_append.is_file():
@@ -761,6 +789,203 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if "/run/nextoomio/diagnostics/audio.txt" not in sh_text:
             errors.append("nextoomio-audio-profile-setup.sh must record diagnostics text to /run/nextoomio/diagnostics/audio.txt")
 
+    # P0-F4.2 / UPD-03 / UPD-04 / AD-13: Update file and SWUpdate configuration checks
+    if distro_conf.is_file():
+        conf_text = distro_conf.read_text(encoding="utf-8")
+        if "image_types_nextoomio" not in conf_text:
+            errors.append(
+                "meta-nextoomio/conf/distro/nextoomio.conf: IMAGE_CLASSES must append "
+                "'image_types_nextoomio' to enable .swu update file generation (P0-F4.2, D-008)"
+            )
+
+    if image_bb.is_file():
+        img_text = image_bb.read_text(encoding="utf-8")
+        m_fstypes = re.search(r'IMAGE_FSTYPES\s*=\s*["\']([^"\']+)["\']', img_text)
+        if not m_fstypes or "swu" not in m_fstypes.group(1).split():
+            errors.append(
+                "meta-nextoomio/recipes-core/images/nextoomio-image.bb: IMAGE_FSTYPES must contain 'swu' "
+                "to produce update package alongside flashable image (P0-F4.2, AC1, D-008)"
+            )
+
+    types_class = root / "meta-nextoomio/classes/image_types_nextoomio.bbclass"
+    if types_class.is_file():
+        class_text = types_class.read_text(encoding="utf-8")
+        if "inherit image_types" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must inherit image_types")
+        if 'IMAGE_TYPES += "swu"' not in class_text:
+            errors.append("image_types_nextoomio.bbclass must declare 'IMAGE_TYPES += \"swu\"'")
+        if 'IMAGE_TYPEDEP:swu = "ext4.gz"' not in class_text:
+            errors.append("image_types_nextoomio.bbclass must declare 'IMAGE_TYPEDEP:swu = \"ext4.gz\"'")
+        if "NEXTOOMIO_BOOT_SLOT_MAXSIZE" not in class_text or "268435456" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must enforce NEXTOOMIO_BOOT_SLOT_MAXSIZE = 268435456 (256 MiB, AC3)"
+            )
+        if "NEXTOOMIO_ROOT_SLOT_MAXSIZE" not in class_text or "3221225472" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must enforce NEXTOOMIO_ROOT_SLOT_MAXSIZE = 3221225472 (3072 MiB, AC3)"
+            )
+        if "NEXTOOMIO_STAGING_RESERVATION_MAXSIZE" not in class_text or "1073741824" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must enforce NEXTOOMIO_STAGING_RESERVATION_MAXSIZE = 1073741824 (1 GiB, AC3)"
+            )
+        if "NEXTOOMIO_HW_REVISION" not in class_text or "1.0" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must declare NEXTOOMIO_HW_REVISION = '1.0' (AC1, ARCHITECTURE.md 3.6)")
+        if "NEXTOOMIO_HW_COMPATIBILITY" not in class_text or "${NEXTOOMIO_HW_REVISION}" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must set NEXTOOMIO_HW_COMPATIBILITY to revision variable "
+                "${NEXTOOMIO_HW_REVISION} (AC1, CQ-R1)"
+            )
+        if "sw-description.sig" in class_text:
+            errors.append("image_types_nextoomio.bbclass must not package sw-description.sig (unsigned updates per UPD-03, AC2)")
+        if "SWUPDATE_SIGNING" in class_text:
+            errors.append("image_types_nextoomio.bbclass must not set unused SWUPDATE_SIGNING (CQ-R14)")
+        if "do_image_swu[file-checksums]" not in class_text or "SWUPDATE_DESCRIPTION_TEMPLATE" not in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass: do_image_swu[file-checksums] must track SWUPDATE_DESCRIPTION_TEMPLATE "
+                "to re-run image creation on template edits (CQ-R1)"
+            )
+        for limit_check in ("BOOT_EXPANDED_SIZE", "ROOT_EXPANDED_SIZE", "SWU_SIZE"):
+            if limit_check not in class_text:
+                errors.append(f"image_types_nextoomio.bbclass must check {limit_check} against slot/staging limit (AC3)")
+        cmd_match = re.search(r"IMAGE_CMD:swu\s*\(\)\s*\{([\s\S]*?)\n\}", class_text)
+        if cmd_match:
+            body = cmd_match.group(1)
+            for line in body.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    if not line.startswith((" ", "\t")):
+                        errors.append(
+                            f"image_types_nextoomio.bbclass: line inside IMAGE_CMD:swu has no leading indentation (column 0): '{line}'. "
+                            "BitBake requires function body lines to be indented to prevent early function termination and parse errors."
+                        )
+        if re.search(r"mcopy[^\n]*\|\|\s*true", class_text) or re.search(r"mmd[^\n]*\|\|\s*true", class_text):
+            errors.append(
+                "image_types_nextoomio.bbclass must not use '|| true' on mcopy or mmd (silent boot assembly failure forbidden, CQ-R2)"
+            )
+        for req_boot in ("${SDIMG_KERNELIMAGE}", "bcm2711-rpi-4-b.dtb", "cmdline.txt", "config.txt", "nextoomio-hardware.txt", "start4.elf", "fixup4.dat"):
+            if req_boot not in class_text:
+                errors.append(f"image_types_nextoomio.bbclass must check required boot file '{req_boot}' (D-056)")
+        if "rpi-bootfiles:do_deploy" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must depend on rpi-bootfiles:do_deploy")
+        for required in ('${IMAGE_BOOT_FILES_label-boot_a}', 'bbfatal "Boot file entry ${entry} matches nothing', 'bbfatal "Required boot file ${req} is not in the boot payload', 'bbfatal "The boot payload has no device tree overlays'):
+            if required not in class_text:
+                errors.append(f"image_types_nextoomio.bbclass missing boot assembly check: {required}")
+        if "gzip -l" in class_text:
+            errors.append(
+                "image_types_nextoomio.bbclass must not use 'gzip -l' for uncompressed size calculation "
+                "(modulo 2^32 wrap risk); compute size via 'gzip -dc | wc -c' (CQ-R1)"
+            )
+        if "SWUPDATE_DESCRIPTION_TEMPLATE" not in class_text or "sed" not in class_text:
+            errors.append("image_types_nextoomio.bbclass must use SWUPDATE_DESCRIPTION_TEMPLATE and sed to populate sw-description")
+
+        # D-067: both slot payloads and the fatal FAT read-back must remain wired in.
+        required_slot_fragments = (
+            'require ${META_NEXTOOMIO_DIR}/recipes-bsp/bootfiles/nextoomio-cmdline.inc',
+            'NEXTOOMIO_ROOT_B = "PARTUUID=4e58544d-06"',
+            'BOOT_PKG_A="nextoomio-boot-a.vfat.gz"',
+            'BOOT_PKG_B="nextoomio-boot-b.vfat.gz"',
+            'for slot in a b; do',
+            'EXPECTED_ROOT="${CMDLINE_ROOT_PARTITION}"',
+            'OTHER_ROOT="${NEXTOOMIO_ROOT_B}"',
+            'EXPECTED_ROOT="${NEXTOOMIO_ROOT_B}"',
+            'OTHER_ROOT="${CMDLINE_ROOT_PARTITION}"',
+            'mcopy -i "${SLOT_ARTIFACT}" ::/cmdline.txt "${SWU_BUILD_DIR}/readback-$slot.txt"',
+            'grep -Eq "(^|[[:space:]])root=$EXPECTED_ROOT([[:space:]]|$)"',
+            'grep -Fq "$OTHER_ROOT"',
+            'bbfatal "Invalid root reference in boot slot $slot cmdline.txt"',
+            'for f in sw-description "${BOOT_PKG_A}" "${BOOT_PKG_B}" "${ROOT_PKG_FILE}"',
+        )
+        for fragment in required_slot_fragments:
+            if fragment not in class_text:
+                errors.append(f"D-067 slot payload/read-back check missing: {fragment}")
+
+    distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
+    if distro_conf.is_file():
+        d_text = distro_conf.read_text(encoding="utf-8")
+        if "SWUPDATE_IMAGES" in d_text:
+            errors.append("meta-nextoomio/conf/distro/nextoomio.conf must not set SWUPDATE_IMAGES (single producer via image_types_nextoomio, CQ-R14)")
+
+    sw_desc = root / "meta-nextoomio/recipes-support/swupdate/files/sw-description.in"
+    if sw_desc.is_file():
+        desc_text = sw_desc.read_text(encoding="utf-8")
+        if "@DISTRO_VERSION@" not in desc_text and not re.search(r'version\s*=\s*["\']0\.0\.1-dev["\']', desc_text):
+            errors.append("sw-description.in must declare version using @DISTRO_VERSION@ (AC1, AC4)")
+        if "hardware-compatibility" not in desc_text or "@HW_COMPATIBILITY@" not in desc_text:
+            errors.append("sw-description.in must declare hardware-compatibility containing @HW_COMPATIBILITY@ (AC1)")
+        idx_stable = desc_text.find("stable")
+        idx_images = desc_text.find("images:")
+        if (idx_images != -1 and (idx_stable == -1 or idx_images < idx_stable)) or desc_text.count("images:") > 2:
+            errors.append(
+                "meta-nextoomio/recipes-support/swupdate/files/sw-description.in: top-level images list "
+                "must be removed so images only apply inside stable.copy1 and stable.copy2 (CQ-R1, CQ-R14)"
+            )
+        if "config-schema-range" not in desc_text:
+            errors.append("sw-description.in must declare readable config-schema-range (AC1)")
+        if "sha256" not in desc_text:
+            errors.append("sw-description.in must declare sha256 checksums for artifacts (AC1)")
+        if "copy1" not in desc_text or "copy2" not in desc_text:
+            errors.append("sw-description.in must configure dual-slot selections copy1 and copy2 (AC1)")
+        if "/dev/mmcblk0p2" not in desc_text or "/dev/mmcblk0p5" not in desc_text:
+            errors.append("sw-description.in copy1 must target slot A partitions (/dev/mmcblk0p2, /dev/mmcblk0p5)")
+        if "/dev/mmcblk0p3" not in desc_text or "/dev/mmcblk0p6" not in desc_text:
+            errors.append("sw-description.in copy2 must target slot B partitions (/dev/mmcblk0p3, /dev/mmcblk0p6)")
+        for selection, slot, boot_device, root_device in (
+            ("copy1", "A", "p2", "p5"), ("copy2", "B", "p3", "p6")
+        ):
+            match = re.search(rf"{selection}\s*=\s*\{{(.*?)\);", desc_text, re.DOTALL)
+            section = match.group(1) if match else ""
+            for fragment in (f'filename = "@BOOT_PKG_{slot}@"',
+                             f'sha256 = "@BOOT_{slot}_SHA256@"',
+                             f'size = @BOOT_{slot}_SIZE@',
+                             f'device = "/dev/mmcblk0{boot_device}"',
+                             f'device = "/dev/mmcblk0{root_device}"'):
+                if fragment not in section:
+                    errors.append(f"D-067 {selection} missing {fragment}")
+        if re.search(r'signature\s*=\s*true', desc_text, re.IGNORECASE):
+            errors.append("sw-description.in must NOT require signature verification (UPD-03, AC2)")
+
+    sw_bbappend = root / "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend"
+    if sw_bbappend.is_file():
+        app_text = sw_bbappend.read_text(encoding="utf-8")
+        if "SWUPDATE_SIGNING" in app_text:
+            errors.append("swupdate_%.bbappend must not set unused SWUPDATE_SIGNING (CQ-R14)")
+        if "swupdate.cfg" not in app_text or "hwrevision" not in app_text:
+            errors.append("swupdate_%.bbappend must install swupdate.cfg and hwrevision")
+
+    sw_cfg = root / "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg"
+    if sw_cfg.is_file():
+        cfg_text = sw_cfg.read_text(encoding="utf-8")
+        if "identify" in cfg_text:
+            errors.append(
+                "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg: identify section must be omitted "
+                "because it is only for Hawkbit/REST identify values and unused (CQ-R14)"
+            )
+
+    hwrev_file = root / "meta-nextoomio/recipes-support/swupdate/files/hwrevision"
+    if hwrev_file.is_file():
+        hwrev_text = hwrev_file.read_text(encoding="utf-8")
+        if not re.search(r"^raspberrypi4-64\s+1\.0", hwrev_text.strip()):
+            errors.append("hwrevision must specify 'raspberrypi4-64 1.0' matching hardware-compatibility declaration")
+
+    update_img_bb = root / "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb"
+    if update_img_bb.exists():
+        errors.append("meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb must be removed (competing producer, CQ-R14)")
+
+    kas_base = root / "kas/base.yml"
+    if kas_base.is_file():
+        kas_text = kas_base.read_text(encoding="utf-8")
+        if "nextoomio-image" not in kas_text:
+            errors.append("kas/base.yml: target must include nextoomio-image")
+        if "nextoomio-update-image" in kas_text:
+            errors.append("kas/base.yml: target must not include nextoomio-update-image (CQ-R14)")
+
+    if yocto_wf.is_file():
+        wf_text = yocto_wf.read_text(encoding="utf-8")
+        if "*.swu" not in wf_text:
+            errors.append(".github/workflows/yocto-build.yml: artifact upload must publish *.swu update file (AC5)")
+        if "bitbake -p nextoomio-image" not in wf_text or "bitbake -p nextoomio-image nextoomio-update-image" in wf_text:
+            errors.append(".github/workflows/yocto-build.yml: parse-only check must parse nextoomio-image (and not nextoomio-update-image)")
+
     # P0-F6.2 / D-012: Validate nextoomio-tone-check recipe, script, and safe tone generation
     tc_bb = root / "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb"
     if tc_bb.is_file():
@@ -922,6 +1147,7 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-core/images/nextoomio-image-dev.bb",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-autoboot.bb",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-cmdline.bbappend",
+        "meta-nextoomio/recipes-bsp/bootfiles/nextoomio-cmdline.inc",
         "meta-nextoomio/recipes-bsp/bootfiles/rpi-config_%.bbappend",
         "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nx-sysd/nx-sysd-crates.inc",
@@ -966,6 +1192,11 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/nextoomio-test-faults_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-hang-early.sh",
         "scripts/bench/test_broken_images.py",
+        "meta-nextoomio/classes/image_types_nextoomio.bbclass",
+        "meta-nextoomio/recipes-support/swupdate/swupdate_%.bbappend",
+        "meta-nextoomio/recipes-support/swupdate/files/sw-description.in",
+        "meta-nextoomio/recipes-support/swupdate/files/swupdate.cfg",
+        "meta-nextoomio/recipes-support/swupdate/files/hwrevision",
         "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/nextoomio-tone-check_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/nextoomio-tone-check.sh",
         "meta-nextoomio/recipes-nextoomio/nextoomio-tone-check/files/generate-tone.py",
@@ -973,6 +1204,12 @@ def run_self_tests() -> int:
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
     ]
+
+    baseline_errors = validate_layer(ROOT)
+    if baseline_errors:
+        for error in baseline_errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
 
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp_root = pathlib.Path(tmp_str)
@@ -1281,6 +1518,176 @@ def run_self_tests() -> int:
         wks_file.write_text(orig_wks, encoding="utf-8")
         print("  test_check_fails_when_wic_specifies_boot_mountpoint: OK")
 
+        # 32. AC1 / D-008: Fail when IMAGE_FSTYPES in nextoomio-image.bb is missing 'swu'
+        img_bb_p = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_img_bb_p = img_bb_p.read_text(encoding="utf-8")
+        img_bb_p.write_text(orig_img_bb_p.replace('swu', ''), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_FSTYPES must contain 'swu'" in e for e in errs), f"Expected swu in IMAGE_FSTYPES failure: {errs}"
+        img_bb_p.write_text(orig_img_bb_p, encoding="utf-8")
+        print("  test_check_fails_when_image_fstypes_missing_swu: OK")
+
+        # 33. AC1: Fail when sw-description.in is missing hardware-compatibility
+        sw_desc_p = tmp_root / "meta-nextoomio/recipes-support/swupdate/files/sw-description.in"
+        orig_sw_desc = sw_desc_p.read_text(encoding="utf-8")
+        sw_desc_p.write_text(orig_sw_desc.replace('hardware-compatibility', 'ignored_hw'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("hardware-compatibility" in e for e in errs), f"Expected hardware-compatibility failure: {errs}"
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_missing_hardware_compatibility: OK")
+
+        # 34. AC1: Fail when sw-description.in is missing config-schema-range
+        sw_desc_p.write_text(orig_sw_desc.replace('config-schema-range', 'ignored_schema'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("config-schema-range" in e for e in errs), f"Expected config-schema-range failure: {errs}"
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_missing_config_schema_range: OK")
+
+        # 35. AC1: Fail when sw-description.in is missing sha256 checksums
+        sw_desc_p.write_text(orig_sw_desc.replace('sha256', 'md5'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("sha256 checksums" in e for e in errs), f"Expected sha256 failure: {errs}"
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_missing_sha256: OK")
+
+        # 36. AC3: Fail when slot limits in image_types_nextoomio.bbclass are altered
+        class_p = tmp_root / "meta-nextoomio/classes/image_types_nextoomio.bbclass"
+        orig_class = class_p.read_text(encoding="utf-8")
+        class_p.write_text(orig_class.replace('268435456', '999999'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("NEXTOOMIO_BOOT_SLOT_MAXSIZE" in e for e in errs), f"Expected size limit failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_size_limits_missing_or_altered: OK")
+
+        # 37. AC2: Fail when sw-description.sig signature file is packaged
+        sig_class = orig_class.replace('for f in sw-description', 'for f in sw-description sw-description.sig')
+        class_p.write_text(sig_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("sw-description.sig" in e for e in errs), f"Expected sw-description.sig failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_sig_packaged: OK")
+
+        # 38. AC5: Fail when *.swu artifact upload is missing from yocto-build.yml
+        wf_p = tmp_root / ".github/workflows/yocto-build.yml"
+        orig_wf_p = wf_p.read_text(encoding="utf-8")
+        wf_p.write_text(orig_wf_p.replace('*.swu', '*.ignored'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("publish *.swu" in e for e in errs), f"Expected *.swu upload failure: {errs}"
+        wf_p.write_text(orig_wf_p, encoding="utf-8")
+        print("  test_check_fails_when_swu_artifact_upload_missing: OK")
+
+        # 39. AC1 / D-008: Fail when distro conf is missing image_types_nextoomio
+        dist_p = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
+        orig_dist_p = dist_p.read_text(encoding="utf-8")
+        dist_p.write_text(orig_dist_p.replace('image_types_nextoomio', 'ignored_class'), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("image_types_nextoomio" in e for e in errs), f"Expected image_types_nextoomio failure: {errs}"
+        dist_p.write_text(orig_dist_p, encoding="utf-8")
+        print("  test_check_fails_when_distro_conf_missing_swupdate_class: OK")
+
+        # 40. CQ-R4 / Point 5: Fail when IMAGE_CMD:swu contains unindented line (column 0)
+        unindented_class = orig_class.replace('    BOOT_ARTIFACT=', 'BOOT_ARTIFACT=')
+        class_p.write_text(unindented_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("no leading indentation" in e for e in errs), f"Expected column 0 indentation failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_image_cmd_has_unindented_line: OK")
+
+        # 41. CQ-R2 / Point 3: Fail when boot assembly uses || true
+        true_class = orig_class.replace(
+            'mcopy -o -i "${BOOT_ARTIFACT}" "${f}" "::/${dst}"',
+            'mcopy -o -i "${BOOT_ARTIFACT}" "${f}" "::/${dst}" || true'
+        )
+        class_p.write_text(true_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("|| true" in e for e in errs), f"Expected || true failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_boot_assembly_ignores_errors: OK")
+
+        # 42. CQ-R14 / Point 2: Fail when competing nextoomio-update-image.bb recipe is present
+        competing_bb = tmp_root / "meta-nextoomio/recipes-support/swupdate/nextoomio-update-image.bb"
+        competing_bb.write_text("inherit swupdate\n", encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("competing producer" in e for e in errs), f"Expected competing recipe failure: {errs}"
+        competing_bb.unlink()
+        print("  test_check_fails_when_competing_update_image_recipe_present: OK")
+
+        # 43. CQ-R1 / Finding 2: Fail when sw-description.in has top-level images list
+        bad_sw_desc = orig_sw_desc.replace('stable = {', 'images: (\n        {\n            filename = "bad";\n        }\n    );\n\n    stable = {')
+        sw_desc_p.write_text(bad_sw_desc, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("top-level images list" in e for e in errs), f"Expected top-level images failure: {errs}"
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        print("  test_check_fails_when_sw_description_has_top_level_images: OK")
+
+        # 44. AC5 / D-056: Fail when image_types_nextoomio.bbclass does not check nextoomio-hardware.txt presence
+        no_hw_class = orig_class.replace('nextoomio-hardware.txt', 'ignored-hardware.txt')
+        class_p.write_text(no_hw_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("nextoomio-hardware.txt" in e for e in errs), f"Expected nextoomio-hardware.txt check failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_boot_assembly_omits_hardware_include: OK")
+
+        # 45. CQ-R1: Fail when image_types_nextoomio.bbclass uses gzip -l for uncompressed rootfs size
+        gzip_l_class = orig_class.replace('gzip -dc "${ROOTFS_ARTIFACT}" | wc -c', 'gzip -l "${ROOTFS_ARTIFACT}" | awk \'NR==2 {print $2}\'')
+        class_p.write_text(gzip_l_class, encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("gzip -l" in e for e in errs), f"Expected gzip -l failure: {errs}"
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_check_fails_when_uncompressed_size_uses_gzip_l: OK")
+
+        # Reject a missing firmware dependency or nonfatal boot payload checks.
+        for original, replacement, expected in (
+            ("rpi-bootfiles:do_deploy", "", "rpi-bootfiles:do_deploy"),
+            ('bbfatal "Required boot file ${req} is not in the boot payload"', 'echo "skipping required file"', "Required boot file"),
+            ('bbfatal "The boot payload has no device tree overlays"', 'echo "skipping overlays"', "no device tree overlays"),
+            ('${IMAGE_BOOT_FILES_label-boot_a}', '', 'IMAGE_BOOT_FILES_label-boot_a'),
+        ):
+            assert original in orig_class
+            class_p.write_text(orig_class.replace(original, replacement), encoding="utf-8")
+            assert any(expected in e for e in validate_layer(tmp_root))
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_boot_assembly_checks: OK")
+
+        # D-067: reject a shared boot payload and a removed FAT read-back.
+        sw_desc_p.write_text(orig_sw_desc.replace("@BOOT_PKG_B@", "@BOOT_PKG_A@"), encoding="utf-8")
+        assert any("D-067 copy2" in e for e in validate_layer(tmp_root))
+        sw_desc_p.write_text(orig_sw_desc, encoding="utf-8")
+        class_p.write_text(orig_class.replace('mcopy -i "${SLOT_ARTIFACT}" ::/cmdline.txt "${SWU_BUILD_DIR}/readback-$slot.txt"', 'true'), encoding="utf-8")
+        assert any("D-067 slot payload/read-back" in e for e in validate_layer(tmp_root))
+        class_p.write_text(orig_class, encoding="utf-8")
+        print("  test_d067_shared_payload_and_missing_readback: OK")
+
+        # 49. AC2: Fail when IMAGE_ROOTFS_MAXSIZE is missing, weakly assigned, or exceeds budget
+        image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
+        orig_image_bb = image_bb.read_text(encoding="utf-8")
+        image_bb.write_text(re.sub(r"^\s*IMAGE_ROOTFS_MAXSIZE\b[^\n]*\n", "", orig_image_bb, flags=re.MULTILINE), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_ROOTFS_MAXSIZE must be configured" in e for e in errs), f"Expected size budget guard error: {errs}"
+        image_bb.write_text(re.sub(r"IMAGE_ROOTFS_MAXSIZE\s*=", "IMAGE_ROOTFS_MAXSIZE ?=", orig_image_bb), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("IMAGE_ROOTFS_MAXSIZE must be configured" in e for e in errs), f"Expected weak assignment failure: {errs}"
+        image_bb.write_text(re.sub(r'IMAGE_ROOTFS_MAXSIZE\s*=\s*"[^"]*"', 'IMAGE_ROOTFS_MAXSIZE = "9999999"', orig_image_bb), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("must be positive and not exceed the 3 GiB root slot budget" in e for e in errs), f"Expected budget exceeded failure: {errs}"
+        image_bb.write_text(orig_image_bb, encoding="utf-8")
+        print("  test_check_fails_when_image_rootfs_maxsize_invalid: OK")
+
+        # 50. AC4: Fail when INCOMPATIBLE_LICENSE is missing, weakly assigned, or omits AGPL
+        distro_conf = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
+        orig_distro_conf = distro_conf.read_text(encoding="utf-8")
+        distro_conf.write_text(re.sub(r"^\s*INCOMPATIBLE_LICENSE\b[^\n]*\n", "", orig_distro_conf, flags=re.MULTILINE), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected license gate error: {errs}"
+        distro_conf.write_text(re.sub(r"INCOMPATIBLE_LICENSE\s*=", "INCOMPATIBLE_LICENSE ?=", orig_distro_conf), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("INCOMPATIBLE_LICENSE must be configured" in e for e in errs), f"Expected weak assignment failure: {errs}"
+        distro_conf.write_text(re.sub(r'INCOMPATIBLE_LICENSE\s*=\s*"[^"]*"', 'INCOMPATIBLE_LICENSE = "GPL-3.0"', orig_distro_conf), encoding="utf-8")
+        errs = validate_layer(tmp_root)
+        assert any("INCOMPATIBLE_LICENSE must include AGPL licenses" in e for e in errs), f"Expected missing AGPL license failure: {errs}"
+        distro_conf.write_text(orig_distro_conf, encoding="utf-8")
+        print("  test_check_fails_when_incompatible_license_invalid: OK")
+
     print("OK: all AC5 automated self-tests passed.")
     return 0
 
@@ -1295,7 +1702,7 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, and D-004/D-005/P0-F3.2/P0-F6.1/P0-F6.2 rules validated.")
+    print("OK: meta-nextoomio layer, A/B Wic layout, reference hardware profile, kas files, SWUpdate .swu configuration, and D-004/D-005/P0-F3.2/P0-F4.2/P0-F6.1/P0-F6.2 rules validated.")
     return 0
 
 

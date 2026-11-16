@@ -28,9 +28,6 @@ SYSTEMD_SERVICE:${PN} = " \
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 
 do_install:append() {
-    install -d ${D}${bindir}
-    ln -sf nx-sysd ${D}${bindir}/nx-identity
-
     if ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'true', 'false', d)}; then
         install -d ${D}${systemd_system_unitdir}
         install -m 0644 "${UNPACKDIR}/nextoomio-device-id.service" "${D}${systemd_system_unitdir}/"
@@ -39,7 +36,6 @@ do_install:append() {
 }
 
 FILES:${PN} += " \
-    ${bindir}/nx-identity \
     ${systemd_system_unitdir}/nextoomio-device-id.service \
     ${systemd_system_unitdir}/nextoomio-update-init.service \
 "
