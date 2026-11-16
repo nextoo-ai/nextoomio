@@ -99,9 +99,6 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         root / "kas/test-broken-network.yml",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/nextoomio-test-faults_0.0.1.bb",
         root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-hang-early.sh",
-        root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-broken-health.sh",
-        root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-broken-health.service",
-        root / "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/99-block-network-test.nft",
         root / "scripts/bench/test_broken_images.py",
     ]
 
@@ -644,8 +641,8 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     # P0-F4.7: Broken test images and documented build options (AC6, isolation invariant)
     broken_images = {
         "hang": ("nextoomio-image-broken-hang.bb", "test-broken-hang.yml", "nextoomio-test-faults-hang"),
-        "health": ("nextoomio-image-broken-health.bb", "test-broken-health.yml", "nextoomio-test-faults-health"),
-        "network": ("nextoomio-image-broken-network.bb", "test-broken-network.yml", "nextoomio-test-faults-network"),
+        "health": ("nextoomio-image-broken-health.bb", "test-broken-health.yml", None),
+        "network": ("nextoomio-image-broken-network.bb", "test-broken-network.yml", None),
     }
     for mode, (img_name, kas_name, fault_pkg) in broken_images.items():
         img_path = root / f"meta-nextoomio/recipes-core/images/{img_name}"
@@ -655,8 +652,17 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             txt = img_path.read_text(encoding="utf-8")
             if "require nextoomio-image.bb" not in txt:
                 errors.append(f"{img_name} must require nextoomio-image.bb")
-            if fault_pkg not in txt:
+            if fault_pkg and fault_pkg not in txt:
                 errors.append(f"{img_name} must include '{fault_pkg}'")
+            if mode == "hang":
+                if "ROOTFS_POSTPROCESS_COMMAND" not in txt or "/sbin/init" not in txt:
+                    errors.append(f"{img_name} must override /sbin/init via ROOTFS_POSTPROCESS_COMMAND")
+            elif mode == "health":
+                if "pipewire.service" not in txt or "nextoomio-audio-profile.service" not in txt:
+                    errors.append(f"{img_name} must mask required health check services")
+            elif mode == "network":
+                if "NetworkManager.service" not in txt or "sshd.service" not in txt:
+                    errors.append(f"{img_name} must mask NetworkManager and sshd services")
 
         kas_path = root / f"kas/{kas_name}"
         if not kas_path.is_file():
@@ -741,9 +747,6 @@ def run_self_tests() -> int:
         "kas/test-broken-network.yml",
         "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/nextoomio-test-faults_0.0.1.bb",
         "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-hang-early.sh",
-        "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-broken-health.sh",
-        "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/nextoomio-broken-health.service",
-        "meta-nextoomio/recipes-nextoomio/nextoomio-test-faults/files/99-block-network-test.nft",
         "scripts/bench/test_broken_images.py",
         ".github/workflows/yocto-build.yml",
         "ARCHITECTURE.md",
