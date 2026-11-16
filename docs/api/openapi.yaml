@@ -137,6 +137,16 @@ paths:
                   type: boolean
                   default: true
                   description: Whether to trigger immediate trial reboot after arming trial boot.
+                remote_confirm:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Commit the trial slot only after the deploying workstation confirms it
+                    through `/update/confirm` within the trial budget, in addition to the local
+                    health check (AD-22). Without it the trial is committed as soon as the local
+                    health check passes. Refused with `update_remote_confirm_unavailable` while
+                    SSH access is disabled (no valid key file on the selector partition, AD-23);
+                    nothing is recorded or armed in that case.
       responses:
         '200':
           description: Trial armed and attempt recorded
@@ -146,6 +156,57 @@ paths:
                 $ref: '#/components/schemas/UpdateStatus'
         '400':
           $ref: '#/components/responses/ApiErrorResponse'
+  /update/confirm:
+    post:
+      summary: Confirm the trial slot from the deploying workstation (AD-22, UPD-06)
+      description: >-
+        Phase 0 exposes this operation as `nx-sysd update confirm` over the developer's SSH
+        session; confirmation from any other source is out of scope. The confirmation is
+        recorded for the current trial attempt only. The trial service commits the slot once
+        the local health check has passed: it persists `committing`, makes the trial slot the
+        default through the selector operation, reads the selector back, and persists
+        `committed` only when the read-back names the trial slot. The call then waits up to
+        `wait_secs` for the commit. Repeating a confirmation of an already committed
+        transaction changes nothing.
+      operationId: confirmTrialUpdate
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tx_id:
+                  type: string
+                  description: >-
+                    Transaction being confirmed. Defaults to the current trial transaction. A
+                    different transaction is rejected with `update_transaction_mismatch` and
+                    changes nothing.
+                wait_secs:
+                  type: integer
+                  minimum: 0
+                  default: 120
+                  description: How long to wait for the commit after recording the confirmation.
+      responses:
+        '200':
+          description: >-
+            Confirmation recorded and transaction committed (`state` is `committed`). A
+            confirmation that was recorded but not yet committed within `wait_secs` returns the
+            current status with `confirmed: true` (CLI exit code 3); a commit that failed
+            returns `state: failed` with `error_code` (CLI exit code 1).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateStatus'
+        '400':
+          description: >-
+            Confirmation rejected and nothing changed: `update_transaction_mismatch` for another
+            transaction, `update_confirm_rejected` when no trial is in progress, the device is
+            not running the trial slot, or remote confirmation was not requested.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /update/health-check:
     get:
       summary: Check system health prerequisites for update trial acceptance (UPD-06, AR-01)
@@ -189,6 +250,16 @@ components:
         consumed_attempts:
           type: integer
           minimum: 0
+        remote_confirm:
+          type: boolean
+          default: false
+          description: Remote confirmation was requested for this transaction (AD-22).
+        confirmed:
+          type: boolean
+          default: false
+          description: >-
+            The current trial attempt has received its remote confirmation (AD-22). A later
+            attempt of the same transaction needs its own confirmation.
         error_code:
           type: [string, 'null']
           description: Machine-readable error code if transaction failed (I18N-04)
@@ -283,6 +354,11 @@ components:
             - update_health_check_failed
             - update_record_contradictory
             - update_journal_corrupted
+            - update_remote_confirm_unavailable
+            - update_confirm_rejected
+            - update_transaction_mismatch
+            - update_commit_failed
+            - update_commit_interrupted
         details:
           type: object
           additionalProperties: true

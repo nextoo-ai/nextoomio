@@ -184,6 +184,11 @@ pub enum ErrorCode {
     UpdateHealthCheckFailed,
     UpdateRecordContradictory,
     UpdateJournalCorrupted,
+    UpdateRemoteConfirmUnavailable,
+    UpdateConfirmRejected,
+    UpdateTransactionMismatch,
+    UpdateCommitFailed,
+    UpdateCommitInterrupted,
 }
 
 impl ErrorCode {
@@ -217,6 +222,11 @@ impl ErrorCode {
             Self::UpdateHealthCheckFailed => "update_health_check_failed",
             Self::UpdateRecordContradictory => "update_record_contradictory",
             Self::UpdateJournalCorrupted => "update_journal_corrupted",
+            Self::UpdateRemoteConfirmUnavailable => "update_remote_confirm_unavailable",
+            Self::UpdateConfirmRejected => "update_confirm_rejected",
+            Self::UpdateTransactionMismatch => "update_transaction_mismatch",
+            Self::UpdateCommitFailed => "update_commit_failed",
+            Self::UpdateCommitInterrupted => "update_commit_interrupted",
         }
     }
 }
@@ -336,6 +346,28 @@ mod tests {
 
         let json = serde_json::to_string(&ErrorCode::UpdateCorruptedArtifact).unwrap();
         assert_eq!(json, "\"update_corrupted_artifact\"");
+    }
+
+    #[test]
+    fn commit_and_confirmation_error_codes_are_stable() {
+        let json = serde_json::to_string(&ErrorCode::UpdateRemoteConfirmUnavailable).unwrap();
+        assert_eq!(json, "\"update_remote_confirm_unavailable\"");
+        assert_eq!(
+            ErrorCode::UpdateConfirmRejected.as_str(),
+            "update_confirm_rejected"
+        );
+        assert_eq!(
+            ErrorCode::UpdateTransactionMismatch.as_str(),
+            "update_transaction_mismatch"
+        );
+        assert_eq!(
+            ErrorCode::UpdateCommitFailed.as_str(),
+            "update_commit_failed"
+        );
+        assert_eq!(
+            ErrorCode::UpdateCommitInterrupted.as_str(),
+            "update_commit_interrupted"
+        );
     }
 
     #[test]

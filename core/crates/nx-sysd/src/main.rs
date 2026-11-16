@@ -34,13 +34,18 @@ fn print_usage() {
         nx-sysd update stage --file <path> [--declared-length <bytes>] [--dir <path>]\n  \
         nx-sysd update validate [--dir <path>] [--hardware <id>] [--schema <n>]\n  \
         nx-sysd update install [--dir <path>] [--hardware <id>] [--schema <n>] [--capacity <bytes>]\n  \
-        nx-sysd update trial [--dir <path>] [--no-reboot] [--json]\n  \
+        nx-sysd update trial [--dir <path>] [--no-reboot] [--remote-confirm] [--json]\n  \
+        nx-sysd update confirm [--dir <path>] [--transaction <id>] [--wait <secs>] [--json]\n  \
         nx-sysd update health-check [--dir <path>] [--json]\n  \
         nx-sysd update trial-watchdog [--dir <path>] [--deadline <secs>] [--poll-interval <ms>]\n  \
         nx-sysd update status [--dir <path>] [--json]\n  \
         nx-sysd update abort [--dir <path>]\n\n\
         Options for update trial:\n  \
-        --no-reboot         Arm trial boot without triggering immediate reboot\n"
+        --no-reboot         Arm trial boot without triggering immediate reboot\n  \
+        --remote-confirm    Commit only after `update confirm` from the deploying workstation\n                      (refused while SSH access is disabled)\n\n\
+        Options for update confirm:\n  \
+        --transaction <id>  Transaction being confirmed (default: the current trial)\n  \
+        --wait <secs>       How long to wait for the commit (default 120)\n"
     );
 }
 
@@ -179,6 +184,9 @@ fn handle_update(args: &[String]) -> ExitCode {
     let mut no_reboot = false;
     let mut deadline_secs = 120u64;
     let mut poll_interval_ms = 1000u64;
+    let mut remote_confirm = false;
+    let mut transaction = None;
+    let mut wait_secs = 120u64;
 
     let mut i = 1;
     while i < args.len() {
@@ -259,6 +267,32 @@ fn handle_update(args: &[String]) -> ExitCode {
             "--no-reboot" => {
                 no_reboot = true;
                 i += 1;
+            }
+            "--remote-confirm" => {
+                remote_confirm = true;
+                i += 1;
+            }
+            "--transaction" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --transaction");
+                    return ExitCode::from(1);
+                }
+                transaction = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--wait" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: missing value for --wait");
+                    return ExitCode::from(1);
+                }
+                match args[i + 1].parse::<u64>() {
+                    Ok(w) => wait_secs = w,
+                    Err(e) => {
+                        eprintln!("Error: invalid value for --wait '{}': {e}", args[i + 1]);
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 2;
             }
             "--deadline" => {
                 if i + 1 >= args.len() {
@@ -422,7 +456,7 @@ fn handle_update(args: &[String]) -> ExitCode {
                 }
             };
 
-            match engine.request_trial(!no_reboot) {
+            match engine.request_trial_with(!no_reboot, remote_confirm) {
                 Ok(status) => {
                     if json_output {
                         match serde_json::to_string_pretty(&status) {
@@ -448,6 +482,58 @@ fn handle_update(args: &[String]) -> ExitCode {
                     status.message = Some(err.to_string());
                     let _ = serde_json::to_string_pretty(&status).map(|j| eprintln!("{j}"));
                     ExitCode::from(1)
+                }
+            }
+        }
+        "confirm" => {
+            let mut engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+
+            if let Err(err) = engine.confirm(transaction.as_deref()) {
+                eprintln!("Confirmation rejected: {err}");
+                let mut status = engine.status();
+                status.error_code = Some(err.error_code_str().to_string());
+                status.message = Some(err.to_string());
+                let _ = serde_json::to_string_pretty(&status).map(|j| eprintln!("{j}"));
+                return ExitCode::from(1);
+            }
+
+            let status = engine.wait_for_commit(wait_secs, poll_interval_ms);
+            let print_status = |status: &nx_sysd::UpdateStatus| {
+                if json_output {
+                    match serde_json::to_string_pretty(status) {
+                        Ok(j) => println!("{j}"),
+                        Err(e) => eprintln!("Serialization error: {e}"),
+                    }
+                }
+            };
+            match status.state {
+                nx_protocol::UpdateTransactionState::Committed => {
+                    print_status(&status);
+                    if !json_output {
+                        println!("Committed: {} is the default slot", status.default_slot);
+                    }
+                    ExitCode::SUCCESS
+                }
+                nx_protocol::UpdateTransactionState::Failed => {
+                    print_status(&status);
+                    eprintln!(
+                        "Confirmation recorded, but the transaction failed ({})",
+                        status.error_code.as_deref().unwrap_or("unknown")
+                    );
+                    ExitCode::from(1)
+                }
+                _ => {
+                    print_status(&status);
+                    eprintln!(
+                        "Confirmation recorded; not committed within {wait_secs} s (local health check not yet passed)"
+                    );
+                    ExitCode::from(3)
                 }
             }
         }

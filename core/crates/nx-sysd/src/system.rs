@@ -64,6 +64,14 @@ impl Slot {
         }
     }
 
+    /// Partition number of this slot's boot partition on the card (section 3.6 layout).
+    pub const fn boot_partition_number(self) -> u8 {
+        match self {
+            Self::A => 2,
+            Self::B => 3,
+        }
+    }
+
     pub const fn inactive(self) -> Self {
         match self {
             Self::A => Self::B,
@@ -152,6 +160,22 @@ pub trait SlotBackend: Send + Sync {
     /// Clears the one-shot tryboot selector after trial finalization or failure (AC4, AC6).
     fn clear_trial_boot(&mut self) -> Result<(), String>;
 
+    /// Makes `slot` the default boot slot and removes any one-shot trial selection
+    /// (ARCHITECTURE.md section 3.6 step 6, interim selector operation).
+    ///
+    /// Power-loss safety of the physical implementation on FAT is not established; it is
+    /// the question of spike S1, and an operation S1 approves replaces this one.
+    fn set_default_slot(&mut self, slot: Slot) -> Result<(), String>;
+
+    /// Reads the default slot back from the durable selector without any fallback.
+    ///
+    /// Unlike [`SlotBackend::get_default_slot`], a missing, unreadable, or ambiguous
+    /// selector is an error and never falls back to the running slot.
+    fn read_back_default_slot(&self) -> Result<Slot, String>;
+
+    /// Whether SSH access is enabled by a valid key file on the selector partition (AD-23).
+    fn ssh_access_enabled(&self) -> Result<bool, String>;
+
     /// Returns the currently armed trial slot, if any.
     #[cfg(test)]
     fn is_trial_armed(&self) -> Result<Option<Slot>, String>;
@@ -207,6 +231,16 @@ pub struct MockSlotBackend {
     pub uptime_step: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub uptime_reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub health_report: Option<HealthReport>,
+    /// Whether a valid SSH key file is present (AD-23).
+    pub ssh_enabled: bool,
+    /// Simulates a failing selector write.
+    pub fail_selector_write: bool,
+    /// Simulates a read-back that returns this slot instead of the written one.
+    pub selector_readback_override: Option<Slot>,
+    /// Simulates a selector that cannot be read back.
+    pub selector_unreadable: bool,
+    /// Number of selector writes performed by `set_default_slot`.
+    pub selector_writes: u32,
 }
 
 impl MockSlotBackend {
@@ -239,6 +273,11 @@ impl MockSlotBackend {
             uptime_step: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             uptime_reads: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             health_report: None,
+            ssh_enabled: true,
+            fail_selector_write: false,
+            selector_readback_override: None,
+            selector_unreadable: false,
+            selector_writes: 0,
         }
     }
 }
@@ -338,6 +377,27 @@ impl SlotBackend for MockSlotBackend {
     fn clear_trial_boot(&mut self) -> Result<(), String> {
         self.trial_armed = None;
         Ok(())
+    }
+
+    fn set_default_slot(&mut self, slot: Slot) -> Result<(), String> {
+        if self.fail_selector_write {
+            return Err("simulated selector write failure".to_string());
+        }
+        self.selector_writes += 1;
+        self.default_slot = slot;
+        self.trial_armed = None;
+        Ok(())
+    }
+
+    fn read_back_default_slot(&self) -> Result<Slot, String> {
+        if self.selector_unreadable {
+            return Err("simulated unreadable selector".to_string());
+        }
+        Ok(self.selector_readback_override.unwrap_or(self.default_slot))
+    }
+
+    fn ssh_access_enabled(&self) -> Result<bool, String> {
+        Ok(self.ssh_enabled)
     }
 
     #[cfg(test)]
@@ -725,6 +785,65 @@ pub fn validate_ssh_authorized_keys(content: &str) -> Result<usize, String> {
     Ok(key_count)
 }
 
+/// Whether the selector partition holds a key file that enables SSH (AD-23).
+///
+/// The same file names and validation as `nextoomio-ssh-keys-setup` apply:
+/// `authorized_keys`, else `authorized_keys.txt`.
+pub fn ssh_key_file_valid(select_dir: &Path) -> bool {
+    let key_1 = select_dir.join("authorized_keys");
+    let key_2 = select_dir.join("authorized_keys.txt");
+    let key_path = if key_1.exists() {
+        key_1
+    } else if key_2.exists() {
+        key_2
+    } else {
+        return false;
+    };
+    match fs::read_to_string(&key_path) {
+        Ok(content) => validate_ssh_authorized_keys(&content).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Selector content that boots `boot_partition` by default with no trial selection.
+pub fn selector_content(boot_partition: u8) -> String {
+    format!("[all]\ntryboot_a_b=1\nboot_partition={boot_partition}\n")
+}
+
+/// Parses the default slot from selector (`autoboot.txt`) content strictly.
+///
+/// Returns an error when no default is named in the `[all]` section, when a default names
+/// a partition that is not a boot slot, or when the defaults disagree.
+pub fn parse_selector_default(text: &str) -> Result<Slot, String> {
+    let mut in_all = true;
+    let mut found: Option<Slot> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_all = trimmed == "[all]";
+            continue;
+        }
+        if !in_all {
+            continue;
+        }
+        let value = trimmed
+            .strip_prefix("boot_partition=")
+            .or_else(|| trimmed.strip_prefix("default_partition="));
+        if let Some(value) = value {
+            let slot = match value.trim() {
+                "2" => Slot::A,
+                "3" => Slot::B,
+                other => return Err(format!("invalid boot partition '{other}'")),
+            };
+            if found.is_some_and(|f| f != slot) {
+                return Err("conflicting default boot partitions".to_string());
+            }
+            found = Some(slot);
+        }
+    }
+    found.ok_or_else(|| "no default boot partition".to_string())
+}
+
 static WATCHDOG_FILE: std::sync::Mutex<Option<File>> = std::sync::Mutex::new(None);
 
 #[cfg(any(target_os = "linux", test))]
@@ -775,6 +894,54 @@ impl PhysicalSlotBackend {
         } else {
             PathBuf::from("/boot/select/autoboot.txt")
         }
+    }
+
+    fn select_dir(&self) -> PathBuf {
+        self.autoboot_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/boot/select"))
+    }
+
+    /// Replaces `autoboot.txt` as a whole: temporary file in the same directory, flush,
+    /// rename, flush the directory, with the selector mounted read-write only meanwhile
+    /// (ARCHITECTURE.md section 3.6 step 6, interim selector operation).
+    fn replace_autoboot(&self, content: &str) -> Result<(), String> {
+        let autoboot_path = self.autoboot_path();
+        let parent = autoboot_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create dir {}: {e}", parent.display()))?;
+
+        let _mount_guard = ScopedSelectRwMount::remount_if_needed(&autoboot_path)?;
+
+        let tmp_path = parent.join(format!(".autoboot.txt.tmp.{}", std::process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("cannot open temp file {}: {e}", tmp_path.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync error {}: {e}", tmp_path.display()))?;
+        drop(file);
+
+        fs::rename(&tmp_path, &autoboot_path).map_err(|e| {
+            format!(
+                "atomic rename failed {} -> {}: {e}",
+                tmp_path.display(),
+                autoboot_path.display()
+            )
+        })?;
+
+        let dir_file =
+            File::open(parent).map_err(|e| format!("cannot open {}: {e}", parent.display()))?;
+        dir_file
+            .sync_all()
+            .map_err(|e| format!("sync error {}: {e}", parent.display()))?;
+
+        Ok(())
     }
 
     fn check_sound_card_openable(&self) -> bool {
@@ -1204,99 +1371,35 @@ impl SlotBackend for PhysicalSlotBackend {
     }
 
     fn arm_trial_boot(&mut self, target_slot: Slot) -> Result<(), String> {
-        let autoboot_path = self.autoboot_path();
-
-        let default_slot = self.get_default_slot()?;
-        let default_part = match default_slot {
-            Slot::A => 2,
-            Slot::B => 3,
-        };
-        let target_part = match target_slot {
-            Slot::A => 2,
-            Slot::B => 3,
-        };
-
-        let content = format!(
+        let default_part = self.get_default_slot()?.boot_partition_number();
+        let target_part = target_slot.boot_partition_number();
+        self.replace_autoboot(&format!(
             "[all]\ntryboot_a_b=1\nboot_partition={default_part}\n\n[tryboot]\nboot_partition={target_part}\n"
-        );
-
-        let parent = autoboot_path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create dir {}: {e}", parent.display()))?;
-
-        let _mount_guard = ScopedSelectRwMount::remount_if_needed(&autoboot_path)?;
-
-        let tmp_path = parent.join(format!(".autoboot.txt.tmp.{}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .map_err(|e| format!("cannot open temp file {}: {e}", tmp_path.display()))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("cannot write {}: {e}", tmp_path.display()))?;
-        file.sync_all()
-            .map_err(|e| format!("sync error {}: {e}", tmp_path.display()))?;
-        drop(file);
-
-        fs::rename(&tmp_path, &autoboot_path).map_err(|e| {
-            format!(
-                "atomic rename failed {} -> {}: {e}",
-                tmp_path.display(),
-                autoboot_path.display()
-            )
-        })?;
-
-        if let Ok(dir_file) = File::open(parent) {
-            let _ = dir_file.sync_all();
-        }
-
-        Ok(())
+        ))
     }
 
     fn clear_trial_boot(&mut self) -> Result<(), String> {
-        let autoboot_path = self.autoboot_path();
-
-        if !autoboot_path.exists() {
+        if !self.autoboot_path().exists() {
             return Ok(());
         }
+        let default_part = self.get_default_slot()?.boot_partition_number();
+        self.replace_autoboot(&selector_content(default_part))
+    }
 
-        let default_slot = self.get_default_slot()?;
-        let default_part = match default_slot {
-            Slot::A => 2,
-            Slot::B => 3,
-        };
-        let content = format!("[all]\ntryboot_a_b=1\nboot_partition={default_part}\n");
+    fn set_default_slot(&mut self, slot: Slot) -> Result<(), String> {
+        self.replace_autoboot(&selector_content(slot.boot_partition_number()))
+    }
 
-        let parent = autoboot_path.parent().unwrap_or_else(|| Path::new("."));
-        let _mount_guard = ScopedSelectRwMount::remount_if_needed(&autoboot_path)?;
+    fn read_back_default_slot(&self) -> Result<Slot, String> {
+        let autoboot_path = self.autoboot_path();
+        let text = fs::read_to_string(&autoboot_path)
+            .map_err(|e| format!("cannot read {}: {e}", autoboot_path.display()))?;
+        parse_selector_default(&text)
+            .map_err(|e| format!("selector {}: {e}", autoboot_path.display()))
+    }
 
-        let tmp_path = parent.join(format!(".autoboot.txt.tmp.{}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .map_err(|e| format!("cannot open temp file {}: {e}", tmp_path.display()))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("cannot write {}: {e}", tmp_path.display()))?;
-        file.sync_all()
-            .map_err(|e| format!("sync error {}: {e}", tmp_path.display()))?;
-        drop(file);
-
-        fs::rename(&tmp_path, &autoboot_path).map_err(|e| {
-            format!(
-                "atomic rename failed {} -> {}: {e}",
-                tmp_path.display(),
-                autoboot_path.display()
-            )
-        })?;
-
-        if let Ok(dir_file) = File::open(parent) {
-            let _ = dir_file.sync_all();
-        }
-
-        Ok(())
+    fn ssh_access_enabled(&self) -> Result<bool, String> {
+        Ok(ssh_key_file_valid(&self.select_dir()))
     }
 
     #[cfg(test)]
@@ -1531,24 +1634,7 @@ impl SlotBackend for PhysicalSlotBackend {
         let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
         let sound_card_openable = self.check_sound_card_openable();
 
-        let select_dir = PathBuf::from("/boot/select");
-        let key_1 = select_dir.join("authorized_keys");
-        let key_2 = select_dir.join("authorized_keys.txt");
-        let key_path = if key_1.exists() {
-            Some(key_1)
-        } else if key_2.exists() {
-            Some(key_2)
-        } else {
-            None
-        };
-
-        let ssh_key_file_present = match key_path {
-            Some(path) => match fs::read_to_string(&path) {
-                Ok(content) => validate_ssh_authorized_keys(&content).is_ok(),
-                Err(_) => false,
-            },
-            None => false,
-        };
+        let ssh_key_file_present = ssh_key_file_valid(&self.select_dir());
 
         let tcp = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
         let tcp6 = fs::read_to_string("/proc/net/tcp6").unwrap_or_default();
