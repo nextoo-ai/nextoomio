@@ -1,0 +1,317 @@
+//! Durable two-record update transaction journal per ARCHITECTURE.md section 3.6.
+//!
+//! Alternates writes between `journal.0` and `journal.1`, protected by generation
+//! numbers and CRC32 checksums. On recovery, selects the newest valid record.
+
+use nx_protocol::UpdateTransactionState;
+use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// Computes CRC32 (IEEE 802.3 standard) checksum.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Durable transaction journal record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalRecord {
+    pub format_version: u32,
+    pub generation: u64,
+    pub tx_id: Option<String>,
+    pub state: UpdateTransactionState,
+    pub active_slot: String,
+    pub default_slot: String,
+    pub target_slot: Option<String>,
+    pub payload_len: u64,
+    pub payload_sha256: Option<String>,
+    pub error_code: Option<String>,
+    pub consumed_attempts: u32,
+    #[serde(default)]
+    pub checksum: u32,
+}
+
+impl JournalRecord {
+    pub fn new_initial(active: &str, default: &str) -> Self {
+        let mut rec = Self {
+            format_version: 1,
+            generation: 1,
+            tx_id: None,
+            state: UpdateTransactionState::Idle,
+            active_slot: active.to_string(),
+            default_slot: default.to_string(),
+            target_slot: None,
+            payload_len: 0,
+            payload_sha256: None,
+            error_code: None,
+            consumed_attempts: 0,
+            checksum: 0,
+        };
+        rec.checksum = rec.compute_checksum();
+        rec
+    }
+
+    pub fn compute_checksum(&self) -> u32 {
+        #[derive(Serialize)]
+        struct ChecksumPayload<'a> {
+            format_version: u32,
+            generation: u64,
+            tx_id: &'a Option<String>,
+            state: UpdateTransactionState,
+            active_slot: &'a str,
+            default_slot: &'a str,
+            target_slot: &'a Option<String>,
+            payload_len: u64,
+            payload_sha256: &'a Option<String>,
+            error_code: &'a Option<String>,
+            consumed_attempts: u32,
+        }
+
+        let payload = ChecksumPayload {
+            format_version: self.format_version,
+            generation: self.generation,
+            tx_id: &self.tx_id,
+            state: self.state,
+            active_slot: &self.active_slot,
+            default_slot: &self.default_slot,
+            target_slot: &self.target_slot,
+            payload_len: self.payload_len,
+            payload_sha256: &self.payload_sha256,
+            error_code: &self.error_code,
+            consumed_attempts: self.consumed_attempts,
+        };
+
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            crc32(&bytes)
+        } else {
+            0
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.format_version == 1 && self.checksum == self.compute_checksum()
+    }
+}
+
+/// Abstract storage for alternating two-record journal files.
+pub trait JournalStorage: Send + Sync {
+    fn read_record(&self, slot_idx: usize) -> Result<Option<JournalRecord>, String>;
+    fn write_record(&mut self, slot_idx: usize, record: &JournalRecord) -> Result<(), String>;
+}
+
+/// In-memory journal storage for unit tests.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryJournalStorage {
+    pub records: [Option<JournalRecord>; 2],
+}
+
+impl JournalStorage for MemoryJournalStorage {
+    fn read_record(&self, slot_idx: usize) -> Result<Option<JournalRecord>, String> {
+        if slot_idx < 2 {
+            Ok(self.records[slot_idx].clone())
+        } else {
+            Err("invalid journal slot index".to_string())
+        }
+    }
+
+    fn write_record(&mut self, slot_idx: usize, record: &JournalRecord) -> Result<(), String> {
+        if slot_idx < 2 {
+            self.records[slot_idx] = Some(record.clone());
+            Ok(())
+        } else {
+            Err("invalid journal slot index".to_string())
+        }
+    }
+}
+
+/// File-backed journal storage managing `/data/update/journal.0` and `journal.1`.
+#[derive(Debug, Clone)]
+pub struct FileJournalStorage {
+    pub journal_dir: PathBuf,
+}
+
+impl FileJournalStorage {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        Self {
+            journal_dir: dir.as_ref().to_path_buf(),
+        }
+    }
+
+    fn path_for(&self, slot_idx: usize) -> PathBuf {
+        self.journal_dir.join(format!("journal.{slot_idx}"))
+    }
+}
+
+impl JournalStorage for FileJournalStorage {
+    fn read_record(&self, slot_idx: usize) -> Result<Option<JournalRecord>, String> {
+        let path = self.path_for(slot_idx);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        match serde_json::from_str::<JournalRecord>(&data) {
+            Ok(rec) => {
+                if rec.is_valid() {
+                    Ok(Some(rec))
+                } else {
+                    Ok(None) // Checksum corrupted
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn write_record(&mut self, slot_idx: usize, record: &JournalRecord) -> Result<(), String> {
+        fs::create_dir_all(&self.journal_dir)
+            .map_err(|e| format!("cannot create dir {}: {e}", self.journal_dir.display()))?;
+        let path = self.path_for(slot_idx);
+        let json = serde_json::to_string_pretty(record)
+            .map_err(|e| format!("cannot serialize journal record: {e}"))?;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("write error {}: {e}", path.display()))?;
+        file.flush()
+            .map_err(|e| format!("flush error {}: {e}", path.display()))?;
+
+        Ok(())
+    }
+}
+
+/// Journal controller that alternates between slot 0 and 1.
+#[derive(Debug, Clone)]
+pub struct JournalController<S: JournalStorage> {
+    storage: S,
+    active_slot_idx: usize,
+    latest_record: JournalRecord,
+}
+
+impl<S: JournalStorage> JournalController<S> {
+    pub fn load_or_init(
+        mut storage: S,
+        active_slot: &str,
+        default_slot: &str,
+    ) -> Result<Self, String> {
+        let r0 = storage.read_record(0).unwrap_or(None);
+        let r1 = storage.read_record(1).unwrap_or(None);
+
+        let selected = match (r0, r1) {
+            (Some(a), Some(b)) => {
+                if a.is_valid() && b.is_valid() {
+                    if a.generation >= b.generation {
+                        (0, a)
+                    } else {
+                        (1, b)
+                    }
+                } else if a.is_valid() {
+                    (0, a)
+                } else if b.is_valid() {
+                    (1, b)
+                } else {
+                    let init = JournalRecord::new_initial(active_slot, default_slot);
+                    storage.write_record(0, &init)?;
+                    (0, init)
+                }
+            }
+            (Some(a), None) => {
+                if a.is_valid() {
+                    (0, a)
+                } else {
+                    let init = JournalRecord::new_initial(active_slot, default_slot);
+                    storage.write_record(0, &init)?;
+                    (0, init)
+                }
+            }
+            (None, Some(b)) => {
+                if b.is_valid() {
+                    (1, b)
+                } else {
+                    let init = JournalRecord::new_initial(active_slot, default_slot);
+                    storage.write_record(0, &init)?;
+                    (0, init)
+                }
+            }
+            (None, None) => {
+                let init = JournalRecord::new_initial(active_slot, default_slot);
+                storage.write_record(0, &init)?;
+                (0, init)
+            }
+        };
+
+        Ok(Self {
+            storage,
+            active_slot_idx: selected.0,
+            latest_record: selected.1,
+        })
+    }
+
+    pub fn current(&self) -> &JournalRecord {
+        &self.latest_record
+    }
+
+    pub fn commit_state(
+        &mut self,
+        next_state: UpdateTransactionState,
+        tx_id: Option<String>,
+        target_slot: Option<String>,
+        payload_len: u64,
+        payload_sha256: Option<String>,
+        error_code: Option<String>,
+    ) -> Result<JournalRecord, String> {
+        let next_slot_idx = 1 - self.active_slot_idx;
+        let next_gen = self.latest_record.generation + 1;
+
+        let mut rec = JournalRecord {
+            format_version: 1,
+            generation: next_gen,
+            tx_id,
+            state: next_state,
+            active_slot: self.latest_record.active_slot.clone(),
+            default_slot: self.latest_record.default_slot.clone(),
+            target_slot,
+            payload_len,
+            payload_sha256,
+            error_code,
+            consumed_attempts: self.latest_record.consumed_attempts,
+            checksum: 0,
+        };
+        rec.checksum = rec.compute_checksum();
+
+        self.storage.write_record(next_slot_idx, &rec)?;
+        self.active_slot_idx = next_slot_idx;
+        self.latest_record = rec.clone();
+
+        Ok(rec)
+    }
+
+    /// Reconciles state after reboot: if upload was interrupted while receiving, marks failed (AC4).
+    pub fn reconcile_boot(&mut self) -> Result<(), String> {
+        if self.latest_record.state == UpdateTransactionState::Receiving {
+            self.commit_state(
+                UpdateTransactionState::Failed,
+                None,
+                None,
+                0,
+                None,
+                Some("update_truncated".to_string()),
+            )?;
+        }
+        Ok(())
+    }
+}
