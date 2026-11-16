@@ -5,15 +5,13 @@
 
 pub mod cpio;
 pub mod engine;
+pub mod identity;
 pub mod journal;
 pub mod sha256;
 pub mod sw_description;
 pub mod system;
 
-pub use engine::{
-    UpdateEngine, UpdateEngineError, UpdateStatus, DEFAULT_HARDWARE_MODEL,
-    DEFAULT_STAGING_RESERVATION,
-};
+pub use engine::{UpdateEngine, UpdateEngineError, UpdateStatus, DEFAULT_STAGING_RESERVATION};
 pub use journal::{
     FileJournalStorage, JournalController, JournalRecord, JournalStorage, MemoryJournalStorage,
 };

@@ -1,0 +1,11 @@
+# /etc/fstab: static file system information (ARCHITECTURE.md sections 3.5, 3.6)
+#
+# <file system>        <mount point>  <type>  <options>                                 <dump> <pass>
+/dev/root              /              auto    ro,noatime,errors=remount-ro               0      1
+proc                   /proc          proc    defaults                                   0      0
+devpts                 /dev/pts       devpts  mode=0620,ptmxmode=0666,gid=5              0      0
+tmpfs                  /run           tmpfs   mode=0755,nodev,nosuid,strictatime         0      0
+tmpfs                  /var/volatile  tmpfs   defaults,size=64M                          0      0
+tmpfs                  /tmp           tmpfs   defaults,nodev,nosuid,size=128M            0      0
+LABEL=select           /boot/select   vfat    ro,defaults,nofail                         0      0
+LABEL=data             /data          ext4    defaults,noatime,nofail                    0      0

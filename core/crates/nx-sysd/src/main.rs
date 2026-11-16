@@ -4,13 +4,11 @@
 //! and update staging, validation, and status operations over CLI
 //! for Phase 0 bench and SSH operation (AD-20, UPD-04, UPD-05, AC1-AC4).
 
-mod identity;
-
-use identity::{
+use nx_sysd::engine::DEFAULT_STAGING_RESERVATION;
+use nx_sysd::identity::{
     get_or_create_device_id_with_path, query_device_identity, HardwareIdentity, VersionInfo,
     DEFAULT_DEVICE_ID_PATH,
 };
-use nx_sysd::engine::DEFAULT_STAGING_RESERVATION;
 use nx_sysd::journal::FileJournalStorage;
 use nx_sysd::system::{FileStagingStorage, PhysicalSlotBackend};
 use nx_sysd::UpdateEngine;
@@ -31,8 +29,7 @@ fn print_usage() {
         nx-sysd version [--json]                         Print image version, commit, build ID, and slot\n  \
         nx-sysd hardware                                 Print board model and hardware compatibility JSON\n  \
         nx-sysd device-id [--json]                       Print random persistent device ID\n  \
-        nx-sysd init-device-id                           Initialize persistent device ID on /data\n  \
-        nx-sysd daemon                                   Run privileged operations helper (stub)\n\n\
+        nx-sysd init-device-id                           Initialize persistent device ID on /data\n\n\
         Update commands:\n  \
         nx-sysd update init-staging [--dir <path>] [--capacity <bytes>]\n  \
         nx-sysd update stage --file <path> [--declared-length <bytes>] [--dir <path>]\n  \
@@ -69,12 +66,9 @@ fn handle_version(args: &[String]) -> ExitCode {
             if want_json {
                 let v = VersionInfo {
                     image_version: identity.image_version.clone(),
-                    version: identity.version.clone(),
                     source_commit: identity.source_commit.clone(),
-                    commit: identity.commit.clone(),
                     build_id: identity.build_id,
                     running_slot: identity.running_slot.clone(),
-                    slot: identity.slot.clone(),
                 };
                 match serde_json::to_string_pretty(&v) {
                     Ok(json) => {
@@ -158,14 +152,6 @@ fn handle_init_device_id() -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-fn handle_daemon() -> ExitCode {
-    let initial_state = nx_protocol::UpdateTransactionState::Idle;
-    println!(
-        "nx-sysd v0.0.1-dev stub (daemon mode not yet implemented, update_state={initial_state:?})"
-    );
-    ExitCode::SUCCESS
 }
 
 fn get_engine(
@@ -486,7 +472,6 @@ fn main() -> ExitCode {
         "hardware" | "--hardware" => handle_hardware(),
         "device-id" | "--device-id" => handle_device_id(&args[2..]),
         "init-device-id" => handle_init_device_id(),
-        "daemon" | "--daemon" => handle_daemon(),
         "update" => handle_update(&args[2..]),
         "help" | "--help" | "-h" => {
             print_usage();

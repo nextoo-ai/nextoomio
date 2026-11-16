@@ -18,9 +18,6 @@ use std::io::Read;
 /// Default preallocated staging reservation capacity: 1 GiB (ARCHITECTURE.md section 3.6 step 1).
 pub const DEFAULT_STAGING_RESERVATION: u64 = 1_073_741_824;
 
-/// Default hardware compatibility identifier for Phase 0 bench (Raspberry Pi 4).
-pub const DEFAULT_HARDWARE_MODEL: &str = "1.0";
-
 /// Default configuration schema version.
 pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
 
@@ -151,7 +148,16 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         capacity: Option<u64>,
     ) -> Result<Self, UpdateEngineError> {
         let cap = capacity.unwrap_or(DEFAULT_STAGING_RESERVATION);
-        let hw = hardware_model.unwrap_or_else(|| DEFAULT_HARDWARE_MODEL.to_string());
+        let hw = match hardware_model {
+            Some(h) => h,
+            None => crate::identity::query_device_identity()
+                .map(|id| id.hardware_compatibility)
+                .map_err(|e| {
+                    UpdateEngineError::Storage(format!(
+                        "failed to determine hardware compatibility from device identity: {e}"
+                    ))
+                })?,
+        };
         let schema = schema_version.unwrap_or(DEFAULT_SCHEMA_VERSION);
 
         let active = backend

@@ -33,8 +33,13 @@ IMAGE_INSTALL:append = " \
     avahi-daemon \
     nftables \
     nx-sysd \
+    nextoomio-data \
+    e2fsprogs-e2fsck \
+    e2fsprogs-resize2fs \
+    parted \
     openssh-sshd \
     openssh-keygen \
     nextoomio-ssh-keys \
     nextoomio-audio-profile \
+    nextoomio-tone-check \
 "

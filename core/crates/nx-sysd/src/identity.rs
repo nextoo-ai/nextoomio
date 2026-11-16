@@ -11,7 +11,6 @@ pub const DEFAULT_DEVICE_ID_PATH: &str = "/data/device-id";
 pub enum IdentityError {
     ReleaseFileNotFound,
     ReleaseFieldMissing(&'static str),
-    SlotDetectionFailed,
     HardwareModelNotFound,
     HardwareCompatibilityNotFound,
     DeviceIdReadFailed(String),
@@ -25,15 +24,11 @@ impl std::fmt::Display for IdentityError {
         match self {
             Self::ReleaseFileNotFound => write!(
                 f,
-                "release metadata file (/etc/nextoomio-release or /etc/os-release) not found"
+                "release metadata file (/etc/nextoomio-release) not found"
             ),
             Self::ReleaseFieldMissing(field) => {
                 write!(f, "release metadata file missing required field: {field}")
             }
-            Self::SlotDetectionFailed => write!(
-                f,
-                "failed to detect active boot slot from /proc/cmdline and /proc/mounts"
-            ),
             Self::HardwareModelNotFound => write!(
                 f,
                 "failed to read device tree hardware model from /proc/device-tree/model"
@@ -64,12 +59,9 @@ impl std::error::Error for IdentityError {}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceIdentity {
     pub image_version: String,
-    pub version: String,
     pub source_commit: String,
-    pub commit: String,
     pub build_id: String,
     pub running_slot: String,
-    pub slot: String,
     pub board_model: String,
     pub hardware_compatibility: String,
     pub device_id: String,
@@ -79,12 +71,9 @@ pub struct DeviceIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VersionInfo {
     pub image_version: String,
-    pub version: String,
     pub source_commit: String,
-    pub commit: String,
     pub build_id: String,
     pub running_slot: String,
-    pub slot: String,
 }
 
 /// Hardware identity subset (AC2).
@@ -94,23 +83,20 @@ pub struct HardwareIdentity {
     pub hardware_compatibility: String,
 }
 
-/// Release file metadata parsed from /etc/os-release or /etc/nextoomio-release.
+/// Release file metadata parsed from /etc/nextoomio-release.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReleaseInfo {
     pub image_version: String,
     pub source_commit: String,
     pub build_id: String,
     pub hardware_compatibility: String,
-    pub board_model: Option<String>,
 }
 
 /// Injected paths for identity detection, allowing hermetic unit testing without environment variables (CQ-R14).
 #[derive(Debug, Clone)]
 pub struct IdentityPaths<'a> {
     pub release_file: &'a Path,
-    pub secondary_release_file: &'a Path,
     pub cmdline_file: &'a Path,
-    pub mounts_file: &'a Path,
     pub dt_model_file: &'a Path,
     pub device_id_file: &'a Path,
 }
@@ -119,16 +105,15 @@ impl<'a> Default for IdentityPaths<'a> {
     fn default() -> Self {
         Self {
             release_file: Path::new("/etc/nextoomio-release"),
-            secondary_release_file: Path::new("/etc/os-release"),
             cmdline_file: Path::new("/proc/cmdline"),
-            mounts_file: Path::new("/proc/mounts"),
             dt_model_file: Path::new("/proc/device-tree/model"),
             device_id_file: Path::new(DEFAULT_DEVICE_ID_PATH),
         }
     }
 }
 
-/// Parses key-value pairs from /etc/os-release or /etc/nextoomio-release (AC1, AC2, AC4).
+/// Parses key-value pairs from /etc/nextoomio-release (AC1, AC2, AC4).
+/// Accepts only keys written by the image (IMAGE_VERSION, SOURCE_COMMIT, BUILD_ID, HARDWARE_COMPATIBILITY).
 /// Fails explicitly if any required release field is missing or unknown (CQ-R2).
 pub fn parse_release_file(content: &str) -> Result<ReleaseInfo, IdentityError> {
     let mut map = HashMap::new();
@@ -151,18 +136,12 @@ pub fn parse_release_file(content: &str) -> Result<ReleaseInfo, IdentityError> {
     }
 
     let image_version = map
-        .get("NEXTOOMIO_IMAGE_VERSION")
-        .or_else(|| map.get("IMAGE_VERSION"))
-        .or_else(|| map.get("VERSION_ID"))
-        .or_else(|| map.get("VERSION"))
+        .get("IMAGE_VERSION")
         .cloned()
         .ok_or(IdentityError::ReleaseFieldMissing("IMAGE_VERSION"))?;
 
     let source_commit = map
-        .get("NEXTOOMIO_SOURCE_COMMIT")
-        .or_else(|| map.get("SOURCE_COMMIT"))
-        .or_else(|| map.get("BUILD_COMMIT"))
-        .or_else(|| map.get("GIT_COMMIT"))
+        .get("SOURCE_COMMIT")
         .cloned()
         .ok_or(IdentityError::ReleaseFieldMissing("SOURCE_COMMIT"))?;
 
@@ -171,104 +150,52 @@ pub fn parse_release_file(content: &str) -> Result<ReleaseInfo, IdentityError> {
     }
 
     let build_id = map
-        .get("NEXTOOMIO_BUILD_ID")
-        .or_else(|| map.get("BUILD_ID"))
+        .get("BUILD_ID")
         .cloned()
         .ok_or(IdentityError::ReleaseFieldMissing("BUILD_ID"))?;
 
     let hardware_compatibility = map
-        .get("NEXTOOMIO_HARDWARE_COMPAT")
-        .or_else(|| map.get("HARDWARE_COMPATIBILITY"))
-        .or_else(|| map.get("HARDWARE_COMPAT"))
+        .get("HARDWARE_COMPATIBILITY")
         .cloned()
         .ok_or(IdentityError::HardwareCompatibilityNotFound)?;
-
-    let board_model = map
-        .get("NEXTOOMIO_BOARD_MODEL")
-        .or_else(|| map.get("BOARD_MODEL"))
-        .cloned();
 
     Ok(ReleaseInfo {
         image_version,
         source_commit,
         build_id,
         hardware_compatibility,
-        board_model,
     })
 }
 
-/// Detects running slot from /proc/cmdline or /proc/mounts (D-004).
-/// Returns explicit error if slot detection fails rather than inventing a plausible value (CQ-R2).
-pub fn detect_running_slot_with_paths(
-    cmdline_path: &Path,
-    mounts_path: &Path,
-) -> Result<String, IdentityError> {
+/// Detects running slot from /proc/cmdline (D-004).
+/// The running slot is derived from root=PARTUUID=4e58544d-05 (A) or -06 (B) only,
+/// anything else is reported as unknown (CQ-R2, CQ-R14).
+pub fn detect_running_slot_with_path(cmdline_path: &Path) -> String {
     if let Ok(cmdline) = fs::read_to_string(cmdline_path) {
-        if let Some(slot) = parse_slot_from_cmdline(&cmdline) {
-            return Ok(slot);
-        }
+        parse_slot_from_cmdline(&cmdline)
+    } else {
+        "unknown".to_string()
     }
-
-    if let Ok(mounts) = fs::read_to_string(mounts_path) {
-        if let Some(slot) = parse_slot_from_mounts(&mounts) {
-            return Ok(slot);
-        }
-    }
-
-    Err(IdentityError::SlotDetectionFailed)
 }
 
 /// Parses slot designation from kernel command line string (D-004).
-pub fn parse_slot_from_cmdline(cmdline: &str) -> Option<String> {
-    // Partition 5 (PARTUUID=...-05) is slot A (root_a)
-    if cmdline.contains("4e58544d-05")
-        || cmdline.contains("mmcblk0p5")
-        || cmdline.contains("root_a")
-        || cmdline.contains("slot=a")
+pub fn parse_slot_from_cmdline(cmdline: &str) -> String {
+    // Partition 5 (PARTUUID=4e58544d-05) is slot A (root_a)
+    // Partition 6 (PARTUUID=4e58544d-06) is slot B (root_b)
+    if cmdline.contains("root=PARTUUID=4e58544d-05") || cmdline.contains("PARTUUID=4e58544d-05") {
+        "a".to_string()
+    } else if cmdline.contains("root=PARTUUID=4e58544d-06")
+        || cmdline.contains("PARTUUID=4e58544d-06")
     {
-        return Some("a".to_string());
+        "b".to_string()
+    } else {
+        "unknown".to_string()
     }
-    // Partition 6 (PARTUUID=...-06) is slot B (root_b)
-    if cmdline.contains("4e58544d-06")
-        || cmdline.contains("mmcblk0p6")
-        || cmdline.contains("root_b")
-        || cmdline.contains("slot=b")
-    {
-        return Some("b".to_string());
-    }
-    None
 }
 
-/// Parses slot designation from mounts table for root filesystem mount.
-pub fn parse_slot_from_mounts(mounts: &str) -> Option<String> {
-    for line in mounts.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 && parts[1] == "/" {
-            let dev = parts[0];
-            if dev.ends_with("p5") || dev.contains("root_a") {
-                return Some("a".to_string());
-            }
-            if dev.ends_with("p6") || dev.contains("root_b") {
-                return Some("b".to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Detects board model from device tree or release metadata override (AC2).
+/// Detects board model from device tree (AC2).
 /// Returns explicit error if model cannot be read rather than falling back to an unverified guess (CQ-R2).
-pub fn detect_board_model_with_path(
-    dt_path: &Path,
-    release_model: Option<&str>,
-) -> Result<String, IdentityError> {
-    if let Some(m) = release_model {
-        let trimmed = m.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-
+pub fn detect_board_model_with_path(dt_path: &Path) -> Result<String, IdentityError> {
     if let Ok(bytes) = fs::read(dt_path) {
         let s = String::from_utf8_lossy(&bytes);
         let cleaned = s.trim_matches('\0').trim();
@@ -406,23 +333,19 @@ pub fn get_or_create_device_id_with_path(path: &Path) -> Result<String, Identity
 pub fn query_device_identity_with_paths(
     paths: &IdentityPaths,
 ) -> Result<DeviceIdentity, IdentityError> {
-    let release_content = fs::read_to_string(paths.release_file)
-        .or_else(|_| fs::read_to_string(paths.secondary_release_file))
-        .map_err(|_| IdentityError::ReleaseFileNotFound)?;
+    let release_content =
+        fs::read_to_string(paths.release_file).map_err(|_| IdentityError::ReleaseFileNotFound)?;
 
     let release = parse_release_file(&release_content)?;
-    let slot = detect_running_slot_with_paths(paths.cmdline_file, paths.mounts_file)?;
-    let board = detect_board_model_with_path(paths.dt_model_file, release.board_model.as_deref())?;
+    let slot = detect_running_slot_with_path(paths.cmdline_file);
+    let board = detect_board_model_with_path(paths.dt_model_file)?;
     let dev_id = get_or_create_device_id_with_path(paths.device_id_file)?;
 
     Ok(DeviceIdentity {
-        image_version: release.image_version.clone(),
-        version: release.image_version,
-        source_commit: release.source_commit.clone(),
-        commit: release.source_commit,
+        image_version: release.image_version,
+        source_commit: release.source_commit,
         build_id: release.build_id,
-        running_slot: slot.clone(),
-        slot,
+        running_slot: slot,
         board_model: board,
         hardware_compatibility: release.hardware_compatibility,
         device_id: dev_id,
@@ -437,30 +360,6 @@ pub fn query_device_identity() -> Result<DeviceIdentity, IdentityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_release_file_standard() {
-        let content = r#"
-NAME="nextoomio Audio OS"
-VERSION="0.0.1-dev"
-ID="nextoomio"
-VERSION_ID="0.0.1-dev"
-BUILD_ID="20261116001200"
-IMAGE_VERSION="0.0.1-dev"
-NEXTOOMIO_BUILD_ID="20261116001200"
-NEXTOOMIO_SOURCE_COMMIT="80903cb41d775175a82c3470a402ef9a4b2de01f"
-NEXTOOMIO_IMAGE_VERSION="0.0.1-dev"
-NEXTOOMIO_HARDWARE_COMPAT="raspberrypi4-64"
-"#;
-        let release = parse_release_file(content).expect("standard release file must parse");
-        assert_eq!(release.image_version, "0.0.1-dev");
-        assert_eq!(
-            release.source_commit,
-            "80903cb41d775175a82c3470a402ef9a4b2de01f"
-        );
-        assert_eq!(release.build_id, "20261116001200");
-        assert_eq!(release.hardware_compatibility, "raspberrypi4-64");
-    }
 
     #[test]
     fn test_parse_release_file_nextoomio_release() {
@@ -509,66 +408,16 @@ SOURCE_COMMIT="80903cb41d775175a82c3470a402ef9a4b2de01f"
             parse_slot_from_cmdline(
                 "coherent_pool=1M 8250.nr_uarts=1 root=PARTUUID=4e58544d-05 rootwait ro"
             ),
-            Some("a".to_string())
-        );
-        assert_eq!(
-            parse_slot_from_cmdline(
-                "coherent_pool=1M 8250.nr_uarts=1 root=/dev/mmcblk0p5 rootwait ro"
-            ),
-            Some("a".to_string())
+            "a"
         );
         assert_eq!(
             parse_slot_from_cmdline(
                 "coherent_pool=1M 8250.nr_uarts=1 root=PARTUUID=4e58544d-06 rootwait ro"
             ),
-            Some("b".to_string())
+            "b"
         );
-        assert_eq!(
-            parse_slot_from_cmdline(
-                "coherent_pool=1M 8250.nr_uarts=1 root=/dev/mmcblk0p6 rootwait ro"
-            ),
-            Some("b".to_string())
-        );
-        assert_eq!(parse_slot_from_cmdline("console=serial0,115200"), None);
-    }
-
-    #[test]
-    fn test_parse_slot_from_mounts() {
-        let mounts = r#"
-/dev/root / ext4 ro,relatime 0 0
-devtmpfs /dev devtmpfs rw,relatime 0 0
-"#;
-        assert_eq!(parse_slot_from_mounts(mounts), None);
-
-        let mounts_a = r#"
-/dev/mmcblk0p5 / ext4 ro,relatime 0 0
-/dev/mmcblk0p7 /data ext4 rw,noatime 0 0
-"#;
-        assert_eq!(parse_slot_from_mounts(mounts_a), Some("a".to_string()));
-
-        let mounts_b = r#"
-/dev/mmcblk0p6 / ext4 ro,relatime 0 0
-/dev/mmcblk0p7 /data ext4 rw,noatime 0 0
-"#;
-        assert_eq!(parse_slot_from_mounts(mounts_b), Some("b".to_string()));
-    }
-
-    #[test]
-    fn test_detect_slot_failure_fails_explicitly() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("nx_test_slot_fail_{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp_dir);
-        let cmdline = temp_dir.join("cmdline");
-        let mounts = temp_dir.join("mounts");
-        fs::write(&cmdline, "root=/dev/root ro").unwrap();
-        fs::write(&mounts, "/dev/root / ext4 ro 0 0").unwrap();
-
-        let res = detect_running_slot_with_paths(&cmdline, &mounts);
-        assert_eq!(res, Err(IdentityError::SlotDetectionFailed));
-
-        let _ = fs::remove_file(cmdline);
-        let _ = fs::remove_file(mounts);
-        let _ = fs::remove_dir(temp_dir);
+        assert_eq!(parse_slot_from_cmdline("console=serial0,115200"), "unknown");
+        assert_eq!(parse_slot_from_cmdline("root=/dev/mmcblk0p5 ro"), "unknown");
     }
 
     #[test]
@@ -578,11 +427,11 @@ devtmpfs /dev devtmpfs rw,relatime 0 0
         let dt_model = temp_dir.join("model");
 
         fs::write(&dt_model, "Raspberry Pi 4 Model B Rev 1.4\0").unwrap();
-        let model = detect_board_model_with_path(&dt_model, None).expect("must read valid model");
+        let model = detect_board_model_with_path(&dt_model).expect("must read valid model");
         assert_eq!(model, "Raspberry Pi 4 Model B Rev 1.4");
 
         let missing_dt = temp_dir.join("nonexistent");
-        let err = detect_board_model_with_path(&missing_dt, None).unwrap_err();
+        let err = detect_board_model_with_path(&missing_dt).unwrap_err();
         assert_eq!(err, IdentityError::HardwareModelNotFound);
 
         let _ = fs::remove_file(dt_model);
@@ -662,7 +511,6 @@ devtmpfs /dev devtmpfs rw,relatime 0 0
 
         let release_file = temp_dir.join("nextoomio-release");
         let cmdline_file = temp_dir.join("cmdline");
-        let mounts_file = temp_dir.join("mounts");
         let dt_model_file = temp_dir.join("model");
         let device_id_file = temp_dir.join("device-id");
 
@@ -672,14 +520,11 @@ devtmpfs /dev devtmpfs rw,relatime 0 0
         )
         .unwrap();
         fs::write(&cmdline_file, "root=PARTUUID=4e58544d-05 ro\n").unwrap();
-        fs::write(&mounts_file, "/dev/mmcblk0p5 / ext4 ro 0 0\n").unwrap();
         fs::write(&dt_model_file, "Raspberry Pi 4 Model B Rev 1.4\0").unwrap();
 
         let paths = IdentityPaths {
             release_file: &release_file,
-            secondary_release_file: &release_file,
             cmdline_file: &cmdline_file,
-            mounts_file: &mounts_file,
             dt_model_file: &dt_model_file,
             device_id_file: &device_id_file,
         };
@@ -698,7 +543,6 @@ devtmpfs /dev devtmpfs rw,relatime 0 0
 
         let _ = fs::remove_file(release_file);
         let _ = fs::remove_file(cmdline_file);
-        let _ = fs::remove_file(mounts_file);
         let _ = fs::remove_file(dt_model_file);
         let _ = fs::remove_file(device_id_file);
         let _ = fs::remove_dir(temp_dir);
@@ -712,7 +556,6 @@ devtmpfs /dev devtmpfs rw,relatime 0 0
         let release_a = temp_dir.join("release_a");
         let release_b = temp_dir.join("release_b");
         let cmdline = temp_dir.join("cmdline");
-        let mounts = temp_dir.join("mounts");
         let dt_model = temp_dir.join("model");
         let device_id = temp_dir.join("device-id");
 
@@ -727,22 +570,17 @@ devtmpfs /dev devtmpfs rw,relatime 0 0
         )
         .unwrap();
         fs::write(&cmdline, "root=PARTUUID=4e58544d-05 ro\n").unwrap();
-        fs::write(&mounts, "/dev/mmcblk0p5 / ext4 ro 0 0\n").unwrap();
         fs::write(&dt_model, "Raspberry Pi 4 Model B\0").unwrap();
 
         let paths_a = IdentityPaths {
             release_file: &release_a,
-            secondary_release_file: &release_a,
             cmdline_file: &cmdline,
-            mounts_file: &mounts,
             dt_model_file: &dt_model,
             device_id_file: &device_id,
         };
         let paths_b = IdentityPaths {
             release_file: &release_b,
-            secondary_release_file: &release_b,
             cmdline_file: &cmdline,
-            mounts_file: &mounts,
             dt_model_file: &dt_model,
             device_id_file: &device_id,
         };
@@ -758,9 +596,99 @@ devtmpfs /dev devtmpfs rw,relatime 0 0
         let _ = fs::remove_file(release_a);
         let _ = fs::remove_file(release_b);
         let _ = fs::remove_file(cmdline);
-        let _ = fs::remove_file(mounts);
         let _ = fs::remove_file(dt_model);
         let _ = fs::remove_file(device_id);
+        let _ = fs::remove_dir(temp_dir);
+    }
+
+    #[test]
+    fn test_hardware_identity_matches_update_validation() {
+        let temp_dir = std::env::temp_dir().join(format!("nx_test_hw_val_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let release_file = temp_dir.join("nextoomio-release");
+        let cmdline_file = temp_dir.join("cmdline");
+        let dt_model_file = temp_dir.join("model");
+        let device_id_file = temp_dir.join("device-id");
+
+        fs::write(
+            &release_file,
+            "IMAGE_VERSION=\"0.0.1-dev\"\nBUILD_ID=\"20261116001200\"\nSOURCE_COMMIT=\"80903cb41d775175a82c3470a402ef9a4b2de01f\"\nHARDWARE_COMPATIBILITY=\"raspberrypi4-64\"\n",
+        )
+        .unwrap();
+        fs::write(&cmdline_file, "root=PARTUUID=4e58544d-05 ro\n").unwrap();
+        fs::write(&dt_model_file, "Raspberry Pi 4 Model B Rev 1.4\0").unwrap();
+
+        let paths = IdentityPaths {
+            release_file: &release_file,
+            cmdline_file: &cmdline_file,
+            dt_model_file: &dt_model_file,
+            device_id_file: &device_id_file,
+        };
+
+        let identity = query_device_identity_with_paths(&paths).expect("identity query must pass");
+        let hardware_report = HardwareIdentity {
+            board_model: identity.board_model.clone(),
+            hardware_compatibility: identity.hardware_compatibility.clone(),
+        };
+
+        // Value reported by `nx-sysd hardware` (hardware_compatibility)
+        assert_eq!(hardware_report.hardware_compatibility, "raspberrypi4-64");
+
+        // Verify that update engine validation uses this exact reported hardware compatibility string
+        use crate::sw_description::SwDescription;
+        let compatible_sw = SwDescription {
+            version: "0.0.2".to_string(),
+            description: "Next update".to_string(),
+            hardware_compatibility: vec![hardware_report.hardware_compatibility.clone()],
+            config_schema_min: 1,
+            config_schema_max: 1,
+            images: vec![],
+        };
+        assert!(
+            compatible_sw.is_hardware_compatible(&hardware_report.hardware_compatibility),
+            "sw-description with reported hardware compatibility must pass update validation"
+        );
+
+        let incompatible_sw = SwDescription {
+            version: "0.0.2".to_string(),
+            description: "Next update".to_string(),
+            hardware_compatibility: vec!["incompatible-board".to_string()],
+            config_schema_min: 1,
+            config_schema_max: 1,
+            images: vec![],
+        };
+        assert!(
+            !incompatible_sw.is_hardware_compatible(&hardware_report.hardware_compatibility),
+            "sw-description with differing hardware compatibility must fail update validation"
+        );
+
+        // Verify engine initialized with this hardware compatibility string matches
+        let backend =
+            crate::system::MockSlotBackend::new(crate::system::Slot::A, crate::system::Slot::A);
+        let storage = crate::system::MockStagingStorage::new(10 * 1024 * 1024);
+        let journal = crate::journal::MemoryJournalStorage::default();
+        let engine = crate::engine::UpdateEngine::new(
+            backend,
+            storage,
+            journal,
+            Some(hardware_report.hardware_compatibility.clone()),
+            Some(1),
+            Some(10 * 1024 * 1024),
+        )
+        .expect("engine initialization must succeed");
+
+        assert_eq!(
+            engine.hardware_model,
+            hardware_report.hardware_compatibility
+        );
+        assert!(compatible_sw.is_hardware_compatible(&engine.hardware_model));
+        assert!(!incompatible_sw.is_hardware_compatible(&engine.hardware_model));
+
+        let _ = fs::remove_file(release_file);
+        let _ = fs::remove_file(cmdline_file);
+        let _ = fs::remove_file(dt_model_file);
+        let _ = fs::remove_file(device_id_file);
         let _ = fs::remove_dir(temp_dir);
     }
 }
