@@ -30,7 +30,7 @@ The automated tooling (`scripts/bench/soak.py`) directly implements and verifies
 | Criterion | Requirement Summary | Implementation & Verification |
 | :--- | :--- | :--- |
 | **AC1** | Ten alternating deploys all committed, slot toggles each cycle, version matches deployed image. | `SoakRunner` alternates between Image A and Image B across cycles 1..10. Each cycle verifies active slot alternation (`root_a` <-> `root_b`), version match against SWU metadata, and commit confirmation. |
-| **AC2** | Report written with per-cycle step times and final state; unattended execution. | Generated Markdown/JSON/text report records `upload`, `validate`, `install`, `wait_for_device`, `confirm`, `marker_check`, and `cycle_total` durations. The run requires no physical intervention. |
+| **AC2** | Report written with per-cycle step times and final state; unattended execution. | Generated Markdown/JSON/text report records `upload`, `validate`, `install`, `wait_for_device`, `confirm`, `marker_check`, and `cycle_total` durations. The tool executes non-interactively over SSH without prompts; verifying that nobody touched the device during the 10 cycles is verified on the bench. |
 | **AC3** | Marker file written to `/data` before the run remains completely unchanged after 10 cycles. | `MarkerManager` writes a unique token with timestamp and SHA-256 checksum to `/data/nextoomio-soak-marker.txt` before cycle 1. Validates checksum and content after each cycle and at run completion. |
 | **AC4** | Any cycle failure halts the run immediately; report names cycle and step; run marked FAILED. | If any step fails (upload error, validation error, install error, device timeout, rollback, version mismatch, or marker corruption), execution halts immediately with exit code 1. |
 
@@ -80,9 +80,10 @@ python3 scripts/bench/soak.py \
 python3 scripts/bench/soak.py --test
 ```
 
-### 4.1 Security and Hygiene Compliance
+### 4.1 Security, Hygiene, and Option Compliance
 
-- **CQ-R7 (Host and User Validation):** Host and user arguments are strictly validated against `^[A-Za-z0-9][A-Za-z0-9._-]*$`. Any leading dash (`-`) or shell metacharacter is rejected with exit code 2 to prevent SSH option injection.
+- **Cycles Requirement (AC1):** The `--cycles` parameter defaults to 10 (the P0-F5.3 exit gate requirement). Specifying fewer than 10 cycles marks the execution as a non-gate result (`NON-GATE` / `FAILED`), while cycle counts `< 1` are rejected with exit code 2.
+- **CQ-R7 (Safe Identifiers and Path Validation):** Host and user arguments are strictly validated against `^[A-Za-z0-9][A-Za-z0-9._-]*$`. Any leading dash (`-`) or shell metacharacter is rejected with exit code 2 to prevent SSH option injection. In addition, `--marker-path` is strictly validated to ensure it is an absolute path residing under `/data/` containing only safe characters, preventing arbitrary filesystem access or shell injection.
 - **AC6 / AD-23 (Credential Protection):** The runner uses the workstation's system `ssh` and active `ssh-agent`. It stores no passwords or private keys on disk and prints no key material in logs or reports.
 
 ---

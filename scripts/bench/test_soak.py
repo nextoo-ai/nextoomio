@@ -45,6 +45,7 @@ from soak import (
     SoakReport,
     SoakRunner,
     build_parser,
+    is_safe_data_path,
     main,
     parse_arguments,
 )
@@ -305,7 +306,7 @@ class TestSoakTool(unittest.TestCase):
             runner=device,
             image_a=self.img_a_path,
             image_b=self.img_b_path,
-            cycles=5,
+            cycles=10,
             marker_path="/data/custom-soak-marker.txt",
             timeout_secs=2.0,
             poll_interval_secs=0.01,
@@ -539,6 +540,100 @@ class TestSoakTool(unittest.TestCase):
         md = report.format_markdown()
         self.assertIn("root_b", md)
         self.assertIn("0.0.1-soak-b", md)
+
+    def test_fewer_than_ten_cycles_is_non_passing(self) -> None:
+        """Fewer than 10 completed cycles marks the run as NON-GATE / FAILED and states actual count."""
+        device = SoakMockDevice(
+            initial_slot="root_a",
+            initial_version="0.0.1-soak-a",
+            version_a="0.0.1-soak-a",
+            version_b="0.0.1-soak-b",
+        )
+        runner = SoakRunner(
+            runner=device,
+            image_a=self.img_a_path,
+            image_b=self.img_b_path,
+            cycles=3,
+            timeout_secs=2.0,
+            poll_interval_secs=0.01,
+        )
+        report = runner.run()
+
+        # AC1 & AC4: Run must not be counted as passed when cycles < 10
+        self.assertFalse(report.success)
+        self.assertEqual(report.failing_step, "gate_criteria")
+        self.assertEqual(len(report.cycles), 3)
+        self.assertEqual(report.total_cycles_requested, 3)
+        self.assertTrue(report.marker_verified_unchanged)
+
+        md = report.format_markdown()
+        self.assertIn("NON-GATE (3 / 10 CYCLES)", md)
+        self.assertIn("3 / 3", md)
+        self.assertIn("All 3 executed cycle(s) committed", md)
+        self.assertIn("AC1 gate requires 10 cycles", md)
+        self.assertNotIn("All 10 cycles committed", md)
+
+    def test_cli_rejects_cycles_less_than_one(self) -> None:
+        """CLI argument parser rejects --cycles < 1 with exit code 2."""
+        code_zero = main(["192.0.2.1", str(self.img_a_path), str(self.img_b_path), "--cycles", "0"])
+        self.assertEqual(code_zero, 2)
+
+        code_neg = main(["192.0.2.1", str(self.img_a_path), str(self.img_b_path), "--cycles", "-5"])
+        self.assertEqual(code_neg, 2)
+
+        # In-memory runner directly rejects cycles < 1 as precheck failure
+        runner = SoakRunner(
+            runner=SoakMockDevice(),
+            image_a=self.img_a_path,
+            image_b=self.img_b_path,
+            cycles=0,
+        )
+        report = runner.run()
+        self.assertFalse(report.success)
+        self.assertEqual(report.failing_step, "precheck")
+        self.assertIn("Cycles must be at least 1", report.failure_message or "")
+
+    def test_marker_status_on_early_precheck_failure(self) -> None:
+        """Precheck failure outputs 'not checked' for persistent marker, not 'FAILED / MODIFIED'."""
+        device = SoakMockDevice(reachable=False)
+        runner = SoakRunner(
+            runner=device,
+            image_a=self.img_a_path,
+            image_b=self.img_b_path,
+            cycles=10,
+        )
+        report = runner.run()
+
+        self.assertFalse(report.success)
+        self.assertEqual(report.failing_step, "precheck")
+        self.assertFalse(report.marker_verified_unchanged)
+
+        md = report.format_markdown()
+        self.assertIn("Persistent Data Marker (`/data/nextoomio-soak-marker.txt`):** not checked", md)
+        self.assertNotIn("FAILED / MODIFIED", md)
+        self.assertIn("NOT CHECKED - Run halted before marker verification", md)
+        self.assertIn("FAILED - Halted during precheck before recording per-cycle step times", md)
+        self.assertNotIn("unattended execution", md)
+
+    def test_marker_path_validation(self) -> None:
+        """CQ-R7: Marker path must be an absolute path under /data with safe characters."""
+        self.assertTrue(is_safe_data_path("/data/marker.txt"))
+        self.assertTrue(is_safe_data_path("/data/nested/marker.txt"))
+        self.assertFalse(is_safe_data_path("/etc/passwd"))
+        self.assertFalse(is_safe_data_path("relative/path"))
+        self.assertFalse(is_safe_data_path("/data/../etc/passwd"))
+        self.assertFalse(is_safe_data_path("/data/evil;rm"))
+        self.assertFalse(is_safe_data_path("/data//double_slash"))
+
+        code = main([
+            "192.0.2.1",
+            str(self.img_a_path),
+            str(self.img_b_path),
+            "--marker-path",
+            "/etc/evil",
+        ])
+        self.assertEqual(code, 2)
+
 
 
 if __name__ == "__main__":

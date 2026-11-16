@@ -74,6 +74,16 @@ DEFAULT_MARKER_PATH = "/data/nextoomio-soak-marker.txt"
 DEFAULT_REPORT_FILE = "soak-report.md"
 
 
+def is_safe_data_path(path: str) -> bool:
+    """Validate that a marker path is an absolute path within /data with safe characters."""
+    if not path.startswith("/data/"):
+        return False
+    subpath = path[len("/data/") :]
+    if not subpath or ".." in subpath or "//" in subpath:
+        return False
+    return bool(re.match(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$", subpath))
+
+
 class SoakError(Exception):
     """Exception raised when a soak execution step or invariant check fails."""
 
@@ -196,32 +206,84 @@ class SoakReport:
 
     def format_markdown(self) -> str:
         """Render soak report as a GitHub-flavored Markdown document (AC2)."""
-        status_badge = "PASSED" if self.success else "FAILED"
+        completed_count = len(self.cycles)
+        if self.success:
+            status_badge = "PASSED"
+        elif self.failing_step == "gate_criteria":
+            status_badge = f"NON-GATE ({completed_count} / 10 CYCLES)"
+        else:
+            status_badge = "FAILED"
+
+        if self.marker_verified_unchanged:
+            marker_status = "UNCHANGED (Verified)"
+        elif self.failing_step in ("marker_check", "final_marker_verification"):
+            marker_status = "FAILED / MODIFIED"
+        elif self.failing_step == "marker_setup":
+            marker_status = "FAILED (Setup error)"
+        else:
+            marker_status = "not checked"
+
+        # AC1 Summary
+        if self.success:
+            ac1_summary = (
+                f"PASSED - All {completed_count} cycles committed with slot alternating and version matching"
+            )
+        elif self.failing_step == "gate_criteria":
+            ac1_summary = (
+                f"FAILED (NON-GATE) - All {completed_count} executed cycle(s) committed, "
+                f"but AC1 gate requires 10 cycles"
+            )
+        elif self.failing_cycle is not None:
+            ac1_summary = f"FAILED - Halted on cycle {self.failing_cycle} at step `{self.failing_step}`"
+        else:
+            ac1_summary = f"FAILED - Halted during precheck at step `{self.failing_step}`"
+
+        # AC2 Summary: tied to whether report recorded per-cycle step times and final state
+        if completed_count > 0:
+            ac2_summary = "PASSED - Per-cycle step times and final state recorded below"
+        else:
+            ac2_summary = "FAILED - Halted during precheck before recording per-cycle step times"
+
+        # AC3 Summary
+        if self.marker_verified_unchanged:
+            ac3_summary = f"PASSED - Marker file on /data unchanged across all {completed_count} cycle(s)"
+        elif self.failing_step in ("marker_check", "final_marker_verification"):
+            ac3_summary = "FAILED - Marker file on /data modified or corrupted"
+        elif self.failing_step == "marker_setup":
+            ac3_summary = "FAILED - Failed to initialize marker file on /data"
+        else:
+            ac3_summary = "NOT CHECKED - Run halted before marker verification"
+
+        # AC4 Summary
+        if self.success:
+            ac4_summary = f"N/A (All {completed_count} cycles succeeded)"
+        elif self.failing_step == "gate_criteria":
+            ac4_summary = f"FAILED - Run not counted as passed ({completed_count} < 10 cycles completed)"
+        elif self.failing_cycle is not None:
+            ac4_summary = f"HALTED on Cycle {self.failing_cycle} at step `{self.failing_step}`"
+        else:
+            ac4_summary = f"HALTED during precheck at step `{self.failing_step}`"
+
         lines = [
             f"# Soak Test Report: Ten-Cycle Update Soak (P0-F5.3)",
             "",
             f"- **Date:** {self.start_time[:10] if self.start_time else datetime.date.today().isoformat()}",
             f"- **Target Device:** `{self.target_device}`",
             f"- **Overall Status:** **{status_badge}**",
-            f"- **Cycles Completed:** {len(self.cycles)} / {self.total_cycles_requested}",
+            f"- **Cycles Completed:** {completed_count} / {self.total_cycles_requested}",
             f"- **Total Elapsed Duration:** {self.total_duration_secs:.2f} s",
             f"- **Start Time:** `{self.start_time}`",
             f"- **End Time:** `{self.end_time}`",
             f"- **Initial State:** slot `{self.initial_slot}`, version `{self.initial_version}`",
             f"- **Final State:** slot `{self.final_slot}`, version `{self.final_version}`",
-            f"- **Persistent Data Marker (`{self.marker_path}`):** "
-            f"{'UNCHANGED (Verified)' if self.marker_verified_unchanged else 'FAILED / MODIFIED'}",
+            f"- **Persistent Data Marker (`{self.marker_path}`):** {marker_status}",
             "",
             "## Summary of Acceptance Criteria",
             "",
-            f"- **AC1 (Alternating Slot & Version Match):** "
-            f"{'PASSED - All 10 cycles committed with slot alternating and version matching' if self.success else 'FAILED'}",
-            f"- **AC2 (Report with Step Times & Final State):** "
-            f"PASSED - Recorded below; unattended execution",
-            f"- **AC3 (Persistent Data Marker Unchanged):** "
-            f"{'PASSED - Marker file on /data unchanged across all cycles' if self.marker_verified_unchanged else 'FAILED'}",
-            f"- **AC4 (Failure Diagnostics & Stop on Error):** "
-            f"{'N/A (All cycles succeeded)' if self.success else f'HALTED on Cycle {self.failing_cycle} at step `{self.failing_step}`'}",
+            f"- **AC1 (Alternating Slot & Version Match):** {ac1_summary}",
+            f"- **AC2 (Report with Step Times & Final State):** {ac2_summary}",
+            f"- **AC3 (Persistent Data Marker Unchanged):** {ac3_summary}",
+            f"- **AC4 (Failure Diagnostics & Stop on Error):** {ac4_summary}",
             "",
         ]
 
@@ -230,10 +292,20 @@ class SoakReport:
                 "## Failure Diagnosis (AC4)",
                 "",
                 f"> [!CAUTION]",
-                f"> **Soak run halted at Cycle {self.failing_cycle}** during step `{self.failing_step}`.",
-                f"> Error: {self.failure_message}",
-                "",
             ])
+            if self.failing_step == "gate_criteria":
+                lines.extend([
+                    f"> **Non-gate execution:** {self.failure_message}.",
+                    "> The soak test must complete at least 10 alternating cycles to satisfy P0-F5.3 exit gate.",
+                    "",
+                ])
+            else:
+                cycle_label = f"Cycle {self.failing_cycle}" if self.failing_cycle is not None else "precheck"
+                lines.extend([
+                    f"> **Soak run halted at {cycle_label}** during step `{self.failing_step}`.",
+                    f"> Error: {self.failure_message}",
+                    "",
+                ])
 
         lines.extend([
             "## Per-Cycle Step Times (AC2)",
@@ -263,13 +335,42 @@ class SoakReport:
             "",
             "## Invariant Verifications",
             "",
-            "1. **Slot Alternation (AC1):** Each consecutive cycle toggled between `root_a` and `root_b` without repeating.",
-            "2. **Commit State (AC1):** All deployed images transitioned to `committed` update state via remote confirmation.",
-            "3. **Version Accuracy (AC1):** Active image version read from `/etc/nextoomio-release` matched the deployed SWU release version each cycle.",
-            f"4. **Data Partition Integrity (AC3):** Marker file written before cycle 1 retained exact SHA-256 (`{self.marker_hash}`) through all reboots.",
-            "5. **Unattended Execution (AC2):** Completed entirely over SSH automation; no manual device interaction required.",
-            "",
         ])
+        if completed_count > 0:
+            lines.extend([
+                f"1. **Slot Alternation (AC1):** Each consecutive cycle ({completed_count} completed) toggled between `root_a` and `root_b` without repeating.",
+                f"2. **Commit State (AC1):** All {completed_count} deployed image(s) transitioned to `committed` update state via remote confirmation.",
+                f"3. **Version Accuracy (AC1):** Active image version read from `/etc/nextoomio-release` matched the deployed SWU release version across all {completed_count} cycle(s).",
+            ])
+        else:
+            lines.extend([
+                "1. **Slot Alternation (AC1):** None (0 cycles executed).",
+                "2. **Commit State (AC1):** None (0 cycles executed).",
+                "3. **Version Accuracy (AC1):** None (0 cycles executed).",
+            ])
+
+        if self.marker_verified_unchanged:
+            lines.append(
+                f"4. **Data Partition Integrity (AC3):** Marker file written before cycle 1 retained exact SHA-256 (`{self.marker_hash}`) through all {completed_count} cycle reboots."
+            )
+        elif self.marker_hash:
+            lines.append(
+                f"4. **Data Partition Integrity (AC3):** Marker file check failed or incomplete (expected SHA-256: `{self.marker_hash}`)."
+            )
+        else:
+            lines.append(
+                "4. **Data Partition Integrity (AC3):** Marker file was not initialized."
+            )
+
+        if completed_count > 0:
+            lines.append(
+                "5. **Automated SSH Execution (AC2):** Non-interactive execution over SSH automation; per-cycle step times recorded in report."
+            )
+        else:
+            lines.append(
+                "5. **Automated SSH Execution (AC2):** Halted during precheck before executing deployment cycles."
+            )
+        lines.append("")
 
         return "\n".join(lines)
 
@@ -278,6 +379,10 @@ class MarkerManager:
     """Manages the lifecycle and verification of the persistent data marker file (AC3)."""
 
     def __init__(self, marker_path: str = DEFAULT_MARKER_PATH):
+        if not is_safe_data_path(marker_path):
+            raise ValueError(
+                f"Marker path '{marker_path}' must be an absolute path under /data with safe characters"
+            )
         self.marker_path = marker_path
         self.expected_content: str = ""
         self.expected_hash: str = ""
@@ -353,7 +458,10 @@ class SoakRunner:
         self.timeout_secs = timeout_secs
         self.poll_interval_secs = poll_interval_secs
         self.verbose = verbose
-        self.marker_manager = MarkerManager(marker_path)
+        try:
+            self.marker_manager = MarkerManager(marker_path)
+        except ValueError:
+            self.marker_manager = None
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -374,6 +482,23 @@ class SoakRunner:
         start_mono = time.monotonic()
 
         self._log(f"Starting {self.cycles}-cycle update soak on {target_name}...")
+
+        # Step -1: Pre-flight parameter validations
+        if self.cycles < 1:
+            report.success = False
+            report.failing_step = "precheck"
+            report.failure_message = f"Cycles must be at least 1, got {self.cycles}"
+            self._finalize_report(report, start_mono)
+            return report
+
+        if self.marker_manager is None or not is_safe_data_path(self.marker_path):
+            report.success = False
+            report.failing_step = "precheck"
+            report.failure_message = (
+                f"Marker path '{self.marker_path}' must be an absolute path under /data with safe characters"
+            )
+            self._finalize_report(report, start_mono)
+            return report
 
         # Step 0: Pre-flight image validations
         if not self.image_a.is_file() or self.image_a.stat().st_size == 0:
@@ -652,15 +777,23 @@ class SoakRunner:
         # Post-loop checks
         if len(report.cycles) == self.cycles and all(c.success for c in report.cycles):
             # Final check of marker
-            m_final_ok, _ = self.marker_manager.verify_marker(self.runner)
-            if m_final_ok:
-                report.success = True
-                report.marker_verified_unchanged = True
-            else:
+            m_final_ok, m_msg = self.marker_manager.verify_marker(self.runner)
+            if not m_final_ok:
                 report.success = False
                 report.marker_verified_unchanged = False
                 report.failing_step = "final_marker_verification"
-                report.failure_message = "Final marker verification failed after completing all cycles"
+                report.failure_message = f"Final marker verification failed after completing all cycles: {m_msg}"
+            elif self.cycles < 10:
+                report.success = False
+                report.marker_verified_unchanged = True
+                report.failing_step = "gate_criteria"
+                report.failure_message = (
+                    f"Fewer than 10 cycles completed ({self.cycles} / 10). "
+                    f"P0-F5.3 exit gate (AC1) requires 10 alternating committed cycles"
+                )
+            else:
+                report.success = True
+                report.marker_verified_unchanged = True
 
         self._finalize_report(report, start_mono)
         return report
@@ -833,6 +966,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.write("Error: Both update images (--image-a and --image-b) must be specified\n")
         return 2
 
+    if args.cycles < 1:
+        sys.stderr.write(f"Error: --cycles must be at least 1 (got {args.cycles})\n")
+        return 2
+
+    if not is_safe_data_path(args.marker_path):
+        sys.stderr.write(
+            f"Error: Marker path '{args.marker_path}' must be an absolute path under /data with safe characters\n"
+        )
+        return 2
+
     runner = SystemSshRunner(host=device, user=args.user, port=args.port)
 
     soak_runner = SoakRunner(
@@ -852,15 +995,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.format == "json":
         report_text = json.dumps(report.to_dict(), indent=2) + "\n"
     elif args.format == "text":
+        if report.success:
+            status_str = "PASSED"
+        elif report.failing_step == "gate_criteria":
+            status_str = f"NON-GATE ({len(report.cycles)} / 10 CYCLES)"
+        else:
+            status_str = "FAILED"
         lines = [
-            f"Soak Run: {'PASSED' if report.success else 'FAILED'}",
+            f"Soak Run: {status_str}",
             f"Device: {report.target_device}",
             f"Cycles: {len(report.cycles)} / {report.total_cycles_requested}",
             f"Duration: {report.total_duration_secs:.2f}s",
             f"Final state: {report.final_slot} ({report.final_version})",
         ]
         if not report.success:
-            lines.append(f"Halted at cycle {report.failing_cycle} ({report.failing_step}): {report.failure_message}")
+            cycle_str = f"cycle {report.failing_cycle}" if report.failing_cycle is not None else report.failing_step
+            lines.append(f"Halted at {cycle_str} ({report.failing_step}): {report.failure_message}")
         report_text = "\n".join(lines) + "\n"
     else:
         report_text = report.format_markdown() + "\n"
