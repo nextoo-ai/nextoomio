@@ -335,9 +335,15 @@ def deliver(role, issue, title, branch, output, extra_paths, number, cwd=None):
                      + ", ".join(f"`{p}`" for p in refused) + ". The changes are kept in a local stash.")
     found = re.search(r"^PR-Title:\s*(.+)$", output, re.M)
     pr_title = found.group(1).strip() if found else title
-    has_summary = "PR-Summary:" in output and bool(output.split("PR-Summary:", 1)[1].strip())
-    summary = output.split("PR-Summary:", 1)[1].strip() if has_summary else \
-        "The author gave no summary; see the diff."
+    matches = list(re.finditer(r"^PR-Summary:\s*", output, re.M))
+    if matches:
+        summary_raw = output[matches[-1].end():].strip()
+        has_summary = bool(summary_raw)
+        summary = summary_raw if has_summary else "The author gave no summary; see the diff."
+    else:
+        has_summary = "PR-Summary:" in output and bool(output.split("PR-Summary:", 1)[1].strip())
+        summary = output.split("PR-Summary:", 1)[1].strip() if has_summary else \
+            "The author gave no summary; see the diff."
     bot, email = bot_identity(role)
     env = dict(os.environ, GIT_AUTHOR_NAME=bot, GIT_COMMITTER_NAME=bot,
                GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_EMAIL=email)
@@ -2502,6 +2508,21 @@ sys.exit(0)
             desc_dev = mock_gh_d054.pr_descriptions[541]
             assert desc_dev.count("Refs #237") == 1
             assert f"Role: Developer · Model: {AUTHOR_MODEL}" in desc_dev
+
+            # Also verify conversational text mentioning PR-Summary before the final block does not leak into summary
+            with open(os.path.join(d054_local, "change_conv.txt"), "w") as f:
+                f.write("change round 2 conv\n")
+            output_conv = (
+                "Explanation: earlier discussion mentioning `PR-Summary:` in text.\n\n"
+                "PR-Title: ops: test conv\n"
+                "PR-Summary:\n"
+                "Clean summary for whole PR at head.\n"
+            )
+            deliver("devops", 237, "D-054 conv issue", "ops/D-054-test", output_conv, [], 540, cwd=d054_local)
+            desc_conv = mock_gh_d054.pr_descriptions[540]
+            assert "Explanation: earlier discussion" not in desc_conv
+            assert "Clean summary for whole PR at head." in desc_conv
+            assert desc_conv.count("Refs #237") == 1
 
             print("test_d054_ac1_later_round_with_summary_updates_description_and_posts_comment: OK")
 
