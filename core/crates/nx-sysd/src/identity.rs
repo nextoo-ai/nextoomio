@@ -79,9 +79,12 @@ pub struct DeviceIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VersionInfo {
     pub image_version: String,
+    pub version: String,
     pub source_commit: String,
+    pub commit: String,
     pub build_id: String,
     pub running_slot: String,
+    pub slot: String,
 }
 
 /// Hardware identity subset (AC2).

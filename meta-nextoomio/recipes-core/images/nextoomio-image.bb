@@ -1,18 +1,19 @@
 SUMMARY = "nextoomio read-only release image (v0.0.1 baseline)"
-DESCRIPTION = "Production-style read-only image with PipeWire, MPD, SWUpdate, NetworkManager, Avahi, nftables, and nx-sysd privileged helper daemon. Excludes SSH server and debug tooling per ARCHITECTURE.md section 3.7."
+DESCRIPTION = "Production-style read-only image with PipeWire, MPD, SWUpdate, NetworkManager, Avahi, nftables, nx-sysd, and key-activated OpenSSH per ARCHITECTURE.md section 3.7 and AD-23."
 LICENSE = "MIT"
 
 inherit core-image nextoomio-image-version
 
-# Enforce read-only rootfs and remove debug/SSH from release image (ARCHITECTURE.md section 3.7)
+# Enforce read-only rootfs and remove debug tooling (ARCHITECTURE.md section 3.7)
+# OpenSSH is installed in the single image, stopped by default, and activated via key file (AD-23, D-007)
 IMAGE_FEATURES += "read-only-rootfs"
-IMAGE_FEATURES:remove = "debug-tweaks ssh-server-dropbear ssh-server-openssh package-management"
+IMAGE_FEATURES:remove = "debug-tweaks ssh-server-dropbear package-management"
 
 WKS_FILE = "nextoomio-ab.wks.in"
 IMAGE_FSTYPES = "wic.bz2 wic.bmap ext4.gz"
 
-# Depend on rpi-autoboot deploy task for selector partition population (D-005)
-do_image_wic[depends] += "rpi-autoboot:do_deploy"
+# Depend on rpi-autoboot and nextoomio-audio-profile deploy tasks for boot partitions (D-005, D-011)
+do_image_wic[depends] += "rpi-autoboot:do_deploy nextoomio-audio-profile:do_deploy"
 
 # Size budget guard (AR-08: root slot is 3 GiB = 3,145,728 KiB)
 IMAGE_ROOTFS_MAXSIZE = "2800000"
@@ -32,4 +33,8 @@ IMAGE_INSTALL:append = " \
     avahi-daemon \
     nftables \
     nx-sysd \
+    openssh-sshd \
+    openssh-keygen \
+    nextoomio-ssh-keys \
+    nextoomio-audio-profile \
 "

@@ -575,6 +575,7 @@ CTL-03, and full delivery of SYS-01, SYS-02, SYS-06, CTL-01, CTL-02, CTL-04, I18
 | libFLAC, libvorbis, libogg | v0.0.1 | BSD-3-Clause | library of third-party processes |
 | curl | v0.0.1 | curl | library of third-party processes |
 | OpenSSL | v0.0.1 | Apache-2.0 | library of third-party processes |
+| OpenSSH | v0.0.1 | BSD-2-Clause, BSD-3-Clause, ISC, MIT | process |
 | SWUpdate | v0.0.1 | GPL-2.0-only; IPC client library LGPL-2.1-or-later | process |
 | NetworkManager | v0.0.1 | GPL-2.0-or-later; libnm LGPL-2.1-or-later | process |
 | Avahi | v0.0.1 | LGPL-2.1-or-later | process |

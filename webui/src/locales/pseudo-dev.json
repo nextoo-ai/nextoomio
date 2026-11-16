@@ -65,6 +65,8 @@
     "update_invalid_format": "[⟦The uploaded update bundle is corrupted or has an invalid format.⟧]",
     "update_incompatible_hardware": "[⟦The update bundle is not compatible with this Raspberry Pi model.⟧]",
     "update_incompatible_schema": "[⟦The update bundle uses an incompatible configuration schema.⟧]",
-    "update_busy": "[⟦Another update transaction is already in progress.⟧]"
+    "update_busy": "[⟦Another update transaction is already in progress.⟧]",
+    "update_truncated": "[⟦The uploaded update bundle is truncated or prematurely terminated.⟧]",
+    "update_corrupted_artifact": "[⟦An artifact inside the update bundle does not match its declared checksum.⟧]"
   }
 }
