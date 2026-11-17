@@ -111,7 +111,7 @@ jobs:
             sh -ec '
               src=/work/build/build/tmp/deploy
               mkdir -p /output/images/raspberrypi4-64 /output/licenses
-              for f in "$src"/images/raspberrypi4-64/*.wic.bz2 "$src"/images/raspberrypi4-64/*.wic.bmap "$src"/images/raspberrypi4-64/*.swu "$src"/images/raspberrypi4-64/*.manifest "$src"/images/raspberrypi4-64/*.rootfs.spdx.json "$src"/images/raspberrypi4-64/*.spdx.tar.zst; do
+              for f in "$src"/images/raspberrypi4-64/*.rootfs.ext4.gz "$src"/images/raspberrypi4-64/*.wic.bz2 "$src"/images/raspberrypi4-64/*.wic.bmap "$src"/images/raspberrypi4-64/*.swu "$src"/images/raspberrypi4-64/*.manifest "$src"/images/raspberrypi4-64/*.rootfs.spdx.json "$src"/images/raspberrypi4-64/*.spdx.tar.zst; do
                 if [ -f "$f" ]; then cp -L "$f" /output/images/raspberrypi4-64/; fi
               done
               for f in "$src"/licenses/*/nextoomio-image-*/license.manifest; do
@@ -121,6 +121,9 @@ jobs:
                 cp -L "$f" "$dest"
               done
             '
+
+      - name: Check built root filesystem
+        run: python3 scripts/check_image_rootfs.py build/tmp/deploy/images/raspberrypi4-64/nextoomio-image-raspberrypi4-64.rootfs.ext4.gz --commit "${{ github.sha }}"
 
       - name: Check required build artifacts and image licenses
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')

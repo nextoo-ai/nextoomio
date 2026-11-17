@@ -5,13 +5,16 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 SRC_URI:append = " \
     file://99-timesync.preset \
+    file://50-nextoomio-services.preset \
 "
 
 do_install:append() {
     install -d ${D}${systemd_unitdir}/system-preset
+    install -m 0644 ${UNPACKDIR}/50-nextoomio-services.preset ${D}${systemd_unitdir}/system-preset/50-nextoomio-services.preset
     install -m 0644 ${UNPACKDIR}/99-timesync.preset ${D}${systemd_unitdir}/system-preset/99-timesync.preset
 }
 
 FILES:${PN} += " \
     ${systemd_unitdir}/system-preset/99-timesync.preset \
+    ${systemd_unitdir}/system-preset/50-nextoomio-services.preset \
 "
