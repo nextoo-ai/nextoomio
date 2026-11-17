@@ -606,6 +606,8 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
             errors.append("nextoomio-image-version.bbclass must write /etc/nextoomio-release via IMAGE_PREPROCESS_COMMAND")
         if "nextoomio_derive_source_commit" not in iv_text or "NEXTOOMIO_SOURCE_COMMIT" not in iv_text:
             errors.append("nextoomio-image-version.bbclass must derive NEXTOOMIO_SOURCE_COMMIT at build time (AC1, AC4, P0-F2.3)")
+        if not re.search(r'^\s*do_rootfs\[vardeps\]\s*\+=\s*"NEXTOOMIO_SOURCE_COMMIT"\s*(?:#.*)?$', iv_text, re.MULTILINE):
+            errors.append("nextoomio-image-version.bbclass must include NEXTOOMIO_SOURCE_COMMIT in do_rootfs vardeps (D-074)")
 
     image_bb = root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
     if image_bb.is_file():
@@ -1237,6 +1239,7 @@ def run_self_tests() -> int:
 
     all_layer_files = [
         "meta-nextoomio/COPYING.MIT",
+        "meta-nextoomio/classes/nextoomio-image-version.bbclass",
         "meta-nextoomio/conf/layer.conf",
         "meta-nextoomio/conf/distro/nextoomio.conf",
         "meta-nextoomio/files/wic/nextoomio-ab.wks.in",
@@ -1828,6 +1831,17 @@ def run_self_tests() -> int:
             assert any("full-image mountpoint" in error for error in validate_layer(tmp_root))
         wf.write_text(original, encoding="utf-8")
         print("  test_full_image_mountpoint_required_before_docker: OK")
+
+        # D-074: cached root filesystems must depend on the source commit.
+        version_class = tmp_root / "meta-nextoomio/classes/nextoomio-image-version.bbclass"
+        original_class = version_class.read_text(encoding="utf-8")
+        vardeps = 'do_rootfs[vardeps] += "NEXTOOMIO_SOURCE_COMMIT"'
+        assert vardeps in original_class
+        for replacement in ("", "# " + vardeps):
+            version_class.write_text(original_class.replace(vardeps, replacement), encoding="utf-8")
+            assert any("do_rootfs vardeps" in error for error in validate_layer(tmp_root))
+        version_class.write_text(original_class, encoding="utf-8")
+        print("  test_rootfs_source_commit_vardeps_required: OK")
 
         # D-069: the gate belongs to the image, and must reject all listed AGPL variants.
         image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
