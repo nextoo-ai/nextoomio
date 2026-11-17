@@ -86,6 +86,7 @@ jobs:
 
       - name: Build full nextoomio Yocto image
         run: |
+          mkdir -p "${GITHUB_WORKSPACE}/build"
           docker run --rm \
             --user=root \
             -v "${GITHUB_WORKSPACE}:/work:ro" \
