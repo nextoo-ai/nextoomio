@@ -301,6 +301,7 @@ class DeployResult:
         confirmation_sent: bool = False,
         rollback_detected: bool = False,
         device_update_state: Optional[Dict[str, Any]] = None,
+        tone_check: Optional[Dict[str, Any]] = None,
     ):
         self.success = success
         self.previous_version = previous_version
@@ -313,6 +314,7 @@ class DeployResult:
         self.confirmation_sent = confirmation_sent
         self.rollback_detected = rollback_detected
         self.device_update_state = device_update_state or {}
+        self.tone_check = tone_check
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -327,6 +329,7 @@ class DeployResult:
             "confirmation_sent": self.confirmation_sent,
             "rollback_detected": self.rollback_detected,
             "device_update_state": self.device_update_state,
+            "tone_check": self.tone_check,
         }
 
 
@@ -342,6 +345,7 @@ class Deployer:
         poll_interval_secs: float = DEFAULT_POLL_INTERVAL_SECS,
         remote_confirm: bool = True,
         verbose: bool = False,
+        tone_check: bool = False,
     ):
         self.runner = runner
         self.swu_path = swu_path
@@ -350,6 +354,7 @@ class Deployer:
         self.poll_interval_secs = poll_interval_secs
         self.remote_confirm = remote_confirm
         self.verbose = verbose
+        self.tone_check = tone_check
         self.timer = StepTimer()
         self.initial_boot_id: Optional[str] = None
 
@@ -656,6 +661,16 @@ class Deployer:
                     raise DeployError("confirm", "Update still in trial at timeout", details=final_status)
             self.timer.stop("confirm")
 
+            tone_result = None
+            if self.tone_check:
+                self.timer.start("tone_check")
+                # The deployment is already committed; this check has its own
+                # bounded SSH timeout and cannot undo that confirmation.
+                check = self.runner.run("nextoomio-tone-check", timeout=30.0)
+                self.timer.stop("tone_check")
+                tone_result = {"returncode": check.returncode, "stdout": check.stdout,
+                               "stderr": check.stderr}
+
             return DeployResult(
                 success=True,
                 previous_version=previous_version,
@@ -666,6 +681,7 @@ class Deployer:
                 confirmation_sent=confirmation_sent,
                 rollback_detected=False,
                 device_update_state=final_status,
+                tone_check=tone_result,
             )
 
         except DeployError as e:
@@ -718,6 +734,11 @@ def format_text_report(res: DeployResult) -> str:
             lines.append(f"Update State:      {state_str}")
 
     lines.append("-" * 60)
+    if res.tone_check is not None:
+        lines.append(f"Tone Check:        {'PASS' if res.tone_check['returncode'] == 0 else 'FAIL'} (exit {res.tone_check['returncode']})")
+        for stream in ("stdout", "stderr"):
+            if res.tone_check[stream].strip():
+                lines.append(res.tone_check[stream].rstrip())
     lines.append("Step Elapsed Times:")
     for step, duration in res.step_times.items():
         if step != "total":
@@ -782,6 +803,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-remote-confirm",
         action="store_true",
         help="Do not request remote confirmation (commit on local health check alone).",
+    )
+    parser.add_argument(
+        "--tone-check",
+        action="store_true",
+        help="Run the remote tone check after the update is committed.",
     )
     parser.add_argument(
         "--json",
@@ -881,6 +907,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         poll_interval_secs=args.poll_interval,
         remote_confirm=not args.no_remote_confirm,
         verbose=args.verbose,
+        tone_check=args.tone_check,
     )
 
     result = deployer.deploy()
@@ -890,7 +917,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         print(format_text_report(result))
 
-    return 0 if result.success else 1
+    return 0 if result.success and (result.tone_check is None or result.tone_check["returncode"] == 0) else 1
 
 
 if __name__ == "__main__":
