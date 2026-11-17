@@ -43,6 +43,9 @@ jobs:
         run: |
           make check-bench
 
+      - name: Run agent pipeline self-tests
+        run: python3 scripts/agent-pipeline.py --test
+
   rust-core:
     name: Rust Core & License Gate
     runs-on: ubuntu-24.04
