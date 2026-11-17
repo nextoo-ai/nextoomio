@@ -546,12 +546,31 @@ def block(issue, reason):
 
 
 def run_qm_and_close(issue, number, log, run_dir, cwd=None):
+    commit = run(["git", "rev-parse", "main"], cwd=cwd).stdout.strip()
+    started = datetime.datetime.now(datetime.timezone.utc)
     agent("qm", f"Verify issue {issue}, which now has state:implemented; its pull request {number} is merged. "
-                "Follow your role definition.", log, cwd=cwd)
+                f"Verify main at commit {commit} and include a standalone line "
+                f"Verified-Commit: {commit} in your verdict. Follow your role definition.", log, cwd=cwd)
     comments = gh_json(["issue", "view", str(issue), "--json", "comments"])["comments"]
-    verdicts = [c["body"] for c in comments if is_app(c["author"]["login"], "qm")]
-    passed = bool(verdicts) and re.search(r"^QM-Verdict:\s*PASS\s*$", verdicts[-1], re.M)
-    if not passed:
+    fresh = []
+    for comment in comments:
+        if not is_app(comment["author"]["login"], "qm"):
+            continue
+        try:
+            created = datetime.datetime.fromisoformat(comment["createdAt"].replace("Z", "+00:00"))
+            if created.tzinfo is not None and created > started:
+                fresh.append((created, comment))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not fresh:
+        raise Stop(2, f"issue #{issue} stays open: no QM comment created after this run started")
+    verdict = max(fresh, key=lambda item: item[0])[1]["body"] or ""
+    commits = re.findall(r"^Verified-Commit:[ \t]*([^\s]+)[ \t]*$", verdict, re.M)
+    if not commits:
+        raise Stop(2, f"issue #{issue} stays open: QM verdict has no Verified-Commit line")
+    if commits != [commit]:
+        raise Stop(2, f"issue #{issue} stays open: QM Verified-Commit does not match {commit}")
+    if not re.search(r"^QM-Verdict:[ \t]*PASS[ \t]*$", verdict, re.M):
         raise Stop(2, f"issue #{issue} stays open: QM did not give 'QM-Verdict: PASS'")
 
     body = gh_json(["issue", "view", str(issue), "--json", "body"])["body"].replace("- [ ] **AC", "- [x] **AC")
@@ -591,7 +610,7 @@ def cleanup_checkout(cwd=None):
 
 def run_self_tests():
     """Run self-tests verifying that pinned tooling runs instead of branch tooling (D-040, AC2)."""
-    global TOOLING, gh, pr_state, say, REQUIRED_CHECKS
+    global TOOLING, gh, gh_json, agent, pr_state, say, REQUIRED_CHECKS
     print("Running agent-pipeline self-tests...")
     with tempfile.TemporaryDirectory() as tmpdir:
         # Test 1: pin_tooling copies all required files and marks them executable (AC1)
@@ -1924,7 +1943,9 @@ sys.exit(0)
                     fields = args[args.index("--json") + 1].split(",")
                     if "comments" in fields:
                         return json.dumps({"comments": gh_state.issue_comments.get(issue_num, [
-                            {"author": {"login": "nextoomio-qm[bot]"}, "body": "QM-Verdict: PASS"}
+                            {"author": {"login": "nextoomio-qm[bot]"}, "createdAt": "2999-01-01T00:00:00Z",
+                             "body": "QM-Verdict: PASS\nVerified-Commit: " + subprocess.check_output(
+                                 ["git", "-C", d051_local, "rev-parse", "main"], text=True).strip()}
                         ])})
                     if "body" in fields and len(fields) == 1:
                         return json.dumps({"body": gh_state.issue_info.get(issue_num, {}).get("body", "- [ ] **AC1**")})
@@ -2853,7 +2874,9 @@ sys.exit(0)
                     fields = args[args.index("--json") + 1].split(",")
                     if "comments" in fields:
                         return json.dumps({"comments": [
-                            {"author": {"login": "nextoomio-qm[bot]"}, "body": "QM-Verdict: PASS"}
+                            {"author": {"login": "nextoomio-qm[bot]"}, "createdAt": "2999-01-01T00:00:00Z",
+                             "body": "QM-Verdict: PASS\nVerified-Commit: " + subprocess.check_output(
+                                 ["git", "-C", d062_local, "rev-parse", "main"], text=True).strip()}
                         ]})
                     if "body" in fields and len(fields) == 1:
                         return json.dumps({"body": "- [ ] **AC1**"})
@@ -3319,6 +3342,51 @@ sys.exit(0)
             TOOLING = old_tooling_d062
             REQUIRED_CHECKS = old_required_checks_d062
             os.environ.pop("D062_RECORD_FILE", None)
+
+        # D-063: GitHub writes are recorded rather than sent to the network.
+        old_agent, old_gh_json, old_gh = agent, gh_json, gh
+        try:
+            sha = subprocess.check_output(["git", "-C", repo_dir, "rev-parse", "main"], text=True).strip()
+            writes = []
+            comments = []
+            prompts = []
+            def qm_agent(role, task, log, cwd=None):
+                prompts.append(task)
+            def qm_json(args, **kwargs):
+                return {"comments": comments} if "comments" in args else {"body": "- [ ] **AC1**"}
+            def qm_write(args, **kwargs):
+                writes.append(args)
+            agent, gh_json, gh = qm_agent, qm_json, qm_write
+
+            def comment(body, timestamp, login="nextoomio-qm[bot]"):
+                return {"author": {"login": login}, "body": body, "createdAt": timestamp}
+
+            old = "2000-01-01T00:00:00Z"
+            future = "2999-01-01T00:00:00Z"
+            cases = [
+                ([comment(f"QM-Verdict: PASS\nVerified-Commit: {sha}", old)], "no QM comment"),
+                ([comment("QM-Verdict: PASS", future)], "no Verified-Commit"),
+                ([comment("QM-Verdict: PASS\nVerified-Commit: " + "0" * 40, future)], "does not match"),
+                ([comment(f"QM-Verdict: FAIL\nVerified-Commit: {sha}", future)], "did not give"),
+                ([comment(f"QM-Verdict: PASS\nVerified-Commit: {sha}", future, "other[bot]")], "no QM comment"),
+            ]
+            for fixture, message in cases:
+                comments[:] = fixture
+                writes.clear()
+                try:
+                    run_qm_and_close(252, 1, "unused", tmpdir, cwd=repo_dir)
+                    raise AssertionError("invalid verdict was accepted")
+                except Stop as exc:
+                    assert exc.status == 2 and message in str(exc), str(exc)
+                assert not writes, writes
+            comments[:] = [comment(f"QM-Verdict: PASS\nVerified-Commit: {sha}", future)]
+            writes.clear()
+            assert run_qm_and_close(252, 1, "unused", tmpdir, cwd=repo_dir) == 0
+            assert [args[:2] for args in writes] == [["issue", "edit"], ["issue", "close"]]
+            assert sha in prompts[-1] and "Verified-Commit:" in prompts[-1]
+            print("test_d063_fresh_verdict_and_commit_gate: OK")
+        finally:
+            agent, gh_json, gh = old_agent, old_gh_json, old_gh
 
     print("OK: all self-tests passed.")
     return 0
