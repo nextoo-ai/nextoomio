@@ -5,7 +5,9 @@
 use crate::cpio::{
     read_entry_bytes, read_next_cpio_header, skip_entry_data, stream_and_hash_entry_data, CpioError,
 };
-use crate::journal::{JournalController, JournalError, JournalStorage, ReconcileOutcome};
+use crate::journal::{
+    JournalController, JournalError, JournalStorage, LockError, ReconcileOutcome, UpdaterLock,
+};
 use crate::sha256::Sha256;
 use crate::sw_description::parse_sw_description;
 use crate::system::{HealthReport, PartitionType, Slot, SlotBackend, StagingError, StagingStorage};
@@ -18,12 +20,20 @@ use std::io::Read;
 /// Default preallocated staging reservation capacity: 1 GiB (ARCHITECTURE.md section 3.6 step 1).
 pub const DEFAULT_STAGING_RESERVATION: u64 = 1_073_741_824;
 
+/// Interval at which a waiting command retries a transition while another process holds
+/// the updater lock (D-065).
+pub const LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Default configuration schema version.
 pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
 
 /// Machine-readable update transaction status for CLI and API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateStatus {
+    /// False when the update directory holds no journal record yet; `status` reports this
+    /// instead of initializing the directory (D-065).
+    #[serde(default = "default_true")]
+    pub initialized: bool,
     pub state: UpdateTransactionState,
     pub active_slot: String,
     pub default_slot: String,
@@ -44,6 +54,10 @@ pub struct UpdateStatus {
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Errors occurring during update staging and validation.
@@ -245,19 +259,31 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             .get_default_slot()
             .map_err(UpdateEngineError::Storage)?;
 
-        let storage_init = storage
-            .init_staging(cap)
-            .map_err(UpdateEngineError::Storage);
-        storage_init?;
+        // Initializing the staging area or the journal is a transition (D-065): it runs
+        // under the updater lock. An already initialized directory is loaded without any
+        // write, so that a process that cannot take the lock changes nothing.
+        let needs_init = !storage.is_ready(cap) || !journal_storage.has_records();
+        let _lock = if needs_init {
+            Some(journal_storage.try_lock_updater().map_err(lock_error)?)
+        } else {
+            None
+        };
+        if needs_init {
+            storage
+                .init_staging(cap)
+                .map_err(UpdateEngineError::Storage)?;
+        }
 
-        let journal =
-            match JournalController::load_or_init(journal_storage, active.name(), default.name()) {
-                Ok(j) => j,
-                Err(JournalError::Corrupted(e)) => {
-                    return Err(UpdateEngineError::JournalCorrupted(e));
-                }
-                Err(JournalError::Storage(e)) => return Err(UpdateEngineError::Storage(e)),
-            };
+        let loaded = if needs_init {
+            JournalController::load_or_init(journal_storage, active.name(), default.name())
+        } else {
+            JournalController::load_existing(journal_storage).and_then(|j| {
+                j.ok_or_else(|| {
+                    JournalError::Storage("journal records disappeared while loading".to_string())
+                })
+            })
+        };
+        let journal = loaded.map_err(journal_error)?;
 
         Ok(Self {
             backend,
@@ -269,9 +295,50 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         })
     }
 
+    /// Reports the update status without taking the updater lock and without writing
+    /// anything (D-065).
+    ///
+    /// An update directory without a journal record is reported as not initialized
+    /// (`initialized: false`, state `idle`) and left unchanged.
+    pub fn read_status(
+        backend: &B,
+        journal_storage: J,
+        capacity: u64,
+    ) -> Result<UpdateStatus, UpdateEngineError> {
+        let active = backend.get_active_slot().map(|s| s.name().to_string());
+        let default = backend.get_default_slot().map(|s| s.name().to_string());
+        match JournalController::load_existing(journal_storage).map_err(journal_error)? {
+            Some(journal) => Ok(status_from(journal.current(), active, default, capacity)),
+            None => {
+                let rec = crate::journal::JournalRecord::new_initial(
+                    active.as_deref().unwrap_or("unknown"),
+                    default.as_deref().unwrap_or("unknown"),
+                );
+                let mut status = status_from(&rec, active, default, capacity);
+                status.initialized = false;
+                status.message = Some("update directory is not initialized".to_string());
+                Ok(status)
+            }
+        }
+    }
+
+    /// Takes the updater lock for one transition and reloads the journal under it (D-065).
+    ///
+    /// Returns [`UpdateEngineError::Busy`] at once when another process holds the lock.
+    fn lock_transition(&mut self) -> Result<UpdaterLock, UpdateEngineError> {
+        let lock = self.journal.try_lock_updater().map_err(lock_error)?;
+        self.reload_journal()?;
+        Ok(lock)
+    }
+
     /// Reconciles unfinalized boot/recovery state (e.g. interrupted upload while Receiving).
     /// Called explicitly on real boot (by `nx-sysd update init-staging` / `nextoomio-update-init.service`).
     pub fn reconcile_boot(&mut self) -> Result<ReconcileOutcome, UpdateEngineError> {
+        let _lock = self.lock_transition()?;
+        self.reconcile_boot_locked()
+    }
+
+    fn reconcile_boot_locked(&mut self) -> Result<ReconcileOutcome, UpdateEngineError> {
         let running_slot = self
             .backend
             .get_active_slot()
@@ -341,37 +408,24 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// Queries the current update transaction status.
     /// Reports the live slot configuration directly from the backend (AC2).
     pub fn status(&self) -> UpdateStatus {
-        let rec = self.journal.current();
-        let active_slot = self
-            .backend
-            .get_active_slot()
-            .map(|s| s.name().to_string())
-            .unwrap_or_else(|_| rec.active_slot.clone());
-        let default_slot = self
-            .backend
-            .get_default_slot()
-            .map(|s| s.name().to_string())
-            .unwrap_or_else(|_| rec.default_slot.clone());
-
-        UpdateStatus {
-            state: rec.state,
-            active_slot,
-            default_slot,
-            target_slot: rec.target_slot.clone(),
-            tx_id: rec.tx_id.clone(),
-            payload_length: rec.payload_len,
-            reserved_capacity: self.reserved_capacity,
-            consumed_attempts: rec.consumed_attempts,
-            remote_confirm: rec.remote_confirm,
-            confirmed: rec.is_confirmed(),
-            error_code: rec.error_code.clone(),
-            message: None,
-        }
+        status_from(
+            self.journal.current(),
+            self.backend.get_active_slot().map(|s| s.name().to_string()),
+            self.backend
+                .get_default_slot()
+                .map(|s| s.name().to_string()),
+            self.reserved_capacity,
+        )
     }
 
     /// Begins an update upload.
     /// Refuses with UpdateBusy if another transaction is currently receiving or installing (AC5).
     pub fn begin_upload(&mut self, declared_len: Option<u64>) -> Result<(), UpdateEngineError> {
+        let _lock = self.lock_transition()?;
+        self.begin_upload_locked(declared_len)
+    }
+
+    fn begin_upload_locked(&mut self, declared_len: Option<u64>) -> Result<(), UpdateEngineError> {
         let curr = self.journal.current().state;
 
         // AC5: Given an upload in progress, when a second upload or an install is requested, then it is refused as busy.
@@ -443,6 +497,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// 9. Commits 'installed' state only upon complete verification (AC2).
     /// 10. Resets staging payload metadata while retaining preallocated extents.
     pub fn install(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
+        let _lock = self.lock_transition()?;
         self.begin_install()?;
 
         let (tx_id, payload_len, payload_sha) = {
@@ -762,6 +817,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         auto_reboot: bool,
         remote_confirm: bool,
     ) -> Result<UpdateStatus, UpdateEngineError> {
+        let _lock = self.lock_transition()?;
         let (current_state, attempts, target_slot, default_slot) = {
             let curr = self.journal.current();
             (
@@ -911,8 +967,10 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         let start_monotonic = std::time::Instant::now();
         let mut health_passed = false;
         let mut waiting_reported = false;
+        let mut busy_reported = false;
 
         loop {
+            let mut retry_soon = false;
             // Re-read the journal each poll to see confirmations and commits recorded by
             // other processes (AC3, CQ-R4)
             if let Err(e) = self.journal.reload() {
@@ -968,6 +1026,18 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
                             let _ = self.backend.trigger_reboot();
                             return Err(e);
                         }
+                        // Another process holds the updater lock: not a trial failure;
+                        // retry within the trial budget (D-065).
+                        Err(UpdateEngineError::Busy) => {
+                            if !busy_reported {
+                                eprintln!(
+                                    "Updater lock busy; retrying the commit every {} ms",
+                                    LOCK_RETRY_INTERVAL.as_millis()
+                                );
+                                busy_reported = true;
+                            }
+                            retry_soon = true;
+                        }
                         Err(e) => eprintln!("Warning: commit not possible yet: {e}"),
                     }
                 }
@@ -976,9 +1046,12 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             self.backend
                 .feed_watchdog()
                 .map_err(UpdateEngineError::Storage)?;
-            std::thread::sleep(std::time::Duration::from_millis(
-                poll_interval_ms.clamp(50, 1000),
-            ));
+            let poll = std::time::Duration::from_millis(poll_interval_ms.clamp(50, 1000));
+            std::thread::sleep(if retry_soon {
+                LOCK_RETRY_INTERVAL
+            } else {
+                poll
+            });
         }
     }
 
@@ -990,11 +1063,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// did not request remote confirmation is rejected and changes nothing. The commit
     /// itself is made by the trial service once the local health check has passed.
     pub fn confirm(&mut self, tx_id: Option<&str>) -> Result<UpdateStatus, UpdateEngineError> {
-        let _lock = self
-            .journal
-            .lock_updater()
-            .map_err(UpdateEngineError::Storage)?;
-        self.reload_journal()?;
+        let _lock = self.lock_transition()?;
         let rec = self.journal.current().clone();
 
         if let Some(id) = tx_id {
@@ -1079,11 +1148,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// `failed` with `update_commit_failed`, and [`UpdateEngineError::CommitFailed`] is
     /// returned so that the caller reboots to the previous slot.
     pub fn commit_trial(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
-        let _lock = self
-            .journal
-            .lock_updater()
-            .map_err(UpdateEngineError::Storage)?;
-        self.reload_journal()?;
+        let _lock = self.lock_transition()?;
         let rec = self.journal.current().clone();
 
         if rec.state != UpdateTransactionState::Trial {
@@ -1210,10 +1275,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     }
 
     fn reload_journal(&mut self) -> Result<(), UpdateEngineError> {
-        self.journal.reload().map_err(|e| match e {
-            JournalError::Corrupted(m) => UpdateEngineError::JournalCorrupted(m),
-            JournalError::Storage(m) => UpdateEngineError::Storage(m),
-        })
+        self.journal.reload().map_err(journal_error)
     }
 
     /// Stages payload from an input reader into the preallocated staging file.
@@ -1223,7 +1285,9 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         reader: R,
         declared_len: Option<u64>,
     ) -> Result<UpdateStatus, UpdateEngineError> {
-        self.begin_upload(declared_len)?;
+        // The upload holds the updater lock from `receiving` until `staged` (D-065).
+        let _lock = self.lock_transition()?;
+        self.begin_upload_locked(declared_len)?;
 
         struct HashingReader<R: Read> {
             inner: R,
@@ -1334,6 +1398,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// Streams entries incrementally to prevent memory exhaustion on target hardware.
     /// Preserves active and default boot slots and performs zero writes to the inactive slot.
     pub fn validate(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
+        let _lock = self.lock_transition()?;
         let (curr_state, payload_len, curr_sha) = {
             let curr = self.journal.current();
             (curr.state, curr.payload_len, curr.payload_sha256.clone())
@@ -1601,6 +1666,7 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
 
     /// Aborts or resets any active/failed update transaction to Idle without reducing reservation.
     pub fn abort(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
+        let _lock = self.lock_transition()?;
         self.journal
             .commit_state(UpdateTransactionState::Idle, None, None, 0, None, None)
             .map_err(UpdateEngineError::Storage)?;
@@ -1608,5 +1674,44 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
         self.storage.cleanup().map_err(UpdateEngineError::Storage)?;
 
         Ok(self.status())
+    }
+}
+
+fn lock_error(e: LockError) -> UpdateEngineError {
+    match e {
+        LockError::Busy => UpdateEngineError::Busy,
+        LockError::Storage(m) => UpdateEngineError::Storage(m),
+    }
+}
+
+fn journal_error(e: JournalError) -> UpdateEngineError {
+    match e {
+        JournalError::Corrupted(m) => UpdateEngineError::JournalCorrupted(m),
+        JournalError::Storage(m) => UpdateEngineError::Storage(m),
+    }
+}
+
+/// Builds the status from a journal record and the live slot configuration (AC2); a slot
+/// the backend cannot report falls back to the recorded one.
+fn status_from(
+    rec: &crate::journal::JournalRecord,
+    active_slot: Result<String, String>,
+    default_slot: Result<String, String>,
+    reserved_capacity: u64,
+) -> UpdateStatus {
+    UpdateStatus {
+        initialized: true,
+        state: rec.state,
+        active_slot: active_slot.unwrap_or_else(|_| rec.active_slot.clone()),
+        default_slot: default_slot.unwrap_or_else(|_| rec.default_slot.clone()),
+        target_slot: rec.target_slot.clone(),
+        tx_id: rec.tx_id.clone(),
+        payload_length: rec.payload_len,
+        reserved_capacity,
+        consumed_attempts: rec.consumed_attempts,
+        remote_confirm: rec.remote_confirm,
+        confirmed: rec.is_confirmed(),
+        error_code: rec.error_code.clone(),
+        message: None,
     }
 }

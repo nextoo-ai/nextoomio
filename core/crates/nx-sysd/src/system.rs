@@ -1759,6 +1759,13 @@ pub trait StagingStorage: Send + Sync {
     /// Preallocates or initializes the staging area to the given capacity in bytes.
     fn init_staging(&mut self, capacity: u64) -> Result<(), String>;
 
+    /// Whether the staging area is already initialized for `capacity`, checked without
+    /// writing, so that [`StagingStorage::init_staging`] can be skipped (D-065). Storage that
+    /// cannot tell returns `false` and is initialized under the updater lock.
+    fn is_ready(&self, _capacity: u64) -> bool {
+        false
+    }
+
     /// Returns the currently allocated extent/block size on disk (e.g. 1 GiB).
     fn get_allocated_size(&self) -> Result<u64, String>;
 
@@ -1956,6 +1963,33 @@ struct StagingMeta {
 }
 
 impl StagingStorage for FileStagingStorage {
+    fn is_ready(&self, capacity: u64) -> bool {
+        let Ok(staging) = fs::metadata(&self.staging_file) else {
+            return false;
+        };
+        #[cfg(unix)]
+        let allocated = {
+            use std::os::unix::fs::MetadataExt;
+            staging.blocks() * 512
+        };
+        #[cfg(not(unix))]
+        let allocated = staging.len();
+        if allocated < capacity || staging.len() < capacity {
+            return false;
+        }
+        let Ok(data) = fs::read(&self.meta_file) else {
+            return false;
+        };
+        if (data.len() as u64) < STAGING_META_FILE_SIZE {
+            return false;
+        }
+        let end_pos = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        matches!(
+            serde_json::from_slice::<StagingMeta>(&data[..end_pos]),
+            Ok(meta) if meta.reserved_capacity == capacity
+        )
+    }
+
     fn init_staging(&mut self, capacity: u64) -> Result<(), String> {
         self.reserved_capacity = capacity;
         fs::create_dir_all(&self.staging_dir)
