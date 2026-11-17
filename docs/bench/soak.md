@@ -15,7 +15,7 @@ The soak run exercises the complete update engine stack ([ARCHITECTURE.md](../..
 - Uploading and staging update containers over SSH.
 - Container payload signature and metadata validation (`nx-sysd update validate`).
 - Writing raw rootfs and boot assets to the inactive partition slot (`nx-sysd update install`).
-- Arming trial boot with remote confirmation requested (`nx-sysd update trial --remote-confirm`, AD-22).
+- Arming trial boot with remote confirmation requested (`nx-sysd update trial`, AD-22).
 - Waiting for system reboot and recovery into the trial slot within the 120-second trial budget (UPD-06).
 - Verifying active slot alternation and version match.
 - Sending remote confirmation (`nx-sysd update confirm`) and verifying durable transition to `committed`.
@@ -45,6 +45,13 @@ The automated tooling (`scripts/bench/soak.py`) directly implements and verifies
 - **SSH Access:** SSH key authentication configured during first-flash ([docs/bench/first-flash.md](first-flash.md), [ARCHITECTURE.md](../../ARCHITECTURE.md) section 4.1). Active SSH agent loaded on workstation (AD-23).
 
 ### Image Artifacts
+
+The Phase 0 deploy tool first uploads to `/data/update/staging.upload.swu`, outside the
+reserved staging space. Allow free space for one additional complete archive. The
+remote shell removes this temporary file after staging and on a handled failure;
+a device power loss or interrupted connection can prevent cleanup, so inspect the
+path before retrying. This procedure does not demonstrate the full-data-partition
+guarantee. Streaming directly into the reservation is a v0.0.1 upload API matter.
 
 The soak test requires two distinguishable valid update images:
 1. `image_a.swu`: Built release or test image reporting version $V_A$ (e.g., `0.0.1-soak-a`).

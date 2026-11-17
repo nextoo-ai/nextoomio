@@ -233,6 +233,42 @@ class TestSoakTool(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_failed_attempt_counts_and_invariants(self) -> None:
+        for failed_cycle in (1, 4):
+            device = SoakMockDevice(fail_cycle=failed_cycle, fail_step="install")
+            report = SoakRunner(device, self.img_a_path, self.img_b_path, cycles=10,
+                                timeout_secs=2, poll_interval_secs=0.01).run()
+            data = report.to_dict()
+            md = report.format_markdown()
+            self.assertEqual(data["attempted_cycles"], failed_cycle)
+            self.assertEqual(data["completed_cycles"], failed_cycle - 1)
+            self.assertIn(f"**Cycles Attempted:** {failed_cycle} / 10", md)
+            self.assertIn(f"**Cycles Completed:** {failed_cycle - 1} / 10", md)
+            self.assertIn("1 failed attempt(s) are excluded", md)
+
+    def test_marker_operations_timeout(self) -> None:
+        import subprocess
+        import sys
+        import time
+        for operation in ("setup", "verify"):
+            class HangingMarkerDevice(SoakMockDevice):
+                def run(self, cmd, timeout=None):
+                    is_write = "cat >" in cmd and "EOF" in cmd
+                    is_check = "sha256sum" in cmd and not is_write
+                    if (operation == "setup" and is_write) or (operation == "verify" and is_check):
+                        try:
+                            subprocess.run([sys.executable, "-c", "import time; time.sleep(10)"], timeout=timeout)
+                        except subprocess.TimeoutExpired:
+                            return SshCommandResult(124, "", "timed out")
+                    return super().run(cmd, timeout)
+            start = time.monotonic()
+            report = SoakRunner(HangingMarkerDevice(), self.img_a_path, self.img_b_path,
+                                cycles=10, timeout_secs=0.15, poll_interval_secs=0.005).run()
+            self.assertLess(time.monotonic() - start, 0.7)
+            self.assertFalse(report.success)
+            self.assertEqual(report.failing_step, "marker_setup" if operation == "setup" else "marker_check")
+            self.assertIn("timed out", report.failure_message)
+
     def test_ac1_and_ac2_ten_cycle_soak_success(self) -> None:
         """AC1 & AC2: Full 10-cycle update soak success, slot alternation, version match, and report."""
         device = SoakMockDevice(
