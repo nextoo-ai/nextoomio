@@ -4,7 +4,7 @@
 //! and update staging, validation, and status operations over CLI
 //! for Phase 0 bench and SSH operation (AD-20, UPD-04, UPD-05, AC1-AC4).
 
-use nx_sysd::engine::DEFAULT_STAGING_RESERVATION;
+use nx_sysd::engine::{DEFAULT_STAGING_RESERVATION, LOCK_RETRY_INTERVAL};
 use nx_sysd::identity::{
     get_or_create_device_id_with_path, query_device_identity, HardwareIdentity, VersionInfo,
     DEFAULT_DEVICE_ID_PATH,
@@ -16,6 +16,7 @@ use std::env;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 const DEFAULT_UPDATE_DIR: &str = "/data/update";
 
@@ -145,12 +146,24 @@ fn handle_init_device_id() -> ExitCode {
     }
 }
 
+type Engine = UpdateEngine<PhysicalSlotBackend, FileStagingStorage, FileJournalStorage>;
+
 fn get_engine(
     update_dir: &Path,
     hardware: Option<String>,
     schema: Option<u32>,
     capacity: Option<u64>,
-) -> Result<UpdateEngine<PhysicalSlotBackend, FileStagingStorage, FileJournalStorage>, String> {
+) -> Result<Engine, String> {
+    try_engine(update_dir, hardware, schema, capacity)
+        .map_err(|e| format!("engine initialization error: {e}"))
+}
+
+fn try_engine(
+    update_dir: &Path,
+    hardware: Option<String>,
+    schema: Option<u32>,
+    capacity: Option<u64>,
+) -> Result<Engine, UpdateEngineError> {
     let backend = PhysicalSlotBackend;
     let cap = capacity.unwrap_or(DEFAULT_STAGING_RESERVATION);
     let storage = FileStagingStorage::new(update_dir, cap);
@@ -164,7 +177,32 @@ fn get_engine(
         schema,
         Some(cap),
     )
-    .map_err(|e| format!("engine initialization error: {e}"))
+}
+
+/// Runs `step` and, while another process holds the updater lock, retries it every
+/// [`LOCK_RETRY_INTERVAL`] until `budget` has elapsed since `start` (D-065). Only commands
+/// that wait use this; every other command reports `update_busy` at once.
+fn retry_while_busy<T>(
+    start: Instant,
+    budget: Duration,
+    mut step: impl FnMut() -> Result<T, UpdateEngineError>,
+) -> Result<T, UpdateEngineError> {
+    let mut reported = false;
+    loop {
+        match step() {
+            Err(UpdateEngineError::Busy) if start.elapsed() + LOCK_RETRY_INTERVAL <= budget => {
+                if !reported {
+                    eprintln!(
+                        "Updater lock busy; retrying every {} ms",
+                        LOCK_RETRY_INTERVAL.as_millis()
+                    );
+                    reported = true;
+                }
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
 }
 
 fn handle_update(args: &[String]) -> ExitCode {
@@ -486,15 +524,23 @@ fn handle_update(args: &[String]) -> ExitCode {
             }
         }
         "confirm" => {
-            let mut engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
+            // `confirm` waits: while another process holds the updater lock it retries
+            // within its `--wait` budget instead of failing (D-065).
+            let start = Instant::now();
+            let budget = Duration::from_secs(wait_secs);
+            let mut engine = match retry_while_busy(start, budget, || {
+                try_engine(&update_dir, hardware.clone(), schema, Some(capacity))
+            }) {
                 Ok(e) => e,
                 Err(err) => {
-                    eprintln!("Error: {err}");
+                    eprintln!("Error: engine initialization error: {err}");
                     return ExitCode::from(1);
                 }
             };
 
-            if let Err(err) = engine.confirm(transaction.as_deref()) {
+            if let Err(err) =
+                retry_while_busy(start, budget, || engine.confirm(transaction.as_deref()))
+            {
                 eprintln!("Confirmation rejected: {err}");
                 let mut status = engine.status();
                 status.error_code = Some(err.error_code_str().to_string());
@@ -503,7 +549,8 @@ fn handle_update(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
 
-            let status = engine.wait_for_commit(wait_secs, poll_interval_ms);
+            let remaining = budget.saturating_sub(start.elapsed()).as_secs();
+            let status = engine.wait_for_commit(remaining, poll_interval_ms);
             let print_status = |status: &nx_sysd::UpdateStatus| {
                 if json_output {
                     match serde_json::to_string_pretty(status) {
@@ -538,15 +585,8 @@ fn handle_update(args: &[String]) -> ExitCode {
             }
         }
         "health-check" => {
-            let engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
-                Ok(e) => e,
-                Err(err) => {
-                    eprintln!("Error: {err}");
-                    return ExitCode::from(1);
-                }
-            };
-
-            match engine.check_health() {
+            // Reads the system only; it neither loads nor initializes the update directory.
+            match PhysicalSlotBackend.check_health() {
                 Ok(report) => {
                     if json_output {
                         match serde_json::to_string_pretty(&report) {
@@ -593,8 +633,15 @@ fn handle_update(args: &[String]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
 
-            // We are running on a non-default slot (trial boot)!
-            match get_engine(&update_dir, hardware.clone(), schema, Some(capacity)) {
+            // We are running on a non-default slot (trial boot)! Loading the engine is
+            // retried while another process holds the updater lock (D-065); the trial budget
+            // still bounds it.
+            let budget = Duration::from_secs_f64(
+                (deadline_secs as f64 - backend.get_uptime_secs().unwrap_or(0.0)).max(0.0),
+            );
+            match retry_while_busy(Instant::now(), budget, || {
+                try_engine(&update_dir, hardware.clone(), schema, Some(capacity))
+            }) {
                 Ok(mut engine) => {
                     match engine.run_trial_watchdog(deadline_secs, poll_interval_ms) {
                         Ok(()) => ExitCode::SUCCESS,
@@ -644,9 +691,10 @@ fn handle_update(args: &[String]) -> ExitCode {
                         }
 
                         // Check if /data mounted and journal became available
-                        if let Ok(mut engine) =
-                            get_engine(&update_dir, hardware.clone(), schema, Some(capacity))
-                        {
+                        let attempt =
+                            try_engine(&update_dir, hardware.clone(), schema, Some(capacity));
+                        let busy = matches!(attempt, Err(UpdateEngineError::Busy));
+                        if let Ok(mut engine) = attempt {
                             match engine.run_trial_watchdog(deadline_secs, poll_interval_ms) {
                                 Ok(()) => return ExitCode::SUCCESS,
                                 Err(UpdateEngineError::TrialDeadlineExceeded) => {
@@ -664,28 +712,36 @@ fn handle_update(args: &[String]) -> ExitCode {
                             let _ = b.trigger_reboot();
                             return ExitCode::from(1);
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            poll_interval_ms.clamp(50, 1000),
-                        ));
+                        let poll = Duration::from_millis(poll_interval_ms.clamp(50, 1000));
+                        std::thread::sleep(if busy { LOCK_RETRY_INTERVAL } else { poll });
                     }
                 }
             }
         }
         "status" => {
-            let engine = match get_engine(&update_dir, hardware, schema, Some(capacity)) {
-                Ok(e) => e,
+            // Takes no lock and writes nothing (D-065).
+            let status = match Engine::read_status(
+                &PhysicalSlotBackend,
+                FileJournalStorage::new(&update_dir),
+                capacity,
+            ) {
+                Ok(s) => s,
                 Err(err) => {
                     eprintln!("Error: {err}");
                     return ExitCode::from(1);
                 }
             };
 
-            let status = engine.status();
             if json_output {
                 match serde_json::to_string_pretty(&status) {
                     Ok(j) => println!("{j}"),
                     Err(e) => eprintln!("Serialization error: {e}"),
                 }
+            } else if !status.initialized {
+                println!(
+                    "State: not initialized\nActive Slot: {}\nDefault Slot: {}",
+                    status.active_slot, status.default_slot
+                );
             } else {
                 println!(
                     "State: {:?}\nActive Slot: {}\nDefault Slot: {}\nPayload: {} bytes (Reservation: {} bytes)",
@@ -736,6 +792,11 @@ fn handle_update(args: &[String]) -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
+    run(&args)
+}
+
+/// Dispatches one command line (`args[0]` is the program name).
+fn run(args: &[String]) -> ExitCode {
     if args.len() < 2 {
         print_usage();
         return ExitCode::SUCCESS;
@@ -757,3 +818,6 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod process_tests;

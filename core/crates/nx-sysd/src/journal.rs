@@ -142,12 +142,42 @@ pub trait JournalStorage: Send + Sync {
     fn preallocate(&mut self) -> Result<(), String> {
         Ok(())
     }
-    /// Takes the single updater lock (ARCHITECTURE.md section 3.6) across processes.
+    /// Whether a journal record exists (valid or not), without writing anything.
     ///
-    /// The lock is held until the returned guard is dropped. Storage that is not shared
-    /// between processes returns a guard that holds nothing.
-    fn lock_updater(&self) -> Result<UpdaterLock, String> {
+    /// Storage with no record at all still needs initialization; a corrupted record
+    /// counts as present so that it is reported instead of being overwritten.
+    fn has_records(&self) -> bool {
+        !matches!(
+            (self.read_record(0), self.read_record(1)),
+            (Ok(None), Ok(None))
+        )
+    }
+    /// Takes the single updater lock (ARCHITECTURE.md section 3.6, D-065) without waiting.
+    ///
+    /// Every state-changing transition holds this lock from loading the journal until its
+    /// last write is flushed. The lock is held until the returned guard is dropped, and the
+    /// kernel releases it when the holding process dies. Storage that is not shared between
+    /// processes returns a guard that holds nothing.
+    fn try_lock_updater(&self) -> Result<UpdaterLock, LockError> {
         Ok(UpdaterLock(None))
+    }
+}
+
+/// Why the updater lock could not be taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// Another process holds the lock (`update_busy`).
+    Busy,
+    /// The lock file could not be opened or locked.
+    Storage(String),
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("the updater lock is held by another process"),
+            Self::Storage(msg) => write!(f, "updater lock error: {msg}"),
+        }
     }
 }
 
@@ -216,23 +246,38 @@ impl FileJournalStorage {
     fn path_for(&self, slot_idx: usize) -> PathBuf {
         self.journal_dir.join(format!("journal.{slot_idx}"))
     }
+
+    /// Path of the single updater lock file, `/data/update/.lock` on the device (D-065).
+    pub fn lock_path(&self) -> PathBuf {
+        self.journal_dir.join(".lock")
+    }
 }
 
 impl JournalStorage for FileJournalStorage {
-    fn lock_updater(&self) -> Result<UpdaterLock, String> {
-        fs::create_dir_all(&self.journal_dir)
-            .map_err(|e| format!("cannot create dir {}: {e}", self.journal_dir.display()))?;
-        let path = self.journal_dir.join("update.lock");
+    fn try_lock_updater(&self) -> Result<UpdaterLock, LockError> {
+        fs::create_dir_all(&self.journal_dir).map_err(|e| {
+            LockError::Storage(format!(
+                "cannot create dir {}: {e}",
+                self.journal_dir.display()
+            ))
+        })?;
+        let path = self.lock_path();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        file.lock()
-            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
-        Ok(UpdaterLock(Some(file)))
+            .map_err(|e| LockError::Storage(format!("cannot open {}: {e}", path.display())))?;
+        // `File::try_lock` is `flock(LOCK_EX | LOCK_NB)` on Unix.
+        match file.try_lock() {
+            Ok(()) => Ok(UpdaterLock(Some(file))),
+            Err(fs::TryLockError::WouldBlock) => Err(LockError::Busy),
+            Err(fs::TryLockError::Error(e)) => Err(LockError::Storage(format!(
+                "cannot lock {}: {e}",
+                path.display()
+            ))),
+        }
     }
 
     fn preallocate(&mut self) -> Result<(), String> {
@@ -374,44 +419,66 @@ impl std::fmt::Display for JournalError {
 impl std::error::Error for JournalError {}
 
 impl<S: JournalStorage> JournalController<S> {
+    /// Loads the newest valid record, initializing the journal when it has no record.
+    ///
+    /// Initialization writes; callers sharing the storage between processes hold the
+    /// updater lock (D-065).
     pub fn load_or_init(
         mut storage: S,
         active_slot: &str,
         default_slot: &str,
     ) -> Result<Self, JournalError> {
         storage.preallocate().map_err(JournalError::Storage)?;
-        let r0 = storage.read_record(0);
-        let r1 = storage.read_record(1);
-
-        let selected = match (r0, r1) {
-            (Ok(Some(a)), Ok(Some(b))) => {
-                if a.generation >= b.generation {
-                    (0, a)
-                } else {
-                    (1, b)
-                }
-            }
-            (Ok(Some(a)), Ok(None)) | (Ok(Some(a)), Err(_)) => (0, a),
-            (Ok(None), Ok(Some(b))) | (Err(_), Ok(Some(b))) => (1, b),
-            (Ok(None), Ok(None)) => {
+        match Self::select(&storage)? {
+            Some((idx, rec)) => Ok(Self {
+                storage,
+                active_slot_idx: idx,
+                latest_record: rec,
+            }),
+            None => {
                 let init = JournalRecord::new_initial(active_slot, default_slot);
                 storage
                     .write_record(0, &init)
                     .map_err(JournalError::Storage)?;
-                (0, init)
+                Ok(Self {
+                    storage,
+                    active_slot_idx: 0,
+                    latest_record: init,
+                })
             }
-            (r0_err, r1_err) => {
-                return Err(JournalError::Corrupted(format!(
-                    "both journal records are invalid or corrupted (slot 0: {r0_err:?}, slot 1: {r1_err:?}); refusing to discard state"
-                )));
-            }
-        };
+        }
+    }
 
-        Ok(Self {
+    /// Loads the newest valid record without writing anything (D-065).
+    ///
+    /// Returns `Ok(None)` when the journal has no record, that is, it is not initialized.
+    pub fn load_existing(storage: S) -> Result<Option<Self>, JournalError> {
+        Ok(Self::select(&storage)?.map(|(idx, rec)| Self {
             storage,
-            active_slot_idx: selected.0,
-            latest_record: selected.1,
-        })
+            active_slot_idx: idx,
+            latest_record: rec,
+        }))
+    }
+
+    fn select(storage: &S) -> Result<Option<(usize, JournalRecord)>, JournalError> {
+        let r0 = storage.read_record(0);
+        let r1 = storage.read_record(1);
+
+        match (r0, r1) {
+            (Ok(Some(a)), Ok(Some(b))) => {
+                if a.generation >= b.generation {
+                    Ok(Some((0, a)))
+                } else {
+                    Ok(Some((1, b)))
+                }
+            }
+            (Ok(Some(a)), Ok(None)) | (Ok(Some(a)), Err(_)) => Ok(Some((0, a))),
+            (Ok(None), Ok(Some(b))) | (Err(_), Ok(Some(b))) => Ok(Some((1, b))),
+            (Ok(None), Ok(None)) => Ok(None),
+            (r0_err, r1_err) => Err(JournalError::Corrupted(format!(
+                "both journal records are invalid or corrupted (slot 0: {r0_err:?}, slot 1: {r1_err:?}); refusing to discard state"
+            ))),
+        }
     }
 
     /// Reloads the newest valid journal record from storage.
@@ -533,9 +600,9 @@ impl<S: JournalStorage> JournalController<S> {
         Ok(rec)
     }
 
-    /// Takes the single updater lock; see [`JournalStorage::lock_updater`].
-    pub fn lock_updater(&self) -> Result<UpdaterLock, String> {
-        self.storage.lock_updater()
+    /// Takes the single updater lock without waiting; see [`JournalStorage::try_lock_updater`].
+    pub fn try_lock_updater(&self) -> Result<UpdaterLock, LockError> {
+        self.storage.try_lock_updater()
     }
 
     pub fn commit_state(

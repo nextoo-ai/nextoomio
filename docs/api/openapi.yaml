@@ -232,6 +232,12 @@ components:
         - reserved_capacity
         - consumed_attempts
       properties:
+        initialized:
+          type: boolean
+          default: true
+          description: >-
+            False when the update directory holds no journal record yet. Reading the status
+            never initializes the directory; it then reports state `idle` (D-065).
         state:
           type: string
           enum: [idle, receiving, staged, validated, installing, installed, trial, committing, committed, failed]
