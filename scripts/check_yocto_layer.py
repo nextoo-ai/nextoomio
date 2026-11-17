@@ -72,6 +72,24 @@ def validate_yocto_runner_boundary(text: str) -> list[str]:
 
 
 
+def validate_full_image_mountpoint(text: str) -> list[str]:
+    """Require the build volume's mount point before the read-only checkout is mounted."""
+    parts = text.split("\n  full-image:", 1)
+    if len(parts) != 2:
+        return ["full-image mountpoint: job missing"]
+    body = re.split(r"(?m)^  [A-Za-z0-9_-]+:\s*$", parts[1], maxsplit=1)[0]
+    steps = re.split(r"(?m)^      - name: ", body)[1:]
+    builds = [step for step in steps if step.startswith("Build full nextoomio Yocto image\n")]
+    prefix = ('Build full nextoomio Yocto image\n        run: |\n'
+              '          mkdir -p "${GITHUB_WORKSPACE}/build"\n'
+              '          docker run --rm \\\n')
+    if (len(builds) != 1 or not builds[0].startswith(prefix)
+            or '-v "${GITHUB_WORKSPACE}:/work:ro"' not in builds[0]
+            or '-v nextoomio-ci-build:/work/build' not in builds[0]):
+        return ["full-image mountpoint: create workspace build directory before mounting the read-only checkout and build volume"]
+    return []
+
+
 def validate_rootfs_workflow(text: str) -> list[str]:
     """Require the rootfs inspection to run as a single command in the kas container."""
     parts = text.split("\n  full-image:", 1)
@@ -778,6 +796,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     if yocto_wf.is_file():
         wf_text = yocto_wf.read_text(encoding="utf-8")
         errors.extend(validate_yocto_runner_boundary(wf_text))
+        errors.extend(validate_full_image_mountpoint(wf_text))
         errors.extend(validate_rootfs_workflow(wf_text))
         if "*.manifest" not in wf_text and "*.rootfs.manifest" not in wf_text:
             errors.append(
@@ -1797,6 +1816,18 @@ def run_self_tests() -> int:
             assert any("rootfs workflow" in error for error in validate_layer(tmp_root)), command
         wf.write_text(original, encoding="utf-8")
         print("  test_postinst_masks_and_container_required: OK")
+
+        # D-073: the mount point must be created in the build step before Docker starts.
+        mkdir_line = '          mkdir -p "${GITHUB_WORKSPACE}/build"\n'
+        assert mkdir_line in original
+        for altered in (original.replace(mkdir_line, "", 1),
+                        original.replace(mkdir_line, "", 1).replace(
+                            '      - name: Copy build artifacts from volume',
+                            mkdir_line + '\n      - name: Copy build artifacts from volume', 1)):
+            wf.write_text(altered, encoding="utf-8")
+            assert any("full-image mountpoint" in error for error in validate_layer(tmp_root))
+        wf.write_text(original, encoding="utf-8")
+        print("  test_full_image_mountpoint_required_before_docker: OK")
 
         # D-069: the gate belongs to the image, and must reject all listed AGPL variants.
         image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
