@@ -36,8 +36,28 @@ pub struct JournalRecord {
     pub payload_sha256: Option<String>,
     pub error_code: Option<String>,
     pub consumed_attempts: u32,
+    /// The deploy tool requested remote confirmation for this transaction (AD-22).
+    ///
+    /// Omitted from the serialized record and from the checksum while `false`, so that
+    /// records without remote confirmation keep the byte layout of journal format 1.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remote_confirm: bool,
+    /// Trial attempt for which the remote confirmation was received; 0 when none.
+    ///
+    /// A confirmation applies only to the attempt it was received in; a later trial
+    /// attempt of the same transaction needs its own confirmation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub confirmed_attempt: u32,
     #[serde(default)]
     pub checksum: u32,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl JournalRecord {
@@ -54,10 +74,17 @@ impl JournalRecord {
             payload_sha256: None,
             error_code: None,
             consumed_attempts: 0,
+            remote_confirm: false,
+            confirmed_attempt: 0,
             checksum: 0,
         };
         rec.checksum = rec.compute_checksum();
         rec
+    }
+
+    /// Whether the current trial attempt has received its remote confirmation (AD-22).
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed_attempt != 0 && self.confirmed_attempt == self.consumed_attempts
     }
 
     pub fn compute_checksum(&self) -> u32 {
@@ -74,6 +101,10 @@ impl JournalRecord {
             payload_sha256: &'a Option<String>,
             error_code: &'a Option<String>,
             consumed_attempts: u32,
+            #[serde(skip_serializing_if = "is_false")]
+            remote_confirm: bool,
+            #[serde(skip_serializing_if = "is_zero")]
+            confirmed_attempt: u32,
         }
 
         let payload = ChecksumPayload {
@@ -88,6 +119,8 @@ impl JournalRecord {
             payload_sha256: &self.payload_sha256,
             error_code: &self.error_code,
             consumed_attempts: self.consumed_attempts,
+            remote_confirm: self.remote_confirm,
+            confirmed_attempt: self.confirmed_attempt,
         };
 
         if let Ok(bytes) = serde_json::to_vec(&payload) {
@@ -108,6 +141,25 @@ pub trait JournalStorage: Send + Sync {
     fn write_record(&mut self, slot_idx: usize, record: &JournalRecord) -> Result<(), String>;
     fn preallocate(&mut self) -> Result<(), String> {
         Ok(())
+    }
+    /// Takes the single updater lock (ARCHITECTURE.md section 3.6) across processes.
+    ///
+    /// The lock is held until the returned guard is dropped. Storage that is not shared
+    /// between processes returns a guard that holds nothing.
+    fn lock_updater(&self) -> Result<UpdaterLock, String> {
+        Ok(UpdaterLock(None))
+    }
+}
+
+/// Guard for the single updater lock; dropping it releases the lock.
+#[derive(Debug)]
+pub struct UpdaterLock(Option<fs::File>);
+
+impl Drop for UpdaterLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.0 {
+            let _ = file.unlock();
+        }
     }
 }
 
@@ -167,6 +219,22 @@ impl FileJournalStorage {
 }
 
 impl JournalStorage for FileJournalStorage {
+    fn lock_updater(&self) -> Result<UpdaterLock, String> {
+        fs::create_dir_all(&self.journal_dir)
+            .map_err(|e| format!("cannot create dir {}: {e}", self.journal_dir.display()))?;
+        let path = self.journal_dir.join("update.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        file.lock()
+            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+        Ok(UpdaterLock(Some(file)))
+    }
+
     fn preallocate(&mut self) -> Result<(), String> {
         fs::create_dir_all(&self.journal_dir)
             .map_err(|e| format!("cannot create dir {}: {e}", self.journal_dir.display()))?;
@@ -280,6 +348,11 @@ pub enum ReconcileOutcome {
     TrialExhausted,
     ContradictoryFailed,
     JournalCorruptedFailed,
+    /// An interrupted commit whose selector already names the target slot was finished (D-026).
+    CommitFinished,
+    /// An interrupted commit whose selector did not name the target slot ended failed,
+    /// with the previous slot selected (D-026).
+    CommitReturned,
 }
 
 /// Typed journal errors distinguishing corruption from storage/I/O issues (CQ-R9, AC6).
@@ -379,6 +452,11 @@ impl<S: JournalStorage> JournalController<S> {
         }
     }
 
+    /// The journal storage, for inspection.
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
     pub fn current(&self) -> &JournalRecord {
         &self.latest_record
     }
@@ -394,12 +472,28 @@ impl<S: JournalStorage> JournalController<S> {
         error_code: Option<String>,
         consumed_attempts: u32,
     ) -> Result<JournalRecord, String> {
-        let next_slot_idx = 1 - self.active_slot_idx;
-        let next_gen = self.latest_record.generation + 1;
+        // The remote-confirmation request and the received confirmation belong to one
+        // transaction and survive only while it stays in trial or commit (AD-22).
+        let carries_confirmation = tx_id.is_some()
+            && tx_id == self.latest_record.tx_id
+            && matches!(
+                next_state,
+                UpdateTransactionState::Trial
+                    | UpdateTransactionState::Committing
+                    | UpdateTransactionState::Committed
+            );
+        let (remote_confirm, confirmed_attempt) = if carries_confirmation {
+            (
+                self.latest_record.remote_confirm,
+                self.latest_record.confirmed_attempt,
+            )
+        } else {
+            (false, 0)
+        };
 
-        let mut rec = JournalRecord {
+        let rec = JournalRecord {
             format_version: 1,
-            generation: next_gen,
+            generation: 0,
             tx_id,
             state: next_state,
             active_slot: self.latest_record.active_slot.clone(),
@@ -409,8 +503,27 @@ impl<S: JournalStorage> JournalController<S> {
             payload_sha256,
             error_code,
             consumed_attempts,
+            remote_confirm,
+            confirmed_attempt,
             checksum: 0,
         };
+        self.write_next(rec)
+    }
+
+    /// Persists a copy of the newest record changed by `change` as the next generation.
+    pub fn commit_with(
+        &mut self,
+        change: impl FnOnce(&mut JournalRecord),
+    ) -> Result<JournalRecord, String> {
+        let mut rec = self.latest_record.clone();
+        change(&mut rec);
+        self.write_next(rec)
+    }
+
+    fn write_next(&mut self, mut rec: JournalRecord) -> Result<JournalRecord, String> {
+        let next_slot_idx = 1 - self.active_slot_idx;
+        rec.format_version = 1;
+        rec.generation = self.latest_record.generation + 1;
         rec.checksum = rec.compute_checksum();
 
         self.storage.write_record(next_slot_idx, &rec)?;
@@ -418,6 +531,11 @@ impl<S: JournalStorage> JournalController<S> {
         self.latest_record = rec.clone();
 
         Ok(rec)
+    }
+
+    /// Takes the single updater lock; see [`JournalStorage::lock_updater`].
+    pub fn lock_updater(&self) -> Result<UpdaterLock, String> {
+        self.storage.lock_updater()
     }
 
     pub fn commit_state(
@@ -517,63 +635,20 @@ impl<S: JournalStorage> JournalController<S> {
             return Ok(ReconcileOutcome::TruncatedFailed);
         }
 
-        // 3. Interrupted commit (D-026)
-        if self.latest_record.state == UpdateTransactionState::Committing {
-            if let Some(target) = &self.latest_record.target_slot {
-                if running_slot == target {
-                    self.commit_state(
-                        UpdateTransactionState::Committed,
-                        self.latest_record.tx_id.clone(),
-                        self.latest_record.target_slot.clone(),
-                        self.latest_record.payload_len,
-                        self.latest_record.payload_sha256.clone(),
-                        None,
-                    )?;
-                    return Ok(ReconcileOutcome::Unchanged);
-                }
-            }
-            self.commit_state(
-                UpdateTransactionState::Failed,
-                None,
-                None,
-                0,
-                None,
-                Some("update_truncated".to_string()),
-            )?;
-            return Ok(ReconcileOutcome::TruncatedFailed);
-        }
+        // 3. Interrupted commit (D-026) is reconciled by the update engine, which can read
+        //    the selector back; see `UpdateEngine::reconcile_boot`. Reaching this point in
+        //    `Committing` means the caller did not do so: keep the record unchanged.
 
         // 4. Trial boot reconciliation (AC1, AC4, AC5)
         if self.latest_record.state == UpdateTransactionState::Trial {
             if let Some(target) = &self.latest_record.target_slot {
                 if running_slot == target {
                     // Running on trial target slot: trial is in progress
-                    let target_str = target.clone();
-                    let tx_id = self.latest_record.tx_id.clone();
-                    let payload_len = self.latest_record.payload_len;
-                    let payload_sha = self.latest_record.payload_sha256.clone();
-                    let attempts = self.latest_record.consumed_attempts;
-
-                    let next_slot_idx = 1 - self.active_slot_idx;
-                    let next_gen = self.latest_record.generation + 1;
-                    let mut rec = JournalRecord {
-                        format_version: 1,
-                        generation: next_gen,
-                        tx_id,
-                        state: UpdateTransactionState::Trial,
-                        active_slot: running_slot.to_string(),
-                        default_slot: self.latest_record.default_slot.clone(),
-                        target_slot: Some(target_str),
-                        payload_len,
-                        payload_sha256: payload_sha,
-                        error_code: None,
-                        consumed_attempts: attempts,
-                        checksum: 0,
-                    };
-                    rec.checksum = rec.compute_checksum();
-                    self.storage.write_record(next_slot_idx, &rec)?;
-                    self.active_slot_idx = next_slot_idx;
-                    self.latest_record = rec;
+                    let running = running_slot.to_string();
+                    self.commit_with(|rec| {
+                        rec.active_slot = running;
+                        rec.error_code = None;
+                    })?;
 
                     return Ok(ReconcileOutcome::TrialInProgress);
                 } else if running_slot == self.latest_record.default_slot {

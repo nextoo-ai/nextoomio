@@ -34,6 +34,12 @@ pub struct UpdateStatus {
     pub payload_length: u64,
     pub reserved_capacity: u64,
     pub consumed_attempts: u32,
+    /// Remote confirmation was requested for this transaction (AD-22).
+    #[serde(default)]
+    pub remote_confirm: bool,
+    /// The current trial attempt has received its remote confirmation (AD-22).
+    #[serde(default)]
+    pub confirmed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,6 +80,17 @@ pub enum UpdateEngineError {
     TrialDeadlineExceeded,
     HealthCheckFailed(String),
     JournalCorrupted(String),
+    /// Remote confirmation was requested while SSH access is disabled (AD-22, AD-23).
+    RemoteConfirmUnavailable(String),
+    /// A confirmation cannot be applied in the current state.
+    ConfirmRejected(String),
+    /// A confirmation names a transaction other than the one being tried.
+    TransactionMismatch {
+        current: Option<String>,
+        received: String,
+    },
+    /// The selector could not be switched to the trial slot and read back.
+    CommitFailed(String),
 }
 
 impl UpdateEngineError {
@@ -93,6 +110,10 @@ impl UpdateEngineError {
             Self::TrialDeadlineExceeded => ErrorCode::UpdateTrialDeadlineExceeded,
             Self::HealthCheckFailed(_) => ErrorCode::UpdateHealthCheckFailed,
             Self::JournalCorrupted(_) => ErrorCode::UpdateJournalCorrupted,
+            Self::RemoteConfirmUnavailable(_) => ErrorCode::UpdateRemoteConfirmUnavailable,
+            Self::ConfirmRejected(_) => ErrorCode::UpdateConfirmRejected,
+            Self::TransactionMismatch { .. } => ErrorCode::UpdateTransactionMismatch,
+            Self::CommitFailed(_) => ErrorCode::UpdateCommitFailed,
         }
     }
 
@@ -144,6 +165,21 @@ impl fmt::Display for UpdateEngineError {
             }
             Self::JournalCorrupted(msg) => {
                 write!(f, "update journal corrupted or unreadable: {msg} (update_journal_corrupted)")
+            }
+            Self::RemoteConfirmUnavailable(msg) => write!(
+                f,
+                "remote confirmation refused: {msg} (update_remote_confirm_unavailable)"
+            ),
+            Self::ConfirmRejected(msg) => {
+                write!(f, "confirmation rejected: {msg} (update_confirm_rejected)")
+            }
+            Self::TransactionMismatch { current, received } => write!(
+                f,
+                "confirmation for transaction '{received}' rejected; current transaction is {} (update_transaction_mismatch)",
+                current.as_deref().map_or("none".to_string(), |c| format!("'{c}'"))
+            ),
+            Self::CommitFailed(msg) => {
+                write!(f, "commit failed: {msg} (update_commit_failed)")
             }
         }
     }
@@ -240,6 +276,28 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             .backend
             .get_active_slot()
             .map_err(UpdateEngineError::Storage)?;
+
+        // D-026: an interrupted commit ends committed or returned, never left in Committing.
+        let interrupted_commit = {
+            let rec = self.journal.current();
+            if rec.state == UpdateTransactionState::Committing {
+                match (
+                    rec.target_slot.as_deref().and_then(Slot::parse),
+                    Slot::parse(&rec.default_slot),
+                ) {
+                    (Some(target), Some(previous)) if target != previous => {
+                        Some((target, previous))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((target, previous)) = interrupted_commit {
+            return self.reconcile_interrupted_commit(running_slot, target, previous);
+        }
+
         let outcome = self
             .journal
             .reconcile_boot(running_slot.name())
@@ -304,6 +362,8 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             payload_length: rec.payload_len,
             reserved_capacity: self.reserved_capacity,
             consumed_attempts: rec.consumed_attempts,
+            remote_confirm: rec.remote_confirm,
+            confirmed: rec.is_confirmed(),
             error_code: rec.error_code.clone(),
             message: None,
         }
@@ -319,9 +379,10 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             return Err(UpdateEngineError::Busy);
         }
 
-        // Strict state transitions: an upload can start from Idle, or from Failed (AC4 retry).
-        // Transition from Staged or Validated without abort is rejected.
-        if curr != UpdateTransactionState::Idle && curr != UpdateTransactionState::Failed {
+        // Strict state transitions: an upload can start from Idle, from Failed (AC4 retry),
+        // or after a committed transaction. Transition from Staged or Validated without
+        // abort is rejected.
+        if !curr.can_transition_to(UpdateTransactionState::Receiving) {
             return Err(UpdateEngineError::InvalidStateTransition {
                 from: curr,
                 to: UpdateTransactionState::Receiving,
@@ -688,16 +749,26 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
     /// 7. Arms the one-shot tryboot selector for target slot, keeping previous slot default (AC1, AD-14).
     /// 8. Triggers tryboot-flagged reboot if auto_reboot is true.
     pub fn request_trial(&mut self, auto_reboot: bool) -> Result<UpdateStatus, UpdateEngineError> {
-        let (current_state, attempts, tx_id, target_slot, default_slot, payload_len, payload_sha) = {
+        self.request_trial_with(auto_reboot, false)
+    }
+
+    /// Arms the trial boot as [`UpdateEngine::request_trial`] does and records whether the
+    /// deploying workstation must confirm the trial before it is committed (AD-22).
+    ///
+    /// With `remote_confirm` and SSH access disabled (no valid key file on the selector
+    /// partition, AD-23) the request is refused before anything is recorded or armed.
+    pub fn request_trial_with(
+        &mut self,
+        auto_reboot: bool,
+        remote_confirm: bool,
+    ) -> Result<UpdateStatus, UpdateEngineError> {
+        let (current_state, attempts, target_slot, default_slot) = {
             let curr = self.journal.current();
             (
                 curr.state,
                 curr.consumed_attempts,
-                curr.tx_id.clone(),
                 curr.target_slot.clone(),
                 curr.default_slot.clone(),
-                curr.payload_len,
-                curr.payload_sha256.clone(),
             )
         };
 
@@ -741,19 +812,36 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             )));
         }
 
+        // AD-22: remote confirmation is available only while SSH access is enabled (AD-23).
+        if remote_confirm {
+            match self.backend.ssh_access_enabled() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(UpdateEngineError::RemoteConfirmUnavailable(
+                        "SSH access is disabled (no valid key file on the selector partition)"
+                            .to_string(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(UpdateEngineError::RemoteConfirmUnavailable(format!(
+                        "cannot determine whether SSH access is enabled: {e}"
+                    )));
+                }
+            }
+        }
+
         let new_attempts = attempts + 1;
 
         // AC1 & AC5: Store attempt count durably in journal before reboot
         self.journal
-            .commit_state_with_attempts(
-                UpdateTransactionState::Trial,
-                tx_id,
-                Some(target_str),
-                payload_len,
-                payload_sha,
-                None,
-                new_attempts,
-            )
+            .commit_with(|rec| {
+                rec.state = UpdateTransactionState::Trial;
+                rec.target_slot = Some(target_str);
+                rec.error_code = None;
+                rec.consumed_attempts = new_attempts;
+                rec.remote_confirm = remote_confirm;
+                rec.confirmed_attempt = 0;
+            })
             .map_err(UpdateEngineError::Storage)?;
 
         // Arm one-shot tryboot selector (AC1, AD-14)
@@ -777,8 +865,14 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             .map_err(UpdateEngineError::Storage)
     }
 
-    /// Enforces the 120-second trial deadline from trial-slot handoff (UPD-06, AR-01, AC3).
-    /// Arms the independent hardware watchdog and polls the journal for commit.
+    /// Enforces the 120-second trial deadline from trial-slot handoff (UPD-06, AR-01, AC3)
+    /// and commits the trial when it is ready (AD-22).
+    ///
+    /// Arms the independent hardware watchdog, then polls until the deadline: the local
+    /// health check until it passes, then, when remote confirmation was requested, the
+    /// journal until the confirmation for the current attempt is recorded. When both hold,
+    /// the trial is committed ([`UpdateEngine::commit_trial`]). At the deadline without
+    /// commit the device reboots to the previous slot and the attempt counts as failed.
     pub fn run_trial_watchdog(
         &mut self,
         deadline_secs: u64,
@@ -815,13 +909,19 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             .map_err(UpdateEngineError::Storage)?;
 
         let start_monotonic = std::time::Instant::now();
+        let mut health_passed = false;
+        let mut waiting_reported = false;
 
         loop {
-            // Re-read the journal each poll to detect commits made by other processes (AC3, CQ-R4)
+            // Re-read the journal each poll to see confirmations and commits recorded by
+            // other processes (AC3, CQ-R4)
             if let Err(e) = self.journal.reload() {
                 eprintln!("Warning: journal reload during trial watchdog poll: {e}");
             }
-            let current_state = self.journal.current().state;
+            let (current_state, remote_confirm, confirmed) = {
+                let rec = self.journal.current();
+                (rec.state, rec.remote_confirm, rec.is_confirmed())
+            };
             if current_state == UpdateTransactionState::Committed
                 || current_state == UpdateTransactionState::Failed
             {
@@ -838,9 +938,39 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
             };
 
             if elapsed_uptime >= deadline_secs as f64 {
-                // 120s deadline exceeded without commit (AC3): return to previous slot via plain reboot
+                // Deadline exceeded without commit (P0-F4.5 AC3, P0-F4.6 AC2): return to the
+                // previous slot via plain reboot; the consumed attempt counts as failed.
                 let _ = self.backend.trigger_reboot();
                 return Err(UpdateEngineError::TrialDeadlineExceeded);
+            }
+
+            if current_state == UpdateTransactionState::Trial {
+                if !health_passed {
+                    match self.backend.check_health() {
+                        Ok(report) if report.healthy => health_passed = true,
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Warning: local health check error: {e}"),
+                    }
+                }
+
+                if health_passed && remote_confirm && !confirmed && !waiting_reported {
+                    eprintln!("Local health check passed; waiting for remote confirmation");
+                    waiting_reported = true;
+                }
+
+                if health_passed && (!remote_confirm || confirmed) {
+                    match self.commit_trial() {
+                        Ok(_) => {
+                            let _ = self.backend.disarm_watchdog();
+                            return Ok(());
+                        }
+                        Err(e @ UpdateEngineError::CommitFailed(_)) => {
+                            let _ = self.backend.trigger_reboot();
+                            return Err(e);
+                        }
+                        Err(e) => eprintln!("Warning: commit not possible yet: {e}"),
+                    }
+                }
             }
 
             self.backend
@@ -850,6 +980,240 @@ impl<B: SlotBackend, S: StagingStorage, J: JournalStorage> UpdateEngine<B, S, J>
                 poll_interval_ms.clamp(50, 1000),
             ));
         }
+    }
+
+    /// Records the remote confirmation of the trial being tried (AD-22, AC3).
+    ///
+    /// `tx_id` names the transaction being confirmed; without it the confirmation applies
+    /// to the current trial transaction. A confirmation for any other transaction, without
+    /// a trial in progress, on a slot other than the trial slot, or for a transaction that
+    /// did not request remote confirmation is rejected and changes nothing. The commit
+    /// itself is made by the trial service once the local health check has passed.
+    pub fn confirm(&mut self, tx_id: Option<&str>) -> Result<UpdateStatus, UpdateEngineError> {
+        let _lock = self
+            .journal
+            .lock_updater()
+            .map_err(UpdateEngineError::Storage)?;
+        self.reload_journal()?;
+        let rec = self.journal.current().clone();
+
+        if let Some(id) = tx_id {
+            if rec.tx_id.as_deref() != Some(id) {
+                return Err(UpdateEngineError::TransactionMismatch {
+                    current: rec.tx_id.clone(),
+                    received: id.to_string(),
+                });
+            }
+        }
+
+        // Repeating a confirmation that has already been applied changes nothing.
+        if rec.state == UpdateTransactionState::Committed
+            && rec.remote_confirm
+            && rec.is_confirmed()
+        {
+            return Ok(self.status());
+        }
+
+        if rec.state != UpdateTransactionState::Trial {
+            return Err(UpdateEngineError::ConfirmRejected(format!(
+                "no trial is in progress (state {:?})",
+                rec.state
+            )));
+        }
+
+        if !rec.remote_confirm {
+            return Err(UpdateEngineError::ConfirmRejected(
+                "remote confirmation was not requested for this transaction; it commits on the local health check alone"
+                    .to_string(),
+            ));
+        }
+
+        let running = self
+            .backend
+            .get_active_slot()
+            .map_err(UpdateEngineError::Storage)?;
+        if rec.target_slot.as_deref() != Some(running.name()) {
+            return Err(UpdateEngineError::ConfirmRejected(format!(
+                "device is running {running}, not the trial slot"
+            )));
+        }
+
+        if !rec.is_confirmed() {
+            self.journal
+                .commit_with(|r| r.confirmed_attempt = r.consumed_attempts)
+                .map_err(UpdateEngineError::Storage)?;
+        }
+
+        Ok(self.status())
+    }
+
+    /// Polls the journal until the transaction is committed or failed, or `timeout_secs`
+    /// elapse, and returns the status at that point.
+    pub fn wait_for_commit(&mut self, timeout_secs: u64, poll_interval_ms: u64) -> UpdateStatus {
+        let start = std::time::Instant::now();
+        loop {
+            if let Err(e) = self.journal.reload() {
+                eprintln!("Warning: journal reload while waiting for commit: {e}");
+            }
+            let state = self.journal.current().state;
+            if state == UpdateTransactionState::Committed
+                || state == UpdateTransactionState::Failed
+                || start.elapsed().as_secs_f64() >= timeout_secs as f64
+            {
+                return self.status();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                poll_interval_ms.clamp(50, 1000),
+            ));
+        }
+    }
+
+    /// Commits the trial slot (ARCHITECTURE.md section 3.6 step 6, AC1).
+    ///
+    /// Requires a trial in progress on the trial slot and, when remote confirmation was
+    /// requested, the confirmation of the current attempt. The caller is responsible for
+    /// the local health check having passed. Persists `committing`, makes the trial slot
+    /// the default through the slot backend's selector operation, reads the selector back,
+    /// and persists `committed` only when the read-back names the trial slot. If the write
+    /// or the read-back fails, the previous slot is selected again, the transaction ends
+    /// `failed` with `update_commit_failed`, and [`UpdateEngineError::CommitFailed`] is
+    /// returned so that the caller reboots to the previous slot.
+    pub fn commit_trial(&mut self) -> Result<UpdateStatus, UpdateEngineError> {
+        let _lock = self
+            .journal
+            .lock_updater()
+            .map_err(UpdateEngineError::Storage)?;
+        self.reload_journal()?;
+        let rec = self.journal.current().clone();
+
+        if rec.state != UpdateTransactionState::Trial {
+            return Err(UpdateEngineError::InvalidStateTransition {
+                from: rec.state,
+                to: UpdateTransactionState::Committing,
+            });
+        }
+        let target = rec
+            .target_slot
+            .as_deref()
+            .and_then(Slot::parse)
+            .ok_or_else(|| {
+                UpdateEngineError::InvalidFormat("no valid trial slot recorded".to_string())
+            })?;
+        let previous = Slot::parse(&rec.default_slot).ok_or_else(|| {
+            UpdateEngineError::InvalidFormat(format!(
+                "invalid previous slot in record: {}",
+                rec.default_slot
+            ))
+        })?;
+        let running = self
+            .backend
+            .get_active_slot()
+            .map_err(UpdateEngineError::Storage)?;
+        if running != target {
+            return Err(UpdateEngineError::TrialFailed(format!(
+                "commit requires running the trial slot {target}, currently running {running}"
+            )));
+        }
+        if rec.remote_confirm && !rec.is_confirmed() {
+            return Err(UpdateEngineError::ConfirmRejected(
+                "remote confirmation for the current attempt has not been received".to_string(),
+            ));
+        }
+
+        // Journal first: an interrupted commit is reconciled from `committing` (D-026).
+        self.journal
+            .commit_with(|r| {
+                r.state = UpdateTransactionState::Committing;
+                r.error_code = None;
+            })
+            .map_err(UpdateEngineError::Storage)?;
+
+        if let Err(msg) = self.switch_default_slot(target) {
+            return Err(self.fail_commit(previous, msg));
+        }
+
+        self.journal
+            .commit_with(|r| {
+                r.state = UpdateTransactionState::Committed;
+                r.default_slot = target.name().to_string();
+                r.active_slot = running.name().to_string();
+                r.error_code = None;
+            })
+            .map_err(UpdateEngineError::Storage)?;
+
+        Ok(self.status())
+    }
+
+    /// Writes `slot` as the default through the selector operation and reads it back.
+    fn switch_default_slot(&mut self, slot: Slot) -> Result<(), String> {
+        self.backend
+            .set_default_slot(slot)
+            .map_err(|e| format!("selector write failed: {e}"))?;
+        let read_back = self
+            .backend
+            .read_back_default_slot()
+            .map_err(|e| format!("selector read-back failed: {e}"))?;
+        if read_back != slot {
+            return Err(format!(
+                "selector read back default slot {read_back}, expected {slot}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn fail_commit(&mut self, previous: Slot, msg: String) -> UpdateEngineError {
+        let restore = self.switch_default_slot(previous);
+        let msg = match restore {
+            Ok(()) => format!("{msg}; previous slot {previous} selected again"),
+            Err(e) => format!("{msg}; restoring previous slot {previous} failed: {e}"),
+        };
+        let _ = self.journal.commit_with(|r| {
+            r.state = UpdateTransactionState::Failed;
+            r.target_slot = None;
+            r.error_code = Some(ErrorCode::UpdateCommitFailed.as_str().to_string());
+        });
+        UpdateEngineError::CommitFailed(msg)
+    }
+
+    /// Ends an interrupted commit at start (D-026): finished when the selector already
+    /// names the trial slot, otherwise failed with the previous slot selected.
+    fn reconcile_interrupted_commit(
+        &mut self,
+        running: Slot,
+        target: Slot,
+        previous: Slot,
+    ) -> Result<ReconcileOutcome, UpdateEngineError> {
+        if self.backend.read_back_default_slot() == Ok(target) {
+            self.journal
+                .commit_with(|r| {
+                    r.state = UpdateTransactionState::Committed;
+                    r.default_slot = target.name().to_string();
+                    r.active_slot = running.name().to_string();
+                    r.error_code = None;
+                })
+                .map_err(UpdateEngineError::Storage)?;
+            return Ok(ReconcileOutcome::CommitFinished);
+        }
+
+        if let Err(e) = self.switch_default_slot(previous) {
+            eprintln!("Warning: restoring previous slot {previous} after interrupted commit: {e}");
+        }
+        self.journal
+            .commit_with(|r| {
+                r.state = UpdateTransactionState::Failed;
+                r.target_slot = None;
+                r.active_slot = running.name().to_string();
+                r.error_code = Some(ErrorCode::UpdateCommitInterrupted.as_str().to_string());
+            })
+            .map_err(UpdateEngineError::Storage)?;
+        Ok(ReconcileOutcome::CommitReturned)
+    }
+
+    fn reload_journal(&mut self) -> Result<(), UpdateEngineError> {
+        self.journal.reload().map_err(|e| match e {
+            JournalError::Corrupted(m) => UpdateEngineError::JournalCorrupted(m),
+            JournalError::Storage(m) => UpdateEngineError::Storage(m),
+        })
     }
 
     /// Stages payload from an input reader into the preallocated staging file.

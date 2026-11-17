@@ -24,6 +24,9 @@ pub use system::{
 };
 
 #[cfg(test)]
+mod commit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cpio::create_cpio;
@@ -1404,7 +1407,7 @@ software =
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_p0_f4_4_install_fails_when_target_partition_absent() {
@@ -1863,6 +1866,8 @@ software =
         let capacity = 10 * 1024 * 1024;
         let mut backend = MockSlotBackend::new(Slot::B, Slot::A);
         backend.uptime_secs = 5.0; // Early in trial boot
+                                   // Health not yet passed, so this watchdog does not commit by itself
+        backend.health_report = Some(evaluate_health_criteria(true, "", true, false, false));
 
         let storage = FileStagingStorage::new(&update_dir, capacity);
         let mut journal = FileJournalStorage::new(&update_dir);
