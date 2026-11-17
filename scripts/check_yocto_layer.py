@@ -91,6 +91,17 @@ def validate_full_image_mountpoint(text: str) -> list[str]:
     return []
 
 
+def validate_artifact_copy_workflow(text: str) -> list[str]:
+    """Reject shell glob patterns in the artifact copy step."""
+    steps = re.split(r"(?m)^      - name: ", text)[1:]
+    copies = [step for step in steps if step.startswith("Copy build artifacts from volume\n")]
+    if len(copies) != 1:
+        return ["artifact copy workflow: expected exactly one copy step"]
+    if re.search(r"[?*]|\[[^\s\]]+\]", copies[0]):
+        return ["artifact copy workflow: wildcard patterns are forbidden in the copy step"]
+    return []
+
+
 def validate_rootfs_workflow(text: str) -> list[str]:
     """Require the rootfs inspection to run as a single command in the kas container."""
     parts = text.split("\n  full-image:", 1)
@@ -841,6 +852,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         errors.extend(validate_yocto_runner_boundary(wf_text))
         errors.extend(validate_full_image_mountpoint(wf_text))
         errors.extend(validate_full_image_workspace_ownership(wf_text))
+        errors.extend(validate_artifact_copy_workflow(wf_text))
         errors.extend(validate_rootfs_workflow(wf_text))
         if "*.manifest" not in wf_text and "*.rootfs.manifest" not in wf_text:
             errors.append(
@@ -1891,6 +1903,18 @@ def run_self_tests() -> int:
             probe = original + f'\n      - name: Ownership probe\n        run: docker run --user=root {mount} image\n'
             assert bool(validate_full_image_workspace_ownership(probe)) == rejected, mount
         print("  test_root_writable_workspace_mounts_rejected: OK")
+
+        # D-076: reject image and license globs independently in the copy step.
+        for stable, wildcard in (
+            ('nextoomio-image-raspberrypi4-64.rootfs"', '*.rootfs"'),
+            ('licenses/raspberrypi4_64/nextoomio-image-raspberrypi4-64.rootfs/',
+             'licenses/*/nextoomio-image-*/'),
+        ):
+            assert stable in original
+            wf.write_text(original.replace(stable, wildcard, 1), encoding="utf-8")
+            assert any("artifact copy workflow" in error for error in validate_layer(tmp_root))
+        wf.write_text(original, encoding="utf-8")
+        print("  test_artifact_copy_wildcards_rejected: OK")
 
         # D-074: cached root filesystems must depend on the source commit.
         version_class = tmp_root / "meta-nextoomio/classes/nextoomio-image-version.bbclass"

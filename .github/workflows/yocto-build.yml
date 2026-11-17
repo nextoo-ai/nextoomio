@@ -111,16 +111,26 @@ jobs:
             ghcr.io/siemens/kas/kas:4.5 \
             sh -ec '
               src=/work/build/build/tmp/deploy
-              mkdir -p /output/images/raspberrypi4-64 /output/licenses
-              for f in "$src"/images/raspberrypi4-64/*.rootfs.ext4.gz "$src"/images/raspberrypi4-64/*.wic.bz2 "$src"/images/raspberrypi4-64/*.wic.bmap "$src"/images/raspberrypi4-64/*.swu "$src"/images/raspberrypi4-64/*.manifest "$src"/images/raspberrypi4-64/*.rootfs.spdx.json "$src"/images/raspberrypi4-64/*.spdx.tar.zst; do
-                if [ -f "$f" ]; then cp -L "$f" /output/images/raspberrypi4-64/; fi
+              image="$src/images/raspberrypi4-64/nextoomio-image-raspberrypi4-64.rootfs"
+              license="$src/licenses/raspberrypi4_64/nextoomio-image-raspberrypi4-64.rootfs/license.manifest"
+              mkdir -p /output/images/raspberrypi4-64 /output/licenses/raspberrypi4_64/nextoomio-image-raspberrypi4-64.rootfs
+              for suffix in ext4.gz wic.bz2 wic.bmap swu manifest spdx.json; do
+                f="$image.$suffix"
+                if [ ! -L "$f" ] || [ ! -f "$f" ]; then
+                  echo "Missing required artifact link: $f" >&2
+                  exit 1
+                fi
+                cp -L "$f" /output/images/raspberrypi4-64/
               done
-              for f in "$src"/licenses/*/nextoomio-image-*/license.manifest; do
-                [ -f "$f" ] || continue
-                dest="/output/licenses/${f#"$src"/licenses/}"
-                mkdir -p "$(dirname "$dest")"
-                cp -L "$f" "$dest"
-              done
+              if [ -L "$image.spdx.tar.zst" ]; then
+                [ -f "$image.spdx.tar.zst" ] || { echo "Broken artifact link: $image.spdx.tar.zst" >&2; exit 1; }
+                cp -L "$image.spdx.tar.zst" /output/images/raspberrypi4-64/
+              fi
+              if [ ! -L "$(dirname "$license")" ] || [ ! -f "$license" ]; then
+                echo "Missing required license link or manifest: $license" >&2
+                exit 1
+              fi
+              cp -L "$license" /output/licenses/raspberrypi4_64/nextoomio-image-raspberrypi4-64.rootfs/license.manifest
             '
 
       - name: Check built root filesystem
