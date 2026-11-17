@@ -1,6 +1,6 @@
 # nextoomio-image-version.bbclass
 # Image-level release metadata generation and rootfs staging (AC1, AC4, P0-F2.3)
-# Stages /etc/nextoomio-release into the root filesystem. Fails if SOURCE_COMMIT is missing.
+# Stages /etc/nextoomio-release into the root filesystem.
 
 def nextoomio_derive_source_commit(d):
     import subprocess
@@ -10,20 +10,22 @@ def nextoomio_derive_source_commit(d):
     commit = os.environ.get('NEXTOOMIO_SOURCE_COMMIT')
     if commit and commit != 'unknown':
         return commit
-    for search_dir in [d.getVar('LAYERDIR_nextoomio'), d.getVar('COREBASE'), d.getVar('TOPDIR'), '.']:
-        if not search_dir:
-            continue
-        try:
+    try:
+        layer = d.getVar('META_NEXTOOMIO_DIR')
+        if layer:
             rev = subprocess.check_output(
-                ['git', '-C', search_dir, 'rev-parse', 'HEAD'],
-                stderr=subprocess.DEVNULL,
-                text=True
+                ['git', '-C', layer, 'rev-parse', '--show-toplevel'],
+                stderr=subprocess.DEVNULL, text=True
             ).strip()
-            if rev:
-                return rev
-        except Exception:
-            continue
-    return ""
+            # A missing layer checkout must not resolve to an enclosing repository.
+            if os.path.realpath(os.path.join(rev, 'meta-nextoomio')) == os.path.realpath(layer):
+                return subprocess.check_output(
+                    ['git', '-C', layer, 'rev-parse', 'HEAD'],
+                    stderr=subprocess.DEVNULL, text=True
+                ).strip() or 'unknown'
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return 'unknown'
 
 python () {
     commit = d.getVar('NEXTOOMIO_SOURCE_COMMIT')
@@ -36,9 +38,6 @@ python () {
 IMAGE_PREPROCESS_COMMAND:append = " write_nextoomio_image_version; "
 
 write_nextoomio_image_version() {
-    if [ -z "${NEXTOOMIO_SOURCE_COMMIT}" ] || [ "${NEXTOOMIO_SOURCE_COMMIT}" = "unknown" ]; then
-        bbfatal "NEXTOOMIO_SOURCE_COMMIT is empty or unknown. Image release file cannot be staged."
-    fi
     install -d ${IMAGE_ROOTFS}${sysconfdir}
     cat << EOF > ${IMAGE_ROOTFS}${sysconfdir}/nextoomio-release
 IMAGE_VERSION="${NEXTOOMIO_IMAGE_VERSION}"

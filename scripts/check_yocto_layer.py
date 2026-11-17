@@ -523,6 +523,26 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if "disable systemd-time-wait-sync.service" not in ts_text:
             errors.append("systemd preset must disable systemd-time-wait-sync.service (AD-21, AC5)")
 
+    # D-071: the firewall must be installed and enabled, and unwanted units preset off.
+    firewall = root / "meta-nextoomio/recipes-connectivity/nftables/files/nftables.service"
+    recipe = root / "meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend"
+    preset = root / "meta-nextoomio/recipes-core/systemd/files/50-nextoomio-services.preset"
+    systemd_recipe = root / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend"
+    required_directives = ("DefaultDependencies=no", "Wants=network-pre.target", "Before=network-pre.target shutdown.target", "Conflicts=shutdown.target", "Type=oneshot", "ExecStart=/usr/sbin/nft -f /etc/nftables.conf", "ExecReload=/usr/sbin/nft -f /etc/nftables.conf", "RemainAfterExit=yes", "WantedBy=sysinit.target")
+    unit_text = firewall.read_text(encoding="utf-8") if firewall.is_file() else ""
+    if not all(directive in unit_text.splitlines() for directive in required_directives):
+        errors.append("firewall unit missing or incomplete")
+    recipe_text = recipe.read_text(encoding="utf-8") if recipe.is_file() else ""
+    if not all(part in recipe_text for part in ('file://nftables.service', '${UNPACKDIR}/nftables.service', 'SYSTEMD_SERVICE:${PN} = "nftables.service"', 'SYSTEMD_AUTO_ENABLE:${PN} = "enable"', 'inherit systemd')):
+        errors.append("firewall unit installation or enablement missing")
+    disabled = ("systemd-networkd.service", "systemd-networkd.socket", "systemd-networkd-varlink.socket", "systemd-networkd-resolve-hook.socket", "dnsmasq.service", "rpcbind.service", "rpcbind.socket", "swupdate.service", "swupdate.socket")
+    preset_lines = preset.read_text(encoding="utf-8").splitlines() if preset.is_file() else []
+    if not all("disable " + unit in preset_lines for unit in disabled):
+        errors.append("nextoomio services preset missing or incomplete")
+    systemd_text = systemd_recipe.read_text(encoding="utf-8") if systemd_recipe.is_file() else ""
+    if not all(part in systemd_text for part in ("file://50-nextoomio-services.preset", "${UNPACKDIR}/50-nextoomio-services.preset", "${systemd_unitdir}/system-preset/50-nextoomio-services.preset")):
+        errors.append("nextoomio services preset installation missing")
+
     # P0-F2.3: Validate device identity, image version release metadata, and persistent device ID
     distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
     if distro_conf.is_file():
@@ -1189,6 +1209,8 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend",
         "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf",
         "meta-nextoomio/recipes-connectivity/nftables/files/00-default.nft",
+        "meta-nextoomio/recipes-connectivity/nftables/files/nftables.service",
+        "meta-nextoomio/recipes-core/systemd/files/50-nextoomio-services.preset",
         "meta-nextoomio/recipes-connectivity/networkmanager/networkmanager_%.bbappend",
         "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection",
         "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset",
@@ -1711,6 +1733,19 @@ def run_self_tests() -> int:
         assert any("must be positive and not exceed the 3 GiB root slot budget" in e for e in errs), f"Expected budget exceeded failure: {errs}"
         image_bb.write_text(orig_image_bb, encoding="utf-8")
         print("  test_check_fails_when_image_rootfs_maxsize_invalid: OK")
+
+        # D-071: missing unit, enablement, and preset must each be detected.
+        for path, replacement, message in (
+            ("meta-nextoomio/recipes-connectivity/nftables/files/nftables.service", "", "firewall unit"),
+            ("meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend", "SYSTEMD_AUTO_ENABLE:${PN} = \"enable\"", "firewall unit installation or enablement"),
+            ("meta-nextoomio/recipes-core/systemd/files/50-nextoomio-services.preset", "", "services preset"),
+        ):
+            target = tmp_root / path
+            original = target.read_text(encoding="utf-8")
+            target.write_text(original.replace(replacement, "") if replacement else "", encoding="utf-8")
+            assert any(message in e for e in validate_layer(tmp_root)), message
+            target.write_text(original, encoding="utf-8")
+        print("  test_firewall_and_preset_required: OK")
 
         # D-069: the gate belongs to the image, and must reject all listed AGPL variants.
         image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"

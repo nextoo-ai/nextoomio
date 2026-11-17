@@ -6,9 +6,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI:append = " \
     file://nftables.conf \
     file://00-default.nft \
+    file://nftables.service \
 "
 
 do_install:append() {
+    install -d ${D}${systemd_system_unitdir}
+    install -m 0644 ${UNPACKDIR}/nftables.service ${D}${systemd_system_unitdir}/nftables.service
     install -d ${D}${sysconfdir}/nftables.d
     install -m 0644 ${UNPACKDIR}/nftables.conf ${D}${sysconfdir}/nftables.conf
     install -m 0644 ${UNPACKDIR}/00-default.nft ${D}${sysconfdir}/nftables.d/00-default.nft
@@ -18,3 +21,8 @@ FILES:${PN} += " \
     ${sysconfdir}/nftables.d \
     ${sysconfdir}/nftables.d/00-default.nft \
 "
+
+inherit systemd
+SYSTEMD_SERVICE:${PN} = "nftables.service"
+SYSTEMD_AUTO_ENABLE:${PN} = "enable"
+FILES:${PN} += "${systemd_system_unitdir}/nftables.service"

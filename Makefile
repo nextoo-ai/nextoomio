@@ -34,6 +34,7 @@ build-webui:
 	npm --prefix webui run build
 
 yocto-validate:
+	python3 scripts/check_image_rootfs.py --test
 	python3 scripts/check_image_licenses.py --test
 	python3 scripts/check_yocto_layer.py --test
 	python3 scripts/check_yocto_layer.py
