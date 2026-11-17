@@ -49,6 +49,28 @@ def derive_hardware_boot_include_from_recipe(
         return out_file.read_text(encoding="utf-8"), None
 
 
+def validate_yocto_runner_boundary(text: str) -> list[str]:
+    """Accept only the explicitly guarded jobs and runner assignments for this workflow."""
+    jobs = text.split("\njobs:\n", 1)
+    if len(jobs) != 2:
+        return ["Yocto runner boundary: missing or duplicate jobs section"]
+    blocks = re.split(r"(?m)^  ([a-zA-Z0-9_-]+):\s*(?:#.*)?$", jobs[1])
+    if blocks[0].strip() or len(blocks) != 5 or set(blocks[1::2]) != {"parse", "full-image"}:
+        return ["Yocto runner boundary: expected only parse and full-image jobs"]
+    expected = {
+        "parse": ("ubuntu-24.04", "github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'parse-only')"),
+        "full-image": ("[self-hosted, nextoomio-build]", "github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')"),
+    }
+    errors = []
+    for name, body in zip(blocks[1::2], blocks[2::2]):
+        runner, condition = expected[name]
+        for field, value in (("runs-on", runner), ("if", condition)):
+            matches = re.findall(rf"(?m)^    {field}:\s*(.*?)\s*$", body)
+            if matches != [value]:
+                errors.append(f"Yocto runner boundary: {name} must have the approved {field}")
+    return errors
+
+
 def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     """Run all static validation checks against the given repository root directory."""
     errors: list[str] = []
@@ -706,6 +728,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     yocto_wf = root / ".github/workflows/yocto-build.yml"
     if yocto_wf.is_file():
         wf_text = yocto_wf.read_text(encoding="utf-8")
+        errors.extend(validate_yocto_runner_boundary(wf_text))
         if "*.manifest" not in wf_text and "*.rootfs.manifest" not in wf_text:
             errors.append(
                 ".github/workflows/yocto-build.yml: artifact upload must publish package manifest (*.manifest, AC4)"
@@ -1581,6 +1604,16 @@ def run_self_tests() -> int:
         assert any("publish *.swu" in e for e in errs), f"Expected *.swu upload failure: {errs}"
         wf_p.write_text(orig_wf_p, encoding="utf-8")
         print("  test_check_fails_when_swu_artifact_upload_missing: OK")
+
+        # D-070: removing the full-image event guard must fail closed.
+        wf_p.write_text(orig_wf_p.replace(
+            "    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')\n", ""
+        ), encoding="utf-8")
+        assert any("Yocto runner boundary" in e for e in validate_layer(tmp_root))
+        wf_p.write_text(orig_wf_p.replace("runs-on: ubuntu-24.04", "runs-on: [self-hosted, nextoomio-build]"), encoding="utf-8")
+        assert any("Yocto runner boundary" in e for e in validate_layer(tmp_root))
+        wf_p.write_text(orig_wf_p, encoding="utf-8")
+        print("  test_check_rejects_unsafe_yocto_runner: OK")
 
         # 39. AC1 / D-008: Fail when distro conf is missing image_types_nextoomio
         dist_p = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
