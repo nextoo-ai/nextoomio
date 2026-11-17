@@ -52,7 +52,7 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
 
 1. **Workflow source:**
    - Full BitBake Wic image builds are executed by the workflow `.github/workflows/yocto-build.yml` ("Yocto Image Build").
-   - Full images are built and uploaded on every `push` to `main`, or via manual `workflow_dispatch` with input `mode: full-image`.
+   - Full images are built and uploaded on every `push` to `main` modifying build paths (`kas/**`, `meta-nextoomio/**`, `core/**`, `.github/workflows/yocto-build.yml`), or via manual `workflow_dispatch` with input `mode: full-image`.
    - Build artifacts are retained for 14 days. Pick the latest successful run on `main` (or a specific tagged release/commit).
 
 2. **Download the artifact:**
