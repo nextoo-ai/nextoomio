@@ -37,6 +37,9 @@ python () {
 
 IMAGE_PREPROCESS_COMMAND:append = " write_nextoomio_image_version; "
 
+# Rebuild the root filesystem when the source commit in its release file changes (D-074).
+do_rootfs[vardeps] += "NEXTOOMIO_SOURCE_COMMIT"
+
 write_nextoomio_image_version() {
     install -d ${IMAGE_ROOTFS}${sysconfdir}
     cat << EOF > ${IMAGE_ROOTFS}${sysconfdir}/nextoomio-release
