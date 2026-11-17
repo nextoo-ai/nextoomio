@@ -49,6 +49,46 @@ def derive_hardware_boot_include_from_recipe(
         return out_file.read_text(encoding="utf-8"), None
 
 
+def validate_yocto_runner_boundary(text: str) -> list[str]:
+    """Accept only the explicitly guarded jobs and runner assignments for this workflow."""
+    jobs = text.split("\njobs:\n", 1)
+    if len(jobs) != 2:
+        return ["Yocto runner boundary: missing or duplicate jobs section"]
+    blocks = re.split(r"(?m)^  ([a-zA-Z0-9_-]+):\s*(?:#.*)?$", jobs[1])
+    if blocks[0].strip() or len(blocks) != 5 or set(blocks[1::2]) != {"parse", "full-image"}:
+        return ["Yocto runner boundary: expected only parse and full-image jobs"]
+    expected = {
+        "parse": ("ubuntu-24.04", "github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'parse-only')"),
+        "full-image": ("[self-hosted, nextoomio-build]", "github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')"),
+    }
+    errors = []
+    for name, body in zip(blocks[1::2], blocks[2::2]):
+        runner, condition = expected[name]
+        for field, value in (("runs-on", runner), ("if", condition)):
+            matches = re.findall(rf"(?m)^    {field}:\s*(.*?)\s*$", body)
+            if matches != [value]:
+                errors.append(f"Yocto runner boundary: {name} must have the approved {field}")
+    return errors
+
+
+
+def validate_rootfs_workflow(text: str) -> list[str]:
+    """Require the rootfs inspection to run as a single command in the kas container."""
+    parts = text.split("\n  full-image:", 1)
+    if len(parts) != 2:
+        return ["rootfs workflow: full-image job missing"]
+    body = re.split(r"(?m)^  [A-Za-z0-9_-]+:\s*$", parts[1], maxsplit=1)[0]
+    steps = re.split(r"(?m)^      - name: ", body)[1:]
+    relevant = [step for step in steps if re.search(r"\bdebugfs\b|check_image_rootfs\.py", step)]
+    expected = ('Check built root filesystem\n        run: |\n'
+                '          docker run --rm --user=root -v "${GITHUB_WORKSPACE}:/work:rw" -w /work --entrypoint python3 \\\n'
+                '            ghcr.io/siemens/kas/kas:4.5 scripts/check_image_rootfs.py \\\n'
+                '            build/tmp/deploy/images/raspberrypi4-64/nextoomio-image-raspberrypi4-64.rootfs.ext4.gz --commit "${{ github.sha }}"')
+    if len(relevant) != 1 or relevant[0].strip() != expected:
+        return ["rootfs workflow: inspection must run only in the kas container"]
+    return []
+
+
 def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     """Run all static validation checks against the given repository root directory."""
     errors: list[str] = []
@@ -501,6 +541,37 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         if "disable systemd-time-wait-sync.service" not in ts_text:
             errors.append("systemd preset must disable systemd-time-wait-sync.service (AD-21, AC5)")
 
+    # D-071: the firewall must be installed and enabled, and unwanted units preset off.
+    firewall = root / "meta-nextoomio/recipes-connectivity/nftables/files/nftables.service"
+    recipe = root / "meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend"
+    preset = root / "meta-nextoomio/recipes-core/systemd/files/50-nextoomio-services.preset"
+    systemd_recipe = root / "meta-nextoomio/recipes-core/systemd/systemd_%.bbappend"
+    required_directives = ("DefaultDependencies=no", "Wants=network-pre.target", "Before=network-pre.target shutdown.target", "Conflicts=shutdown.target", "Type=oneshot", "ExecStart=/usr/sbin/nft -f /etc/nftables.conf", "ExecReload=/usr/sbin/nft -f /etc/nftables.conf", "RemainAfterExit=yes", "WantedBy=sysinit.target")
+    unit_text = firewall.read_text(encoding="utf-8") if firewall.is_file() else ""
+    if not all(directive in unit_text.splitlines() for directive in required_directives):
+        errors.append("firewall unit missing or incomplete")
+    recipe_text = recipe.read_text(encoding="utf-8") if recipe.is_file() else ""
+    if not all(part in recipe_text for part in ('file://nftables.service', '${UNPACKDIR}/nftables.service', 'SYSTEMD_SERVICE:${PN} = "nftables.service"', 'SYSTEMD_AUTO_ENABLE:${PN} = "enable"', 'inherit systemd')):
+        errors.append("firewall unit installation or enablement missing")
+    disabled = ("systemd-networkd.service", "systemd-networkd.socket", "systemd-networkd-varlink.socket", "systemd-networkd-resolve-hook.socket", "dnsmasq.service", "rpcbind.service", "rpcbind.socket", "swupdate.service", "swupdate.socket")
+    preset_lines = preset.read_text(encoding="utf-8").splitlines() if preset.is_file() else []
+    if not all("disable " + unit in preset_lines for unit in disabled):
+        errors.append("nextoomio services preset missing or incomplete")
+    systemd_text = systemd_recipe.read_text(encoding="utf-8") if systemd_recipe.is_file() else ""
+    if not all(part in systemd_text for part in ("file://50-nextoomio-services.preset", "${UNPACKDIR}/50-nextoomio-services.preset", "${systemd_unitdir}/system-preset/50-nextoomio-services.preset")):
+        errors.append("nextoomio services preset installation missing")
+
+    # D-072: package postinst enablement bypasses presets; masks defeat Also=.
+    distro_text = distro_conf.read_text(encoding="utf-8") if distro_conf.is_file() else ""
+    for package in ("dnsmasq", "rpcbind", "swupdate"):
+        if f'SYSTEMD_AUTO_ENABLE:pn-{package} = "disable"' not in distro_text.splitlines():
+            errors.append(f"postinst enablement must be disabled for {package}")
+    if 'SYSTEMD_AUTO_ENABLE:${PN}-networkd = "disable"' not in systemd_text.splitlines():
+        errors.append("postinst enablement must be disabled for networkd")
+    for unit in ("NetworkManager-wait-online.service", "systemd-networkd-wait-online.service"):
+        if not re.search(r'^\s*ln -sf /dev/null \${D}\${sysconfdir}/systemd/system/' + re.escape(unit) + r'\s*$', systemd_text, re.MULTILINE):
+            errors.append(f"wait-online unit must be masked: {unit}")
+
     # P0-F2.3: Validate device identity, image version release metadata, and persistent device ID
     distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
     if distro_conf.is_file():
@@ -706,6 +777,8 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     yocto_wf = root / ".github/workflows/yocto-build.yml"
     if yocto_wf.is_file():
         wf_text = yocto_wf.read_text(encoding="utf-8")
+        errors.extend(validate_yocto_runner_boundary(wf_text))
+        errors.extend(validate_rootfs_workflow(wf_text))
         if "*.manifest" not in wf_text and "*.rootfs.manifest" not in wf_text:
             errors.append(
                 ".github/workflows/yocto-build.yml: artifact upload must publish package manifest (*.manifest, AC4)"
@@ -1166,6 +1239,8 @@ def run_self_tests() -> int:
         "meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend",
         "meta-nextoomio/recipes-connectivity/nftables/files/nftables.conf",
         "meta-nextoomio/recipes-connectivity/nftables/files/00-default.nft",
+        "meta-nextoomio/recipes-connectivity/nftables/files/nftables.service",
+        "meta-nextoomio/recipes-core/systemd/files/50-nextoomio-services.preset",
         "meta-nextoomio/recipes-connectivity/networkmanager/networkmanager_%.bbappend",
         "meta-nextoomio/recipes-connectivity/networkmanager/files/10-default-wired.nmconnection",
         "meta-nextoomio/recipes-connectivity/networkmanager/files/99-nextoomio.preset",
@@ -1582,6 +1657,16 @@ def run_self_tests() -> int:
         wf_p.write_text(orig_wf_p, encoding="utf-8")
         print("  test_check_fails_when_swu_artifact_upload_missing: OK")
 
+        # D-070: removing the full-image event guard must fail closed.
+        wf_p.write_text(orig_wf_p.replace(
+            "    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')\n", ""
+        ), encoding="utf-8")
+        assert any("Yocto runner boundary" in e for e in validate_layer(tmp_root))
+        wf_p.write_text(orig_wf_p.replace("runs-on: ubuntu-24.04", "runs-on: [self-hosted, nextoomio-build]"), encoding="utf-8")
+        assert any("Yocto runner boundary" in e for e in validate_layer(tmp_root))
+        wf_p.write_text(orig_wf_p, encoding="utf-8")
+        print("  test_check_rejects_unsafe_yocto_runner: OK")
+
         # 39. AC1 / D-008: Fail when distro conf is missing image_types_nextoomio
         dist_p = tmp_root / "meta-nextoomio/conf/distro/nextoomio.conf"
         orig_dist_p = dist_p.read_text(encoding="utf-8")
@@ -1678,6 +1763,40 @@ def run_self_tests() -> int:
         assert any("must be positive and not exceed the 3 GiB root slot budget" in e for e in errs), f"Expected budget exceeded failure: {errs}"
         image_bb.write_text(orig_image_bb, encoding="utf-8")
         print("  test_check_fails_when_image_rootfs_maxsize_invalid: OK")
+
+        # D-071: missing unit, enablement, and preset must each be detected.
+        for path, replacement, message in (
+            ("meta-nextoomio/recipes-connectivity/nftables/files/nftables.service", "", "firewall unit"),
+            ("meta-nextoomio/recipes-connectivity/nftables/nftables_%.bbappend", "SYSTEMD_AUTO_ENABLE:${PN} = \"enable\"", "firewall unit installation or enablement"),
+            ("meta-nextoomio/recipes-core/systemd/files/50-nextoomio-services.preset", "", "services preset"),
+        ):
+            target = tmp_root / path
+            original = target.read_text(encoding="utf-8")
+            target.write_text(original.replace(replacement, "") if replacement else "", encoding="utf-8")
+            assert any(message in e for e in validate_layer(tmp_root)), message
+            target.write_text(original, encoding="utf-8")
+        print("  test_firewall_and_preset_required: OK")
+
+        # D-072: each postinst setting and mask is necessary.
+        for path, line, message in (
+            *(("meta-nextoomio/conf/distro/nextoomio.conf", f'SYSTEMD_AUTO_ENABLE:pn-{package} = "disable"', package) for package in ("dnsmasq", "rpcbind", "swupdate")),
+            ("meta-nextoomio/recipes-core/systemd/systemd_%.bbappend", 'SYSTEMD_AUTO_ENABLE:${PN}-networkd = "disable"', "networkd"),
+            *(("meta-nextoomio/recipes-core/systemd/systemd_%.bbappend", f'    ln -sf /dev/null ${{D}}${{sysconfdir}}/systemd/system/{unit}', unit) for unit in ("NetworkManager-wait-online.service", "systemd-networkd-wait-online.service")),
+        ):
+            target = tmp_root / path
+            original = target.read_text(encoding="utf-8")
+            assert line in original
+            target.write_text(original.replace(line, ""), encoding="utf-8")
+            assert any(message in error for error in validate_layer(tmp_root)), message
+            target.write_text(original, encoding="utf-8")
+        wf = tmp_root / ".github/workflows/yocto-build.yml"
+        original = wf.read_text(encoding="utf-8")
+        for command in ('python3 scripts/check_image_rootfs.py image', 'debugfs image'):
+            altered = original.replace('      - name: Check required build artifacts and image licenses', f'      - name: Unsafe inspection\n        run: {command}\n\n      - name: Check required build artifacts and image licenses')
+            wf.write_text(altered, encoding="utf-8")
+            assert any("rootfs workflow" in error for error in validate_layer(tmp_root)), command
+        wf.write_text(original, encoding="utf-8")
+        print("  test_postinst_masks_and_container_required: OK")
 
         # D-069: the gate belongs to the image, and must reject all listed AGPL variants.
         image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"

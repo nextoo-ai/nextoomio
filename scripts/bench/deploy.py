@@ -208,7 +208,7 @@ class SystemSshRunner(SshRunner):
     def check_reachability(self, timeout: float = 3.0) -> bool:
         cmd = self._base_ssh_args(connect_timeout=timeout) + ["true"]
         try:
-            proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 1.0, check=False)
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
             return proc.returncode == 0
         except Exception:
             return False
@@ -301,6 +301,7 @@ class DeployResult:
         confirmation_sent: bool = False,
         rollback_detected: bool = False,
         device_update_state: Optional[Dict[str, Any]] = None,
+        tone_check: Optional[Dict[str, Any]] = None,
     ):
         self.success = success
         self.previous_version = previous_version
@@ -313,6 +314,7 @@ class DeployResult:
         self.confirmation_sent = confirmation_sent
         self.rollback_detected = rollback_detected
         self.device_update_state = device_update_state or {}
+        self.tone_check = tone_check
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -327,6 +329,7 @@ class DeployResult:
             "confirmation_sent": self.confirmation_sent,
             "rollback_detected": self.rollback_detected,
             "device_update_state": self.device_update_state,
+            "tone_check": self.tone_check,
         }
 
 
@@ -342,6 +345,7 @@ class Deployer:
         poll_interval_secs: float = DEFAULT_POLL_INTERVAL_SECS,
         remote_confirm: bool = True,
         verbose: bool = False,
+        tone_check: bool = False,
     ):
         self.runner = runner
         self.swu_path = swu_path
@@ -350,6 +354,7 @@ class Deployer:
         self.poll_interval_secs = poll_interval_secs
         self.remote_confirm = remote_confirm
         self.verbose = verbose
+        self.tone_check = tone_check
         self.timer = StepTimer()
         self.initial_boot_id: Optional[str] = None
 
@@ -358,14 +363,26 @@ class Deployer:
             sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
             sys.stderr.flush()
 
-    def query_device_state(self) -> Tuple[str, str, Dict[str, Any]]:
+    def _remaining(self, step: str, cap: Optional[float] = None) -> float:
+        remaining = self.timeout_secs - self.timer.total_elapsed()
+        if remaining <= 0:
+            raise DeployError(step, "Timeout: deployment time budget exhausted")
+        return min(remaining, cap) if cap is not None else remaining
+
+    def _run(self, cmd: str, step: str, cap: Optional[float] = None) -> SshCommandResult:
+        res = self.runner.run(cmd, timeout=self._remaining(step, cap))
+        if res.returncode == 124:
+            raise DeployError(step, f"Remote command timed out: {cmd}")
+        return res
+
+    def query_device_state(self, step: str = "precheck") -> Tuple[str, str, Dict[str, Any]]:
         """Query the running slot, image version, and update status from target."""
         slot = "unknown"
         version = "unknown"
         update_status: Dict[str, Any] = {}
 
         # 1. Try nx-sysd version --json
-        res = self.runner.run("nx-sysd version --json")
+        res = self._run("nx-sysd version --json", step)
         if res.ok and res.stdout.strip():
             try:
                 data = json.loads(res.stdout)
@@ -376,7 +393,7 @@ class Deployer:
 
         # 2. Fallbacks for slot and version if not resolved
         if slot == "unknown":
-            res_cmd = self.runner.run("cat /proc/cmdline")
+            res_cmd = self._run("cat /proc/cmdline", step)
             if res_cmd.ok:
                 if "root_b" in res_cmd.stdout or "4e58544d-06" in res_cmd.stdout:
                     slot = "root_b"
@@ -384,8 +401,8 @@ class Deployer:
                     slot = "root_a"
 
         if version == "unknown":
-            res_ver = self.runner.run(
-                "cat /etc/nextoomio-release 2>/dev/null || cat /etc/os-release"
+            res_ver = self._run(
+                "cat /etc/nextoomio-release 2>/dev/null || cat /etc/os-release", step
             )
             if res_ver.ok:
                 m = re.search(r'IMAGE_VERSION=["\']?([^"\']+)["\']?', res_ver.stdout)
@@ -395,7 +412,7 @@ class Deployer:
                     version = m.group(1).strip()
 
         # 3. Query updater status
-        res_stat = self.runner.run("nx-sysd update status --json")
+        res_stat = self._run("nx-sysd update status --json", step)
         if res_stat.ok and res_stat.stdout.strip():
             try:
                 update_status = json.loads(res_stat.stdout)
@@ -441,11 +458,11 @@ class Deployer:
                     f"No expected version could be determined from '{self.swu_path}' (sw-description missing or unreadable) and --expected-version was not specified",
                 )
 
-            if not self.runner.check_reachability(timeout=5.0):
+            if not self.runner.check_reachability(timeout=self._remaining("precheck", 5.0)):
                 raise DeployError("precheck", "Bench device is not reachable over SSH")
 
             # Record initial boot ID for reboot detection (Finding 3)
-            res_boot = self.runner.run("cat /proc/sys/kernel/random/boot_id", timeout=5.0)
+            res_boot = self._run("cat /proc/sys/kernel/random/boot_id", "precheck", 5.0)
             if res_boot.ok and res_boot.stdout.strip():
                 self.initial_boot_id = res_boot.stdout.strip()
                 self._log(f"Initial device boot ID: {self.initial_boot_id}")
@@ -469,13 +486,14 @@ class Deployer:
             self._log("Step 2: Uploading update payload to device staging...")
             # Upload via stream to staging buffer and trigger nx-sysd update stage
             upload_cmd = (
+                "trap 'rm -f /data/update/staging.upload.swu || exit 1' EXIT; "
+                "trap 'exit 1' HUP INT TERM; "
                 "mkdir -p /data/update && "
                 "cat > /data/update/staging.upload.swu && "
-                "nx-sysd update stage --file /data/update/staging.upload.swu && "
-                "rm -f /data/update/staging.upload.swu"
+                "nx-sysd update stage --file /data/update/staging.upload.swu"
             )
             res_upload = self.runner.stream_upload(
-                self.swu_path, upload_cmd, timeout=self.timeout_secs
+                self.swu_path, upload_cmd, timeout=self._remaining("upload")
             )
             if not res_upload.ok:
                 raise DeployError(
@@ -488,7 +506,7 @@ class Deployer:
             # Step 3: Validate
             self.timer.start("validate")
             self._log("Step 3: Validating staged update on device...")
-            res_val = self.runner.run("nx-sysd update validate", timeout=30.0)
+            res_val = self._run("nx-sysd update validate", "validate", 30.0)
             if not res_val.ok:
                 raise DeployError(
                     "validate",
@@ -500,7 +518,7 @@ class Deployer:
             # Step 4: Install
             self.timer.start("install")
             self._log(f"Step 4: Installing image artifacts to inactive slot ({target_slot})...")
-            res_inst = self.runner.run("nx-sysd update install", timeout=60.0)
+            res_inst = self._run("nx-sysd update install", "install", 60.0)
             if not res_inst.ok:
                 raise DeployError(
                     "install",
@@ -514,11 +532,7 @@ class Deployer:
             self._log(
                 f"Step 5: Arming trial boot for {target_slot} (remote_confirm={self.remote_confirm})..."
             )
-            confirm_flag = "--remote-confirm" if self.remote_confirm else ""
-            trial_cmd = (
-                f"nx-sysd update trial {confirm_flag} && (nohup systemctl reboot >/dev/null 2>&1 &)"
-            )
-            res_trial = self.runner.run(trial_cmd, timeout=15.0)
+            res_trial = self._run("nx-sysd update trial", "start_trial", 15.0)
             if not res_trial.ok:
                 raise DeployError(
                     "start_trial",
@@ -537,12 +551,12 @@ class Deployer:
             device_returned = False
             device_went_down = False
 
-            while (time.monotonic() - start_wait) < self.timeout_secs:
+            while self.timer.total_elapsed() < self.timeout_secs:
                 # 1. If initial_boot_id is known, check if boot ID has changed
                 if self.initial_boot_id:
                     res_boot = self.runner.run(
                         "cat /proc/sys/kernel/random/boot_id",
-                        timeout=min(3.0, self.poll_interval_secs + 1.0),
+                        timeout=self._remaining("wait_for_device", min(3.0, self.poll_interval_secs + 1.0)),
                     )
                     if res_boot.ok and res_boot.stdout.strip():
                         current_boot_id = res_boot.stdout.strip()
@@ -556,7 +570,7 @@ class Deployer:
                             self._log(
                                 "Device still reachable with pre-reboot boot ID (shutdown in progress)..."
                             )
-                            time.sleep(self.poll_interval_secs)
+                            time.sleep(min(self.poll_interval_secs, max(0, self.timeout_secs - self.timer.total_elapsed())))
                             continue
 
                 # 2. Check reachability
@@ -577,7 +591,7 @@ class Deployer:
                         device_returned = True
                         break
 
-                time.sleep(self.poll_interval_secs)
+                time.sleep(min(self.poll_interval_secs, max(0, self.timeout_secs - self.timer.total_elapsed())))
 
             if not device_returned:
                 raise DeployError(
@@ -590,7 +604,7 @@ class Deployer:
             # Step 7: Check running slot and image version
             self.timer.start("check_running")
             self._log("Step 7: Verifying running slot and image version...")
-            running_slot, new_version, device_update_state = self.query_device_state()
+            running_slot, new_version, device_update_state = self.query_device_state("check_running")
 
             # Check for rollback (AC4)
             if running_slot == previous_slot:
@@ -622,43 +636,40 @@ class Deployer:
 
             # Step 8: Confirm (AD-22)
             self.timer.start("confirm")
-            status_after_confirm: Dict[str, Any] = {}
             if self.remote_confirm:
-                self._log("Step 8: Sending remote confirmation to commit update...")
-                res_conf = self.runner.run("nx-sysd update confirm", timeout=15.0)
+                res_conf = self._run("nx-sysd update confirm", "confirm", 15.0)
                 if not res_conf.ok:
-                    raise DeployError(
-                        "confirm",
-                        f"Remote confirmation rejected (code {res_conf.returncode}): {res_conf.stderr.strip() or res_conf.stdout.strip()}",
-                    )
+                    raise DeployError("confirm", f"Remote confirmation rejected: {res_conf.stderr or res_conf.stdout}")
                 confirmation_sent = True
-                self._log("Remote confirmation sent. Verifying update state on device...")
 
-                _, _, status_after_confirm = self.query_device_state()
-                raw_state = status_after_confirm.get("state")
+            # Both modes require an observed committed state. Trial may commit asynchronously.
+            final_status: Dict[str, Any] = {}
+            while True:
+                _, _, final_status = self.query_device_state("confirm")
+                raw_state = final_status.get("state")
                 final_state = str(raw_state) if raw_state is not None else "unknown"
-
-                if final_state.lower() != "committed":
-                    raise DeployError(
-                        "confirm",
-                        f"Update state on device is not 'committed' after confirmation (got '{final_state}')",
-                        details=status_after_confirm,
-                    )
-                self._log(f"Update committed successfully (verified device state: '{final_state}').")
-            else:
-                self._log("Step 8: Remote confirmation not requested; checking device update state...")
-                _, _, status_after_confirm = self.query_device_state()
-                raw_state = status_after_confirm.get("state")
-                final_state = str(raw_state) if raw_state is not None else "unknown"
-
+                state = final_state.lower()
+                if state == "committed":
+                    break
+                if state != "trial":
+                    raise DeployError("confirm", f"Update state is {final_state}", details=final_status)
+                remaining = self.timeout_secs - self.timer.total_elapsed()
+                if remaining <= 0:
+                    raise DeployError("confirm", "Update still in trial at timeout", details=final_status)
+                time.sleep(min(self.poll_interval_secs, remaining))
+                if self.timer.total_elapsed() >= self.timeout_secs:
+                    raise DeployError("confirm", "Update still in trial at timeout", details=final_status)
             self.timer.stop("confirm")
 
-            # Final status query / result assembly
-            _, _, final_status = self.query_device_state()
-            if not final_status and status_after_confirm:
-                final_status = status_after_confirm
-            raw_state = final_status.get("state")
-            final_state = str(raw_state) if raw_state is not None else final_state
+            tone_result = None
+            if self.tone_check:
+                self.timer.start("tone_check")
+                # The deployment is already committed; this check has its own
+                # bounded SSH timeout and cannot undo that confirmation.
+                check = self.runner.run("nextoomio-tone-check", timeout=30.0)
+                self.timer.stop("tone_check")
+                tone_result = {"returncode": check.returncode, "stdout": check.stdout,
+                               "stderr": check.stderr}
 
             return DeployResult(
                 success=True,
@@ -670,6 +681,7 @@ class Deployer:
                 confirmation_sent=confirmation_sent,
                 rollback_detected=False,
                 device_update_state=final_status,
+                tone_check=tone_result,
             )
 
         except DeployError as e:
@@ -714,7 +726,7 @@ def format_text_report(res: DeployResult) -> str:
         lines.append("=" * 60)
         lines.append(f"Failing Step:      {res.failing_step}")
         lines.append(f"Error:             {res.error_message}")
-        lines.append(f"Confirmation Sent: No (suppressed on failure)")
+        lines.append(f"Confirmation Sent: {'Yes' if res.confirmation_sent else 'No'}")
         if res.rollback_detected:
             lines.append(f"Rollback Detected: Device returned on previous slot '{res.running_slot}'")
         if res.device_update_state:
@@ -722,6 +734,11 @@ def format_text_report(res: DeployResult) -> str:
             lines.append(f"Update State:      {state_str}")
 
     lines.append("-" * 60)
+    if res.tone_check is not None:
+        lines.append(f"Tone Check:        {'PASS' if res.tone_check['returncode'] == 0 else 'FAIL'} (exit {res.tone_check['returncode']})")
+        for stream in ("stdout", "stderr"):
+            if res.tone_check[stream].strip():
+                lines.append(res.tone_check[stream].rstrip())
     lines.append("Step Elapsed Times:")
     for step, duration in res.step_times.items():
         if step != "total":
@@ -774,7 +791,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_SECS,
-        help=f"Timeout in seconds for reboot and device return (default: {DEFAULT_TIMEOUT_SECS}s).",
+        help=f"Total deployment time budget in seconds (default: {DEFAULT_TIMEOUT_SECS}s).",
     )
     parser.add_argument(
         "--poll-interval",
@@ -786,6 +803,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-remote-confirm",
         action="store_true",
         help="Do not request remote confirmation (commit on local health check alone).",
+    )
+    parser.add_argument(
+        "--tone-check",
+        action="store_true",
+        help="Run the remote tone check after the update is committed.",
     )
     parser.add_argument(
         "--json",
@@ -872,6 +894,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.write(f"Error: update file '{update_file}' does not exist.\n")
         return 2
 
+    if not (0 < args.timeout < float("inf") and 0 < args.poll_interval < float("inf")):
+        sys.stderr.write("Error: timeout and poll interval must be finite positive numbers.\n")
+        return 2
+
     runner = SystemSshRunner(host=device, user=args.user, port=args.port)
     deployer = Deployer(
         runner=runner,
@@ -881,6 +907,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         poll_interval_secs=args.poll_interval,
         remote_confirm=not args.no_remote_confirm,
         verbose=args.verbose,
+        tone_check=args.tone_check,
     )
 
     result = deployer.deploy()
@@ -890,7 +917,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         print(format_text_report(result))
 
-    return 0 if result.success else 1
+    return 0 if result.success and (result.tone_check is None or result.tone_check["returncode"] == 0) else 1
 
 
 if __name__ == "__main__":

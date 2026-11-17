@@ -40,6 +40,7 @@ try:
         DEFAULT_SSH_USER,
         DEFAULT_TIMEOUT_SECS,
         SAFE_IDENTIFIER_PATTERN,
+        DeployError,
         DeployResult,
         Deployer,
         SshCommandResult,
@@ -57,6 +58,7 @@ except ImportError:
         DEFAULT_SSH_USER,
         DEFAULT_TIMEOUT_SECS,
         SAFE_IDENTIFIER_PATTERN,
+        DeployError,
         DeployResult,
         Deployer,
         SshCommandResult,
@@ -186,7 +188,8 @@ class SoakReport:
         return {
             "target_device": self.target_device,
             "total_cycles_requested": self.total_cycles_requested,
-            "completed_cycles": len(self.cycles),
+            "attempted_cycles": len(self.cycles),
+            "completed_cycles": sum(c.success for c in self.cycles),
             "success": self.success,
             "start_time": self.start_time,
             "end_time": self.end_time,
@@ -206,7 +209,8 @@ class SoakReport:
 
     def format_markdown(self) -> str:
         """Render soak report as a GitHub-flavored Markdown document (AC2)."""
-        completed_count = len(self.cycles)
+        completed_count = sum(c.success for c in self.cycles)
+        attempted_count = len(self.cycles)
         if self.success:
             status_badge = "PASSED"
         elif self.failing_step == "gate_criteria":
@@ -270,6 +274,7 @@ class SoakReport:
             f"- **Date:** {self.start_time[:10] if self.start_time else datetime.date.today().isoformat()}",
             f"- **Target Device:** `{self.target_device}`",
             f"- **Overall Status:** **{status_badge}**",
+            f"- **Cycles Attempted:** {attempted_count} / {self.total_cycles_requested}",
             f"- **Cycles Completed:** {completed_count} / {self.total_cycles_requested}",
             f"- **Total Elapsed Duration:** {self.total_duration_secs:.2f} s",
             f"- **Start Time:** `{self.start_time}`",
@@ -336,18 +341,12 @@ class SoakReport:
             "## Invariant Verifications",
             "",
         ])
-        if completed_count > 0:
-            lines.extend([
-                f"1. **Slot Alternation (AC1):** Each consecutive cycle ({completed_count} completed) toggled between `root_a` and `root_b` without repeating.",
-                f"2. **Commit State (AC1):** All {completed_count} deployed image(s) transitioned to `committed` update state via remote confirmation.",
-                f"3. **Version Accuracy (AC1):** Active image version read from `/etc/nextoomio-release` matched the deployed SWU release version across all {completed_count} cycle(s).",
-            ])
-        else:
-            lines.extend([
-                "1. **Slot Alternation (AC1):** None (0 cycles executed).",
-                "2. **Commit State (AC1):** None (0 cycles executed).",
-                "3. **Version Accuracy (AC1):** None (0 cycles executed).",
-            ])
+        successful = [c for c in self.cycles if c.success]
+        lines.extend([
+            f"1. **Slot Alternation (AC1):** Verified for {sum(c.previous_slot in ('root_a', 'root_b') and c.running_slot == opposite_slot(c.previous_slot) for c in successful)} successful cycle(s); {attempted_count - completed_count} failed attempt(s) are excluded.",
+            f"2. **Commit State (AC1):** Observed committed for {completed_count} successful cycle(s); {attempted_count - completed_count} failed attempt(s) are excluded.",
+            f"3. **Version Accuracy (AC1):** Matched for {sum(c.new_version == c.expected_version for c in successful)} successful cycle(s); {attempted_count - completed_count} failed attempt(s) are excluded.",
+        ])
 
         if self.marker_verified_unchanged:
             lines.append(
@@ -387,7 +386,7 @@ class MarkerManager:
         self.expected_content: str = ""
         self.expected_hash: str = ""
 
-    def setup_marker(self, runner: SshRunner) -> Tuple[str, str]:
+    def setup_marker(self, runner: SshRunner, timeout: float = DEFAULT_TIMEOUT_SECS) -> Tuple[str, str]:
         """Write a unique verifiable marker file to the /data partition before the soak run."""
         token = uuid.uuid4().hex
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -401,7 +400,7 @@ class MarkerManager:
             f"cat > {quoted_path} << 'EOF'\n{self.expected_content}EOF\n"
             f"sha256sum {quoted_path}"
         )
-        res = runner.run(write_cmd)
+        res = runner.run(write_cmd, timeout=timeout)
         if not res.ok:
             raise RuntimeError(f"Failed to write marker file to {self.marker_path}: {res.stderr}")
 
@@ -414,14 +413,14 @@ class MarkerManager:
 
         return self.expected_content, self.expected_hash
 
-    def verify_marker(self, runner: SshRunner) -> Tuple[bool, str]:
+    def verify_marker(self, runner: SshRunner, timeout: float = DEFAULT_TIMEOUT_SECS) -> Tuple[bool, str]:
         """Verify that the marker file exists on /data and its content/checksum is unchanged."""
         if not self.expected_hash:
             return False, "Marker was never initialized"
 
         quoted_path = "'" + self.marker_path.replace("'", "'\\''") + "'"
         check_cmd = f"sha256sum {quoted_path} && cat {quoted_path}"
-        res = runner.run(check_cmd)
+        res = runner.run(check_cmd, timeout=timeout)
         if not res.ok:
             return False, f"Marker file unreadable or missing at {self.marker_path}: {res.stderr}"
 
@@ -543,7 +542,7 @@ class SoakRunner:
         self._log(f"Image B: {self.image_b.name} (version {ver_b})")
 
         # Step 1: Check initial device reachability and query state
-        if not self.runner.check_reachability(timeout=5.0):
+        if not self.runner.check_reachability(timeout=min(5.0, self.timeout_secs)):
             report.success = False
             report.failing_step = "precheck"
             report.failure_message = f"Target device '{target_name}' is not reachable over SSH"
@@ -559,7 +558,13 @@ class SoakRunner:
             poll_interval_secs=self.poll_interval_secs,
             verbose=False,
         )
-        init_slot, init_ver, _ = probe_deployer.query_device_state()
+        try:
+            init_slot, init_ver, _ = probe_deployer.query_device_state("precheck")
+        except DeployError as e:
+            report.failing_step = e.step
+            report.failure_message = e.message
+            self._finalize_report(report, start_mono)
+            return report
         report.initial_slot = init_slot
         report.initial_version = init_ver
         self._log(f"Initial device state: slot={init_slot}, version={init_ver}")
@@ -567,7 +572,7 @@ class SoakRunner:
         # Step 2: Write persistent marker to /data partition (AC3)
         self._log(f"Writing persistent data marker to {self.marker_path}...")
         try:
-            _, marker_hash = self.marker_manager.setup_marker(self.runner)
+            _, marker_hash = self.marker_manager.setup_marker(self.runner, timeout=self.timeout_secs)
             report.marker_hash = marker_hash
             self._log(f"Persistent marker established with SHA256: {marker_hash[:16]}...")
         except Exception as e:
@@ -718,7 +723,7 @@ class SoakRunner:
 
             # AC3 Invariant: Verify persistent data partition marker intact
             m_start = time.monotonic()
-            marker_ok, marker_msg = self.marker_manager.verify_marker(self.runner)
+            marker_ok, marker_msg = self.marker_manager.verify_marker(self.runner, timeout=self.timeout_secs)
             step_times["marker_check"] = time.monotonic() - m_start
 
             if not marker_ok:
@@ -777,7 +782,7 @@ class SoakRunner:
         # Post-loop checks
         if len(report.cycles) == self.cycles and all(c.success for c in report.cycles):
             # Final check of marker
-            m_final_ok, m_msg = self.marker_manager.verify_marker(self.runner)
+            m_final_ok, m_msg = self.marker_manager.verify_marker(self.runner, timeout=self.timeout_secs)
             if not m_final_ok:
                 report.success = False
                 report.marker_verified_unchanged = False
@@ -877,7 +882,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_SECS,
-        help=f"Trial boot wait timeout in seconds (default: {DEFAULT_TIMEOUT_SECS})",
+        help=f"Time budget per deployment or marker operation in seconds (default: {DEFAULT_TIMEOUT_SECS})",
     )
     parser.add_argument(
         "--poll-interval",
@@ -974,6 +979,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.write(
             f"Error: Marker path '{args.marker_path}' must be an absolute path under /data with safe characters\n"
         )
+        return 2
+
+    if not (0 < args.timeout < float("inf") and 0 < args.poll_interval < float("inf")):
+        sys.stderr.write("Error: timeout and poll interval must be finite positive numbers\n")
         return 2
 
     runner = SystemSshRunner(host=device, user=args.user, port=args.port)

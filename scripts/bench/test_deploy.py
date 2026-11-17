@@ -17,9 +17,13 @@ import json
 import os
 import pathlib
 import struct
+import subprocess
+import time
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from contextlib import redirect_stdout
 from typing import Any, Dict, List, Optional
 
 # Ensure deploy module can be imported
@@ -272,6 +276,106 @@ class TestDeployTool(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_optional_tone_check_after_commit(self) -> None:
+        for code in (0, 2, 3, 255):
+            with self.subTest(code=code):
+                class ToneDevice(MockBenchDevice):
+                    def run(self, cmd, timeout=None):
+                        if cmd == "nextoomio-tone-check":
+                            self.commands_executed.append(cmd)
+                            self.assert_committed = self.update_state == "Committed"
+                            return SshCommandResult(code, "tone output", "tone error" if code else "")
+                        return super().run(cmd, timeout)
+
+                device = ToneDevice()
+                with patch("deploy.SystemSshRunner", return_value=device), redirect_stdout(io.StringIO()) as out:
+                    rc = main(["-d", "bench", "-f", str(self.swu_file), "--tone-check", "--json"])
+                data = json.loads(out.getvalue())
+                self.assertTrue(device.assert_committed)
+                self.assertEqual(device.commands_executed[-1], "nextoomio-tone-check")
+                self.assertTrue(data["success"])
+                self.assertEqual(data["tone_check"]["returncode"], code)
+                self.assertEqual(data["tone_check"]["stdout"], "tone output")
+                self.assertEqual(rc, 0 if code == 0 else 1)
+
+        device = MockBenchDevice(fail_validation=True)
+        result = Deployer(device, self.swu_file, tone_check=True).deploy()
+        self.assertFalse(result.success)
+        self.assertIsNone(result.tone_check)
+        self.assertNotIn("nextoomio-tone-check", device.commands_executed)
+
+        device = MockBenchDevice()
+        result = Deployer(device, self.swu_file).deploy()
+        self.assertIsNone(result.tone_check)
+        self.assertNotIn("nextoomio-tone-check", device.commands_executed)
+
+        device = MockBenchDevice()
+        result = Deployer(device, self.swu_file, tone_check=True).deploy()
+        self.assertIn("Tone Check:        PASS", format_text_report(result))
+
+    def test_final_states_in_both_confirmation_modes(self) -> None:
+        for remote in (False, True):
+            for sequence, success, message in [
+                (["Committed"], True, ""), (["Trial", "Committed"], True, ""),
+                (["Trial"], False, "still in trial"), (["Failed"], False, "Failed"),
+                ([None], False, "unknown"),
+            ]:
+                with self.subTest(remote=remote, sequence=sequence):
+                    class StateDevice(MockBenchDevice):
+                        reads = 0
+                        def run(self, cmd, timeout=None):
+                            if cmd == "nx-sysd update status --json" and self.trial_armed:
+                                # First post-boot query is the slot/version check.
+                                self.reads += 1
+                                if self.reads > 1:
+                                    state = sequence[min(self.reads - 2, len(sequence) - 1)]
+                                    return SshCommandResult(0, json.dumps({"state": state}), "")
+                            if cmd == "nx-sysd update confirm":
+                                self.commands_executed.append(cmd)
+                                return SshCommandResult(0, "", "")
+                            return super().run(cmd, timeout)
+                    device = StateDevice()
+                    result = Deployer(device, self.swu_file, timeout_secs=0.08,
+                                      poll_interval_secs=0.005, remote_confirm=remote).deploy()
+                    self.assertEqual(result.success, success, result.error_message)
+                    if not success:
+                        self.assertIn(message, result.error_message)
+                    trial = [c for c in device.commands_executed if c.startswith("nx-sysd update trial")]
+                    self.assertEqual(trial, ["nx-sysd update trial"])
+                    self.assertEqual("nx-sysd update confirm" in device.commands_executed, remote)
+
+    def test_hanging_queries_obey_budget_and_name_step(self) -> None:
+        for stage in ("precheck", "confirm"):
+            with self.subTest(stage=stage):
+                class HangingDevice(MockBenchDevice):
+                    def run(self, cmd, timeout=None):
+                        if cmd == "nx-sysd version --json" and (stage == "precheck" or self.confirmation_received):
+                            self_timeout = timeout
+                            try:
+                                subprocess.run([sys.executable, "-c", "import time; time.sleep(10)"], timeout=self_timeout)
+                            except subprocess.TimeoutExpired:
+                                return SshCommandResult(124, "", "timed out")
+                        return super().run(cmd, timeout)
+                start = time.monotonic()
+                result = Deployer(HangingDevice(), self.swu_file, timeout_secs=0.15, poll_interval_secs=0.005).deploy()
+                self.assertLess(time.monotonic() - start, 0.6)
+                self.assertFalse(result.success)
+                self.assertEqual(result.failing_step, stage)
+                self.assertIn("timed out", result.error_message)
+
+    def test_failed_stage_removes_upload(self) -> None:
+        class StageDevice(MockBenchDevice):
+            def stream_upload(inner, local_file, remote_cmd, timeout=None):
+                path = str(self.temp_path / "data" / "update")
+                command = remote_cmd.replace("/data/update", path)
+                command = "nx-sysd() { return 1; }; " + command
+                proc = subprocess.run(["sh", "-c", command], input=b"payload", capture_output=True, timeout=timeout)
+                return SshCommandResult(proc.returncode, "", proc.stderr.decode())
+        result = Deployer(StageDevice(), self.swu_file, timeout_secs=2).deploy()
+        self.assertFalse(result.success)
+        self.assertEqual(result.failing_step, "upload")
+        self.assertFalse((self.temp_path / "data/update/staging.upload.swu").exists())
+
     def test_cpio_metadata_parsing(self) -> None:
         """Verify sw-description parsing from CPIO archive."""
         meta = parse_swu_description(self.swu_file)
@@ -362,7 +466,7 @@ class TestDeployTool(unittest.TestCase):
         res = deployer.deploy()
         self.assertFalse(res.success)
         self.assertEqual(res.failing_step, "confirm")
-        self.assertIn("not 'committed'", str(res.error_message))
+        self.assertIn("Unconfirmed", str(res.error_message))
         self.assertNotEqual(res.final_state.lower(), "committed")
 
     def test_ac3_validation_failure(self) -> None:

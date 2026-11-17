@@ -11,15 +11,6 @@ on:
         options:
           - parse-only
           - full-image
-      runner:
-        description: 'Target GitHub Actions runner'
-        required: true
-        default: 'ubuntu-24.04'
-        type: choice
-        options:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
-          - self-hosted
   pull_request:
     branches: [main]
     paths:
@@ -37,54 +28,37 @@ on:
 
 concurrency:
   group: yocto-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  yocto:
-    name: Yocto (${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')) && 'full-image' || 'parse-only' }} on ${{ inputs.runner || 'ubuntu-24.04' }})
-    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+  parse:
+    name: Yocto parse and task graph
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'parse-only')
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Maximize runner disk space (GitHub-hosted full-image builds only)
-        if: (inputs.runner || 'ubuntu-24.04') != 'self-hosted' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image'))
-        run: |
-          df -h
-          sudo rm -rf /usr/share/dotnet \
-                      /usr/local/lib/android \
-                      /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL \
-                      /usr/local/share/boost \
-                      /usr/local/graalvm || true
-          docker image prune --all --force || true
-          df -h
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Prepare build and cache directories
         run: |
-          if [ "${{ inputs.runner || 'ubuntu-24.04' }}" != "self-hosted" ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          fi
-          mkdir -p "${GITHUB_WORKSPACE}/build"
-          mkdir -p "${GITHUB_WORKSPACE}/yocto-cache/downloads"
-          mkdir -p "${GITHUB_WORKSPACE}/yocto-cache/sstate-cache"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          mkdir -p "${GITHUB_WORKSPACE}/build" "${GITHUB_WORKSPACE}/yocto-cache/downloads" "${GITHUB_WORKSPACE}/yocto-cache/sstate-cache"
 
-      - name: Restore Yocto downloads & sstate cache (up to 10 GB GitHub Cache limit)
-        uses: actions/cache@v4
+      - name: Restore Yocto downloads and sstate cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ github.workspace }}/yocto-cache/downloads
             ${{ github.workspace }}/yocto-cache/sstate-cache
-          key: yocto-${{ inputs.runner || 'ubuntu-24.04' }}-wrynose-${{ hashFiles('kas/**', 'meta-nextoomio/**') }}
+          key: yocto-ubuntu-24.04-wrynose-${{ hashFiles('kas/**', 'meta-nextoomio/**') }}
           restore-keys: |
-            yocto-${{ inputs.runner || 'ubuntu-24.04' }}-wrynose-
+            yocto-ubuntu-24.04-wrynose-
 
-      - name: Run BitBake layer & recipe parse verification (parse-only)
-        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.mode || 'parse-only') == 'parse-only')
+      - name: Parse layers and resolve the image task graph
         run: |
           docker run --rm \
             --user=root \
@@ -98,24 +72,61 @@ jobs:
             -e DL_DIR=/work/yocto-cache/downloads \
             -e SSTATE_DIR=/work/yocto-cache/sstate-cache \
             ghcr.io/siemens/kas/kas:4.5 \
-            kas shell /work/kas/ci-hosted.yml -c "bitbake-layers show-layers && bitbake -p nextoomio-image"
+            kas shell /work/kas/ci-hosted.yml -c "bitbake-layers show-layers && bitbake -p nextoomio-image && bitbake -n nextoomio-image"
 
-      - name: Build full nextoomio Yocto image (full-image)
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')
+  full-image:
+    name: Yocto full image
+    # Never run untrusted pull_request code on the self-hosted runner.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')
+    runs-on: [self-hosted, nextoomio-build]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build full nextoomio Yocto image
         run: |
           docker run --rm \
             --user=root \
-            --security-opt apparmor=unconfined \
-            -v "${GITHUB_WORKSPACE}:/work:rw" \
+            -v "${GITHUB_WORKSPACE}:/work:ro" \
+            -v nextoomio-ci-build:/work/build \
             -w /work \
             -e USER_ID="$(id -u)" \
             -e GROUP_ID="$(id -g)" \
             -e NEXTOOMIO_SOURCE_COMMIT="${{ github.sha }}" \
             -e KAS_WORK_DIR=/work/build \
-            -e DL_DIR=/work/yocto-cache/downloads \
-            -e SSTATE_DIR=/work/yocto-cache/sstate-cache \
+            -e DL_DIR=/work/build/downloads \
+            -e SSTATE_DIR=/work/build/sstate-cache \
             ghcr.io/siemens/kas/kas:4.5 \
             kas build /work/kas/ci-hosted.yml
+
+      - name: Copy build artifacts from volume
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/build/tmp/deploy"
+          docker run --rm \
+            --user=root \
+            -v nextoomio-ci-build:/work/build:ro \
+            -v "${GITHUB_WORKSPACE}/build/tmp/deploy:/output" \
+            ghcr.io/siemens/kas/kas:4.5 \
+            sh -ec '
+              src=/work/build/build/tmp/deploy
+              mkdir -p /output/images/raspberrypi4-64 /output/licenses
+              for f in "$src"/images/raspberrypi4-64/*.rootfs.ext4.gz "$src"/images/raspberrypi4-64/*.wic.bz2 "$src"/images/raspberrypi4-64/*.wic.bmap "$src"/images/raspberrypi4-64/*.swu "$src"/images/raspberrypi4-64/*.manifest "$src"/images/raspberrypi4-64/*.rootfs.spdx.json "$src"/images/raspberrypi4-64/*.spdx.tar.zst; do
+                if [ -f "$f" ]; then cp -L "$f" /output/images/raspberrypi4-64/; fi
+              done
+              for f in "$src"/licenses/*/nextoomio-image-*/license.manifest; do
+                [ -f "$f" ] || continue
+                dest="/output/licenses/${f#"$src"/licenses/}"
+                mkdir -p "$(dirname "$dest")"
+                cp -L "$f" "$dest"
+              done
+            '
+
+      - name: Check built root filesystem
+        run: |
+          docker run --rm --user=root -v "${GITHUB_WORKSPACE}:/work:rw" -w /work --entrypoint python3 \
+            ghcr.io/siemens/kas/kas:4.5 scripts/check_image_rootfs.py \
+            build/tmp/deploy/images/raspberrypi4-64/nextoomio-image-raspberrypi4-64.rootfs.ext4.gz --commit "${{ github.sha }}"
 
       - name: Check required build artifacts and image licenses
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'full-image')
