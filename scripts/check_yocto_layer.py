@@ -71,6 +71,24 @@ def validate_yocto_runner_boundary(text: str) -> list[str]:
     return errors
 
 
+
+def validate_rootfs_workflow(text: str) -> list[str]:
+    """Require the rootfs inspection to run as a single command in the kas container."""
+    parts = text.split("\n  full-image:", 1)
+    if len(parts) != 2:
+        return ["rootfs workflow: full-image job missing"]
+    body = re.split(r"(?m)^  [A-Za-z0-9_-]+:\s*$", parts[1], maxsplit=1)[0]
+    steps = re.split(r"(?m)^      - name: ", body)[1:]
+    relevant = [step for step in steps if re.search(r"\bdebugfs\b|check_image_rootfs\.py", step)]
+    expected = ('Check built root filesystem\n        run: |\n'
+                '          docker run --rm --user=root -v "${GITHUB_WORKSPACE}:/work:rw" -w /work --entrypoint python3 \\\n'
+                '            ghcr.io/siemens/kas/kas:4.5 scripts/check_image_rootfs.py \\\n'
+                '            build/tmp/deploy/images/raspberrypi4-64/nextoomio-image-raspberrypi4-64.rootfs.ext4.gz --commit "${{ github.sha }}"')
+    if len(relevant) != 1 or relevant[0].strip() != expected:
+        return ["rootfs workflow: inspection must run only in the kas container"]
+    return []
+
+
 def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     """Run all static validation checks against the given repository root directory."""
     errors: list[str] = []
@@ -543,6 +561,17 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     if not all(part in systemd_text for part in ("file://50-nextoomio-services.preset", "${UNPACKDIR}/50-nextoomio-services.preset", "${systemd_unitdir}/system-preset/50-nextoomio-services.preset")):
         errors.append("nextoomio services preset installation missing")
 
+    # D-072: package postinst enablement bypasses presets; masks defeat Also=.
+    distro_text = distro_conf.read_text(encoding="utf-8") if distro_conf.is_file() else ""
+    for package in ("dnsmasq", "rpcbind", "swupdate"):
+        if f'SYSTEMD_AUTO_ENABLE:pn-{package} = "disable"' not in distro_text.splitlines():
+            errors.append(f"postinst enablement must be disabled for {package}")
+    if 'SYSTEMD_AUTO_ENABLE:${PN}-networkd = "disable"' not in systemd_text.splitlines():
+        errors.append("postinst enablement must be disabled for networkd")
+    for unit in ("NetworkManager-wait-online.service", "systemd-networkd-wait-online.service"):
+        if not re.search(r'^\s*ln -sf /dev/null \${D}\${sysconfdir}/systemd/system/' + re.escape(unit) + r'\s*$', systemd_text, re.MULTILINE):
+            errors.append(f"wait-online unit must be masked: {unit}")
+
     # P0-F2.3: Validate device identity, image version release metadata, and persistent device ID
     distro_conf = root / "meta-nextoomio/conf/distro/nextoomio.conf"
     if distro_conf.is_file():
@@ -749,6 +778,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
     if yocto_wf.is_file():
         wf_text = yocto_wf.read_text(encoding="utf-8")
         errors.extend(validate_yocto_runner_boundary(wf_text))
+        errors.extend(validate_rootfs_workflow(wf_text))
         if "*.manifest" not in wf_text and "*.rootfs.manifest" not in wf_text:
             errors.append(
                 ".github/workflows/yocto-build.yml: artifact upload must publish package manifest (*.manifest, AC4)"
@@ -1746,6 +1776,27 @@ def run_self_tests() -> int:
             assert any(message in e for e in validate_layer(tmp_root)), message
             target.write_text(original, encoding="utf-8")
         print("  test_firewall_and_preset_required: OK")
+
+        # D-072: each postinst setting and mask is necessary.
+        for path, line, message in (
+            *(("meta-nextoomio/conf/distro/nextoomio.conf", f'SYSTEMD_AUTO_ENABLE:pn-{package} = "disable"', package) for package in ("dnsmasq", "rpcbind", "swupdate")),
+            ("meta-nextoomio/recipes-core/systemd/systemd_%.bbappend", 'SYSTEMD_AUTO_ENABLE:${PN}-networkd = "disable"', "networkd"),
+            *(("meta-nextoomio/recipes-core/systemd/systemd_%.bbappend", f'    ln -sf /dev/null ${{D}}${{sysconfdir}}/systemd/system/{unit}', unit) for unit in ("NetworkManager-wait-online.service", "systemd-networkd-wait-online.service")),
+        ):
+            target = tmp_root / path
+            original = target.read_text(encoding="utf-8")
+            assert line in original
+            target.write_text(original.replace(line, ""), encoding="utf-8")
+            assert any(message in error for error in validate_layer(tmp_root)), message
+            target.write_text(original, encoding="utf-8")
+        wf = tmp_root / ".github/workflows/yocto-build.yml"
+        original = wf.read_text(encoding="utf-8")
+        for command in ('python3 scripts/check_image_rootfs.py image', 'debugfs image'):
+            altered = original.replace('      - name: Check required build artifacts and image licenses', f'      - name: Unsafe inspection\n        run: {command}\n\n      - name: Check required build artifacts and image licenses')
+            wf.write_text(altered, encoding="utf-8")
+            assert any("rootfs workflow" in error for error in validate_layer(tmp_root)), command
+        wf.write_text(original, encoding="utf-8")
+        print("  test_postinst_masks_and_container_required: OK")
 
         # D-069: the gate belongs to the image, and must reject all listed AGPL variants.
         image_bb = tmp_root / "meta-nextoomio/recipes-core/images/nextoomio-image.bb"
