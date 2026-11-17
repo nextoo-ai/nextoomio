@@ -4,9 +4,9 @@ This document defines the single manual flash procedure to rebuild the nextoomio
 
 ## 1. Overview and Scope
 
-In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1 and [ARCHITECTURE.md](../../ARCHITECTURE.md) section 4.1, the microSD card is written by hand during initial bench provisioning. The developer's SSH public key is copied to the card's first FAT partition during this initial flash. Under the planned update architecture (stories P0-F4.2–P0-F4.6; not yet verified on hardware), subsequent system images are planned to be deployed over the network through the update engine, without requiring physical card removal or manual flashing.
+In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1 and [ARCHITECTURE.md](../../ARCHITECTURE.md) section 4.1, the microSD card is written by hand during initial bench provisioning. The developer's SSH public key is copied to the card's first FAT partition during this initial flash. The update engine for subsequent network deployments is implemented in software (stories P0-F4.2–P0-F4.6), but has not yet been verified on hardware. It is intended to avoid physical card removal or manual flashing for subsequent updates.
 
-Physical access to the microSD card is required only for:
+The procedure expects physical access to the microSD card for:
 1. Bare-metal initial provisioning of the reference bench device (this procedure).
 2. Hardware recovery in the event of storage failure or an unreadable partition table / selector.
 
@@ -53,7 +53,7 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
 1. **Workflow source:**
    - Full BitBake Wic image builds are executed by the workflow `.github/workflows/yocto-build.yml` ("Yocto Image Build").
    - Full images are built and uploaded on every `push` to `main` modifying build paths (`kas/**`, `meta-nextoomio/**`, `core/**`, `.github/workflows/yocto-build.yml`), or via manual `workflow_dispatch` with input `mode: full-image`.
-   - Build artifacts are retained for 14 days. Pick the latest successful run on `main` (or a specific tagged release/commit).
+   - Build artifacts are retained for 14 days. Select a successful run on `main` with a non-expired image artifact (or a suitable run for a specific commit). A successful parse-only run has no image artifact.
 
 2. **Download the artifact:**
 
@@ -62,17 +62,16 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
      # List recent successful Yocto image runs on main
      gh run list --workflow=yocto-build.yml --status=success --branch=main
 
-     # Verify that the selected run produced artifacts (full-image builds publish
-     # the image artifact; fast parse-only verification runs publish no artifacts):
-     gh run view <RUN_ID>
+     # List artifacts for a selected run; choose a non-expired artifact named
+     # nextoomio-rpi4-64-<full commit SHA> and note its exact name.
+     gh api repos/nextoo-ai/nextoomio/actions/runs/<RUN_ID>/artifacts
 
-     # Download the artifact from the selected run ID into a dedicated directory
-     gh run download <RUN_ID> -p "nextoomio-rpi4-64-*" --dir nextoomio-rpi4-64
-
-     # Change into the extracted artifact directory
-     cd nextoomio-rpi4-64/nextoomio-rpi4-64-*
+     # Substitute the selected run ID and exact artifact name. With -n, a single
+     # named artifact is extracted directly into this dedicated directory.
+     gh run download <RUN_ID> -n <ARTIFACT_NAME> -D nextoomio-rpi4-64
+     cd nextoomio-rpi4-64
      ```
-     With `-p`, `gh run download` extracts each matching artifact into a subdirectory named after the artifact under `--dir`. Confirm that exactly one artifact matches before changing into it. No separate `unzip` command is needed when using `gh`.
+     Run these commands from a checkout of `nextoo-ai/nextoomio`, authenticated with `gh`. Use a new or empty destination directory to avoid mixing files from different runs. No separate `unzip` command is needed with `gh`.
 
    - **Using the GitHub Web UI:**
      1. Navigate to the repository's **Actions** tab.
@@ -88,12 +87,12 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
 
 3. **Identify the Wic image and block map:**
 
-   The downloaded artifact archive preserves the directory structure under `build/**/deploy/` published by `actions/upload-artifact@v4`:
-   - Flashable Wic image and block map: `build/tmp/deploy/images/raspberrypi4-64/*.wic.bz2` and `build/tmp/deploy/images/raspberrypi4-64/*.wic.bmap`
-   - Rootfs package manifests and SPDX SBOM: `build/tmp/deploy/images/raspberrypi4-64/*.manifest` and `build/tmp/deploy/images/raspberrypi4-64/*.spdx.tar.zst`
-   - License manifest: `build/tmp/deploy/licenses/**/license.manifest`
+   The artifact from full-image run `44139017187` extracts with these paths relative to the destination directory:
+   - Wic image and block map: `tmp/deploy/images/raspberrypi4-64/*.wic.bz2` and `tmp/deploy/images/raspberrypi4-64/*.wic.bmap`
+   - Update bundle, package manifest and SPDX metadata: `tmp/deploy/images/raspberrypi4-64/*.swu`, `*.manifest` and `*.spdx.json`
+   - License manifest: `tmp/deploy/licenses/raspberrypi4_64/nextoomio-image-raspberrypi4-64.rootfs/license.manifest`
 
-   *(Note: The exact subdirectory layout inside the downloaded zip artifact was observed by the Architect on 2026-11-16 from full-image CI run 43832700635; all published files reside under `build/tmp/deploy/`.)*
+   Check the extracted paths for the selected run; the upload layout may change in a later workflow revision.
 
    > [!IMPORTANT]
    > Keep both the `*.wic.bz2` image and its matching `*.wic.bmap` block map in the same directory. When invoked, `bmaptool copy` looks for the matching `.wic.bmap` file in the same directory as the image.
@@ -102,7 +101,7 @@ In accordance with [ROADMAP.md](../../ROADMAP.md) section 2.1, the image is buil
 
    Change into the image directory and identify your exact filename:
    ```bash
-   cd build/tmp/deploy/images/raspberrypi4-64
+   cd tmp/deploy/images/raspberrypi4-64
    ls -la nextoomio-image-raspberrypi4-64*
    ```
    In the flashing commands in Section 3.3, substitute your actual filename (e.g. `nextoomio-image-raspberrypi4-64.rootfs.wic.bz2` or `nextoomio-image-raspberrypi4-64-20261116120000.rootfs.wic.bz2`) for `<IMAGE_FILE>`.
@@ -314,8 +313,4 @@ Confirm that the test sound is audible from the connected passive test speaker. 
 
 ## 9. Subsequent Deployments
 
-Once the first flash is complete and the bench device is verified reachable over SSH, subsequent software iterations and A/B trial deployments are planned to be delivered over the network using the update engine (planned behavior under stories P0-F4.2–P0-F4.6; not yet verified on hardware):
-
-- The card remains in the device.
-- Updates are uploaded over SSH and installed into the inactive slot (`boot_b`/`root_b` or `boot_a`/`root_a`).
-- Trial boot, local health check, and remote-confirmed commit proceed automatically without physical card access.
+The update engine and workstation deployment tool implement network deployment in software (stories P0-F4.2–P0-F4.6), but this path has not yet been verified on hardware. The intended flow leaves the card in the device: the tool uploads the update over SSH, installs it into the inactive slot, initiates a trial boot, and sends remote confirmation after its checks. See [the deployment tool instructions](../../scripts/bench/README.md) for the procedure and its current assumptions. Successful deployment and recovery without physical access remain to be demonstrated on the bench.
