@@ -22,6 +22,8 @@ import time
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from contextlib import redirect_stdout
 from typing import Any, Dict, List, Optional
 
 # Ensure deploy module can be imported
@@ -273,6 +275,43 @@ class TestDeployTool(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_optional_tone_check_after_commit(self) -> None:
+        for code in (0, 2, 3, 255):
+            with self.subTest(code=code):
+                class ToneDevice(MockBenchDevice):
+                    def run(self, cmd, timeout=None):
+                        if cmd == "nextoomio-tone-check":
+                            self.commands_executed.append(cmd)
+                            self.assert_committed = self.update_state == "Committed"
+                            return SshCommandResult(code, "tone output", "tone error" if code else "")
+                        return super().run(cmd, timeout)
+
+                device = ToneDevice()
+                with patch("deploy.SystemSshRunner", return_value=device), redirect_stdout(io.StringIO()) as out:
+                    rc = main(["-d", "bench", "-f", str(self.swu_file), "--tone-check", "--json"])
+                data = json.loads(out.getvalue())
+                self.assertTrue(device.assert_committed)
+                self.assertEqual(device.commands_executed[-1], "nextoomio-tone-check")
+                self.assertTrue(data["success"])
+                self.assertEqual(data["tone_check"]["returncode"], code)
+                self.assertEqual(data["tone_check"]["stdout"], "tone output")
+                self.assertEqual(rc, 0 if code == 0 else 1)
+
+        device = MockBenchDevice(fail_validation=True)
+        result = Deployer(device, self.swu_file, tone_check=True).deploy()
+        self.assertFalse(result.success)
+        self.assertIsNone(result.tone_check)
+        self.assertNotIn("nextoomio-tone-check", device.commands_executed)
+
+        device = MockBenchDevice()
+        result = Deployer(device, self.swu_file).deploy()
+        self.assertIsNone(result.tone_check)
+        self.assertNotIn("nextoomio-tone-check", device.commands_executed)
+
+        device = MockBenchDevice()
+        result = Deployer(device, self.swu_file, tone_check=True).deploy()
+        self.assertIn("Tone Check:        PASS", format_text_report(result))
 
     def test_final_states_in_both_confirmation_modes(self) -> None:
         for remote in (False, True):
