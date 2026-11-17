@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -99,12 +100,52 @@ def validate_rootfs_workflow(text: str) -> list[str]:
     steps = re.split(r"(?m)^      - name: ", body)[1:]
     relevant = [step for step in steps if re.search(r"\bdebugfs\b|check_image_rootfs\.py", step)]
     expected = ('Check built root filesystem\n        run: |\n'
-                '          docker run --rm --user=root -v "${GITHUB_WORKSPACE}:/work:rw" -w /work --entrypoint python3 \\\n'
+                '          docker run --rm --user "$(id -u):$(id -g)" -v "${GITHUB_WORKSPACE}:/work:rw" -w /work --entrypoint python3 \\\n'
                 '            ghcr.io/siemens/kas/kas:4.5 scripts/check_image_rootfs.py \\\n'
                 '            build/tmp/deploy/images/raspberrypi4-64/nextoomio-image-raspberrypi4-64.rootfs.ext4.gz --commit "${{ github.sha }}"')
     if len(relevant) != 1 or relevant[0].strip() != expected:
         return ["rootfs workflow: inspection must run only in the kas container"]
     return []
+
+
+def validate_full_image_workspace_ownership(text: str) -> list[str]:
+    """Reject root Docker runs with writable workspace bind mounts in full-image."""
+    parts = text.split("\n  full-image:", 1)
+    if len(parts) != 2:
+        return ["full-image workspace ownership: job missing"]
+    body = re.split(r"(?m)^  [A-Za-z0-9_-]+:\s*$", parts[1], maxsplit=1)[0]
+    body = re.sub(r"\\\n\s*", " ", body)
+    errors = []
+    for line in body.splitlines():
+        if not re.search(r"\bdocker\s+run\b", line):
+            continue
+        try:
+            # A multiline shell script argument can open a quote after the image.
+            command = line.split(" sh -ec '", 1)[0]
+            args = shlex.split(command, comments=True)
+        except ValueError:
+            errors.append("full-image workspace ownership: cannot parse Docker command")
+            continue
+        root = any(arg == "--user=root" or (arg == "--user" and args[i + 1:i + 2] == ["root"])
+                   for i, arg in enumerate(args))
+        if not root:
+            continue
+        for i, arg in enumerate(args):
+            spec = args[i + 1] if arg in ("-v", "--volume", "--mount") and i + 1 < len(args) else ""
+            if arg.startswith("--volume=") or arg.startswith("--mount="):
+                spec = arg.split("=", 1)[1]
+            if arg.startswith("-v") and arg != "-v":
+                spec = arg[2:]
+            if spec.startswith("${GITHUB_WORKSPACE}"):
+                source, _, modes = spec.partition(":")
+                if (source == "${GITHUB_WORKSPACE}" or source.startswith("${GITHUB_WORKSPACE}/")) and "ro" not in modes.split(":")[-1].split(","):
+                    errors.append("full-image workspace ownership: root container has a writable workspace mount")
+            elif "type=bind" in spec.split(","):
+                options = spec.split(",")
+                sources = [option.split("=", 1)[1] for option in options if option.startswith(("source=", "src="))]
+                if any(source == "${GITHUB_WORKSPACE}" or source.startswith("${GITHUB_WORKSPACE}/") for source in sources) and not any(option in ("readonly", "readonly=true", "ro") for option in options):
+                    errors.append("full-image workspace ownership: root container has a writable workspace mount")
+    return errors
 
 
 def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
@@ -799,6 +840,7 @@ def validate_layer(root: pathlib.Path = ROOT) -> list[str]:
         wf_text = yocto_wf.read_text(encoding="utf-8")
         errors.extend(validate_yocto_runner_boundary(wf_text))
         errors.extend(validate_full_image_mountpoint(wf_text))
+        errors.extend(validate_full_image_workspace_ownership(wf_text))
         errors.extend(validate_rootfs_workflow(wf_text))
         if "*.manifest" not in wf_text and "*.rootfs.manifest" not in wf_text:
             errors.append(
@@ -1831,6 +1873,24 @@ def run_self_tests() -> int:
             assert any("full-image mountpoint" in error for error in validate_layer(tmp_root))
         wf.write_text(original, encoding="utf-8")
         print("  test_full_image_mountpoint_required_before_docker: OK")
+
+        # D-075: both writable workspace mounts must reject root independently.
+        user = '--user "$(id -u):$(id -g)"'
+        assert original.count(user) == 2
+        for index in range(2):
+            before, after = original.split(user, 1) if index == 0 else original.rsplit(user, 1)
+            wf.write_text(before + '--user=root' + after, encoding="utf-8")
+            assert any("full-image workspace ownership" in error for error in validate_layer(tmp_root))
+        wf.write_text(original, encoding="utf-8")
+        for mount, rejected in (
+            ('-v "${GITHUB_WORKSPACE}:/work:ro"', False),
+            ('-v "${GITHUB_WORKSPACE}/build:/output"', True),
+            ('--mount "source=${GITHUB_WORKSPACE}/build,target=/output,type=bind"', True),
+            ('--mount "type=bind,src=${GITHUB_WORKSPACE},dst=/work,readonly"', False),
+        ):
+            probe = original + f'\n      - name: Ownership probe\n        run: docker run --user=root {mount} image\n'
+            assert bool(validate_full_image_workspace_ownership(probe)) == rejected, mount
+        print("  test_root_writable_workspace_mounts_rejected: OK")
 
         # D-074: cached root filesystems must depend on the source commit.
         version_class = tmp_root / "meta-nextoomio/classes/nextoomio-image-version.bbclass"

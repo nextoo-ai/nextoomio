@@ -105,7 +105,7 @@ jobs:
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/build/tmp/deploy"
           docker run --rm \
-            --user=root \
+            --user "$(id -u):$(id -g)" \
             -v nextoomio-ci-build:/work/build:ro \
             -v "${GITHUB_WORKSPACE}/build/tmp/deploy:/output" \
             ghcr.io/siemens/kas/kas:4.5 \
@@ -125,7 +125,7 @@ jobs:
 
       - name: Check built root filesystem
         run: |
-          docker run --rm --user=root -v "${GITHUB_WORKSPACE}:/work:rw" -w /work --entrypoint python3 \
+          docker run --rm --user "$(id -u):$(id -g)" -v "${GITHUB_WORKSPACE}:/work:rw" -w /work --entrypoint python3 \
             ghcr.io/siemens/kas/kas:4.5 scripts/check_image_rootfs.py \
             build/tmp/deploy/images/raspberrypi4-64/nextoomio-image-raspberrypi4-64.rootfs.ext4.gz --commit "${{ github.sha }}"
 
